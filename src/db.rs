@@ -684,7 +684,14 @@ mod tests {
         assert!(fk, "foreign keys are back on");
 
         // The page that failed under version 2 is pending again.
-        assert_eq!(db.pending_pages().unwrap().iter().map(|p| p.id).collect::<Vec<_>>(), [8]);
+        assert_eq!(
+            db.pending_pages()
+                .unwrap()
+                .iter()
+                .map(|p| p.id)
+                .collect::<Vec<_>>(),
+            [8]
+        );
 
         // The new status works.
         let stub = PageResult {

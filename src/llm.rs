@@ -156,20 +156,29 @@ impl OpenAiCompatible {
                 Ok(response) => {
                     let status = response.status();
                     let wait = crate::fetch::retry_after(&response);
-                    let text = response.text().await?;
-                    if status.is_success() {
-                        break text;
+                    // The connection can also drop or time out while the body
+                    // arrives; that is retried like a failed send.
+                    match response.text().await {
+                        Err(err) => (
+                            anyhow::Error::new(err).context(format!("reading the response from {url}")),
+                            wait,
+                        ),
+                        Ok(text) => {
+                            if status.is_success() {
+                                break text;
+                            }
+                            let message = format!("LLM server returned HTTP {status}: {}", snippet(&text));
+                            // Bad request / too large / unprocessable usually means this page's
+                            // prompt, e.g. more tokens than the model's context window.
+                            if matches!(status.as_u16(), 400 | 413 | 422) {
+                                return Err(PageRejected::rejected(message).into());
+                            }
+                            if status.as_u16() != 429 && !status.is_server_error() {
+                                bail!(message);
+                            }
+                            (anyhow!(message), wait)
+                        }
                     }
-                    let message = format!("LLM server returned HTTP {status}: {}", snippet(&text));
-                    // Bad request / too large / unprocessable usually means this page's
-                    // prompt, e.g. more tokens than the model's context window.
-                    if matches!(status.as_u16(), 400 | 413 | 422) {
-                        return Err(PageRejected::rejected(message).into());
-                    }
-                    if status.as_u16() != 429 && !status.is_server_error() {
-                        bail!(message);
-                    }
-                    (anyhow!(message), wait)
                 }
             };
             if attempt >= self.config.retries {
