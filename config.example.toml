@@ -1,0 +1,35 @@
+# tabkeeper configuration.
+#
+# Copy this file to the path printed by `tabkeeper config` and adjust it.
+# Every setting is optional; the values below are the defaults.
+
+[llm]
+# Only OpenAI-compatible chat-completions servers are supported so far. That
+# covers Ollama, LM Studio, llama.cpp server, vLLM, OpenRouter and OpenAI.
+provider = "openai_compatible"
+base_url = "http://localhost:11434/v1"   # Ollama
+model = "llama3.1:8b"
+# Name of the environment variable that holds the API key. Leave unset for
+# local servers that need no key, e.g. api_key_env = "OPENAI_API_KEY".
+# api_key_env = "OPENAI_API_KEY"
+# How the model is told to answer in JSON: "json_schema" (strict schema,
+# preferred), "json_object" (any JSON) or "none" (prompt instructions only).
+structured_output = "json_schema"
+# Page text is cut to this many characters before it is sent to the model.
+max_input_chars = 12000
+temperature = 0.2
+# Local models can be slow on long pages.
+timeout_secs = 300
+
+[fetch]
+timeout_secs = 20
+user_agent = "Mozilla/5.0 (compatible; tabkeeper/0.1; +https://github.com/agegechkori/tabkeeper)"
+
+[tags]
+# Maximum number of levels in a tag path, e.g. technology/ai/llm is 3.
+max_depth = 3
+# Maximum tags per page, and how many of them may be new tags.
+max_per_page = 5
+max_new_per_page = 2
+# How many existing tags (the most used ones) are shown to the model.
+vocabulary_limit = 300
