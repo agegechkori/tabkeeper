@@ -1,64 +1,26 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fmt;
 
-/// Top-level segment reserved for tags the tool assigns itself, such as
-/// `status/unreachable`. The model may not use it.
-pub const RESERVED_ROOT: &str = "status";
+/// Prefix of tags the tool assigns itself, such as `status/unreachable`. A
+/// model's tags are normalized to a single level, so they can never collide.
+pub const RESERVED_PREFIX: &str = "status/";
 
-/// A normalized hierarchical tag, e.g. `technology/programming-languages/rust`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct TagPath(Vec<String>);
-
-impl TagPath {
-    /// Normalizes a tag as written by a model or a person: segments become
-    /// lowercase kebab-case, and paths deeper than `max_depth` keep their
-    /// most general levels. Returns `None` if nothing usable is left.
-    pub fn parse(raw: &str, max_depth: usize) -> Option<Self> {
-        let mut segments: Vec<String> = raw
-            .trim()
-            .trim_start_matches('#')
-            .split('/')
-            .filter_map(normalize_segment)
-            .collect();
-        segments.truncate(max_depth);
-        if segments.is_empty() {
-            return None;
-        }
-        // Obsidian ignores tags made only of digits, like #2024.
-        if segments
-            .iter()
-            .all(|s| s.chars().all(|c| c.is_ascii_digit() || c == '-'))
-        {
-            return None;
-        }
-        Some(Self(segments))
+/// Normalizes a tag as written by a model or a person to a flat,
+/// lowercase kebab-case name. A path such as `technology/rust` keeps its most
+/// specific level. Returns `None` for reserved or unusable tags.
+pub fn normalize_name(raw: &str) -> Option<String> {
+    let raw = raw.trim().trim_start_matches('#').trim();
+    if raw.to_lowercase().starts_with(RESERVED_PREFIX) {
+        return None;
     }
-
-    pub fn segments(&self) -> &[String] {
-        &self.0
+    let last = raw.split('/').rev().find_map(kebab_case)?;
+    // Obsidian ignores tags made only of digits, like #2024.
+    if last.chars().all(|c| c.is_ascii_digit() || c == '-') {
+        return None;
     }
-
-    pub fn root(&self) -> &str {
-        &self.0[0]
-    }
-
-    pub fn is_reserved(&self) -> bool {
-        self.root() == RESERVED_ROOT
-    }
-
-    /// Every path from the root down to and including this one.
-    pub fn prefixes(&self) -> impl Iterator<Item = TagPath> + '_ {
-        (1..=self.0.len()).map(|n| TagPath(self.0[..n].to_vec()))
-    }
+    Some(last)
 }
 
-impl fmt::Display for TagPath {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0.join("/"))
-    }
-}
-
-fn normalize_segment(raw: &str) -> Option<String> {
+fn kebab_case(raw: &str) -> Option<String> {
     let mut out = String::new();
     for c in raw.chars().flat_map(char::to_lowercase) {
         if c.is_alphanumeric() {
@@ -71,13 +33,51 @@ fn normalize_segment(raw: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
+/// Singular and plural spellings of a tag's last word, so `board-games`
+/// finds an existing `board-game` and the other way around. Only used to
+/// look up tags that already exist, so a wrong guess like `gam` is harmless.
+pub fn plural_variants(name: &str) -> Vec<String> {
+    let (head, last) = match name.rsplit_once('-') {
+        Some((head, last)) => (Some(head), last),
+        None => (None, name),
+    };
+    let mut words = Vec::new();
+    if last.chars().count() > 3
+        && last.ends_with('s')
+        && !(last.ends_with("ss") || last.ends_with("us") || last.ends_with("is"))
+    {
+        if let Some(stem) = last.strip_suffix("ies") {
+            words.push(format!("{stem}y"));
+        }
+        if let Some(stem) = last.strip_suffix("es") {
+            words.push(stem.to_string());
+        }
+        words.push(last[..last.len() - 1].to_string());
+    } else if !last.ends_with('s') {
+        words.push(format!("{last}s"));
+        if ["x", "z", "ch", "sh"].iter().any(|end| last.ends_with(end)) {
+            words.push(format!("{last}es"));
+        }
+        if let Some(stem) = last.strip_suffix('y') {
+            words.push(format!("{stem}ies"));
+        }
+    }
+    words
+        .into_iter()
+        .filter(|w| w != last && !w.is_empty())
+        .map(|w| match head {
+            Some(head) => format!("{head}-{w}"),
+            None => w,
+        })
+        .collect()
+}
+
 /// A tag as stored in the database.
 #[derive(Debug, Clone)]
 pub struct TagRow {
     pub id: i64,
     pub parent_id: Option<i64>,
     pub name: String,
-    pub path: String,
     pub description: Option<String>,
 }
 
@@ -85,6 +85,7 @@ pub struct TagRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CountedTag {
     pub id: i64,
+    /// The tag's name, or its path from the root once tags have parents.
     pub path: String,
     pub name: String,
     pub depth: usize,
@@ -96,7 +97,7 @@ pub struct CountedTag {
 }
 
 /// Counts pages per tag and returns the tags depth-first, siblings ordered by
-/// total pages (most first), then by name.
+/// total pages (most first), then by name. Flat tags are all roots.
 pub fn count_tree(tags: &[TagRow], links: &[(i64, i64)]) -> Vec<CountedTag> {
     let by_id: HashMap<i64, &TagRow> = tags.iter().map(|t| (t.id, t)).collect();
     let mut direct: HashMap<i64, HashSet<i64>> = HashMap::new();
@@ -124,88 +125,105 @@ pub fn count_tree(tags: &[TagRow], links: &[(i64, i64)]) -> Vec<CountedTag> {
     }
 
     let mut out = Vec::with_capacity(tags.len());
-    let mut stack: Vec<(&TagRow, usize)> = children
+    let mut stack: Vec<(&TagRow, usize, String)> = children
         .get(&None)
-        .map(|roots| roots.iter().rev().map(|t| (*t, 0)).collect())
+        .map(|roots| roots.iter().rev().map(|t| (*t, 0, t.name.clone())).collect())
         .unwrap_or_default();
-    while let Some((tag, depth)) = stack.pop() {
+    while let Some((tag, depth, path)) = stack.pop() {
+        if let Some(kids) = children.get(&Some(tag.id)) {
+            stack.extend(
+                kids.iter()
+                    .rev()
+                    .map(|t| (*t, depth + 1, format!("{path}/{}", t.name))),
+            );
+        }
         out.push(CountedTag {
             id: tag.id,
-            path: tag.path.clone(),
+            path,
             name: tag.name.clone(),
             depth,
             direct: len(&direct, tag.id),
             total: len(&subtree, tag.id),
             description: tag.description.clone(),
         });
-        if let Some(kids) = children.get(&Some(tag.id)) {
-            stack.extend(kids.iter().rev().map(|t| (*t, depth + 1)));
-        }
     }
     out
 }
 
-/// The tag vocabulary shown to the model: the `limit` most used tags,
-/// listed alphabetically so related tags sit next to each other.
-pub fn vocabulary(counted: &[CountedTag], limit: usize) -> String {
-    let mut top: Vec<&CountedTag> = counted
+/// One line per tag for the model: `name (pages) - description`, sorted by name.
+pub fn format_vocabulary(tags: &[&CountedTag]) -> String {
+    let mut sorted = tags.to_vec();
+    sorted.sort_by(|a, b| a.name.cmp(&b.name));
+    sorted
         .iter()
-        .filter(|t| t.total > 0 && t.path.split('/').next() != Some(RESERVED_ROOT))
-        .collect();
-    top.sort_by(|a, b| b.total.cmp(&a.total).then(a.path.cmp(&b.path)));
-    top.truncate(limit);
-    top.sort_by(|a, b| a.path.cmp(&b.path));
-    top.iter()
         .map(|t| match &t.description {
-            Some(d) => format!("{} ({}) - {}", t.path, t.total, d),
-            None => format!("{} ({})", t.path, t.total),
+            Some(d) => format!("{} ({}) - {}", t.name, t.total, d),
+            None => format!("{} ({})", t.name, t.total),
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Tags the model may reuse: used on at least one page, and not reserved.
+pub fn is_offerable(tag: &CountedTag) -> bool {
+    tag.total > 0 && !tag.name.starts_with(RESERVED_PREFIX)
+}
+
+/// The `limit` most used tags; the fallback when embeddings are unavailable.
+pub fn most_used(counted: &[CountedTag], limit: usize) -> Vec<&CountedTag> {
+    let mut top: Vec<&CountedTag> = counted.iter().filter(|t| is_offerable(t)).collect();
+    top.sort_by(|a, b| b.total.cmp(&a.total).then(a.name.cmp(&b.name)));
+    top.truncate(limit);
+    top
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn p(raw: &str) -> Option<String> {
-        TagPath::parse(raw, 3).map(|t| t.to_string())
-    }
-
     #[test]
-    fn normalizes_segments() {
+    fn normalizes_to_flat_kebab_case() {
         assert_eq!(
-            p("#Technology/Programming Languages/Rust").as_deref(),
-            Some("technology/programming-languages/rust")
+            normalize_name("#Machine Learning").as_deref(),
+            Some("machine-learning")
         );
-        assert_eq!(p(" machine_learning ").as_deref(), Some("machine-learning"));
-        assert_eq!(p("science//chemistry/").as_deref(), Some("science/chemistry"));
-        assert_eq!(p("food/Café").as_deref(), Some("food/café"));
+        assert_eq!(normalize_name(" rust_lang ").as_deref(), Some("rust-lang"));
+        assert_eq!(
+            normalize_name("technology/Programming Languages/").as_deref(),
+            Some("programming-languages")
+        );
+        assert_eq!(normalize_name("Café").as_deref(), Some("café"));
     }
 
     #[test]
-    fn truncates_depth_and_rejects_junk() {
-        assert_eq!(p("a/b/c/d/e").as_deref(), Some("a/b/c"));
-        assert_eq!(p("///"), None);
-        assert_eq!(p("2024"), None);
-        assert_eq!(p("news/2024").as_deref(), Some("news/2024"));
+    fn rejects_reserved_and_junk() {
+        assert_eq!(normalize_name("status/unreachable"), None);
+        assert_eq!(normalize_name("#Status/whatever"), None);
+        assert_eq!(normalize_name("///"), None);
+        assert_eq!(normalize_name("2024"), None);
+        assert_eq!(normalize_name("web3").as_deref(), Some("web3"));
     }
 
     #[test]
-    fn reserved_and_prefixes() {
-        let t = TagPath::parse("status/unreachable", 3).unwrap();
-        assert!(t.is_reserved());
-        let t = TagPath::parse("a/b/c", 3).unwrap();
-        let prefixes: Vec<String> = t.prefixes().map(|p| p.to_string()).collect();
-        assert_eq!(prefixes, ["a", "a/b", "a/b/c"]);
+    fn plural_variants_both_ways() {
+        assert!(plural_variants("board-games").contains(&"board-game".to_string()));
+        assert!(plural_variants("board-game").contains(&"board-games".to_string()));
+        assert!(plural_variants("policies").contains(&"policy".to_string()));
+        assert!(plural_variants("policy").contains(&"policies".to_string()));
+        assert!(plural_variants("boxes").contains(&"box".to_string()));
+        assert!(plural_variants("box").contains(&"boxes".to_string()));
+        // Words that end in s without being plural are left alone.
+        assert!(plural_variants("css").is_empty());
+        assert!(plural_variants("status").is_empty());
+        assert!(plural_variants("analysis").is_empty());
+        assert!(plural_variants("gas").is_empty());
     }
 
-    fn row(id: i64, parent: Option<i64>, path: &str) -> TagRow {
+    fn row(id: i64, parent: Option<i64>, name: &str) -> TagRow {
         TagRow {
             id,
             parent_id: parent,
-            name: path.rsplit('/').next().unwrap().into(),
-            path: path.into(),
+            name: name.into(),
             description: None,
         }
     }
@@ -214,8 +232,8 @@ mod tests {
     fn counts_subtrees_without_double_counting() {
         let tags = vec![
             row(1, None, "tech"),
-            row(2, Some(1), "tech/rust"),
-            row(3, Some(1), "tech/python"),
+            row(2, Some(1), "rust"),
+            row(3, Some(1), "python"),
             row(4, None, "food"),
         ];
         // Page 10 is tagged with both rust and python: tech counts it once.
@@ -231,16 +249,34 @@ mod tests {
                 ("tech", 0, 1, 3),
                 ("tech/rust", 1, 2, 2),
                 ("tech/python", 1, 1, 1),
-                ("food", 0, 1, 1),
+                ("food", 0, 1, 1)
             ]
         );
     }
 
     #[test]
-    fn vocabulary_keeps_most_used_sorted_by_path() {
-        let tags = vec![row(1, None, "b"), row(2, None, "a"), row(3, None, "c")];
-        let links = vec![(1, 1), (2, 1), (3, 2), (4, 3), (5, 3), (6, 3)];
-        let vocab = vocabulary(&count_tree(&tags, &links), 2);
-        assert_eq!(vocab, "b (2)\nc (3)");
+    fn most_used_skips_unused_and_reserved() {
+        let tags = vec![
+            row(1, None, "b"),
+            row(2, None, "a"),
+            row(3, None, "c"),
+            row(4, None, "status/unreachable"),
+            row(5, None, "unused"),
+        ];
+        let links = vec![
+            (1, 1),
+            (2, 1),
+            (3, 2),
+            (4, 3),
+            (5, 3),
+            (6, 3),
+            (7, 4),
+            (8, 4),
+            (9, 4),
+            (10, 4),
+        ];
+        let counted = count_tree(&tags, &links);
+        let top = most_used(&counted, 2);
+        assert_eq!(format_vocabulary(&top), "b (2)\nc (3)");
     }
 }

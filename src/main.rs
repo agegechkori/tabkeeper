@@ -1,5 +1,6 @@
 mod config;
 mod db;
+mod embed;
 mod extract;
 mod fetch;
 mod import;
@@ -104,7 +105,37 @@ async fn run(cli: Cli) -> Result<()> {
             let fetcher = fetch::HttpFetcher::new(&config.fetch)?;
             let llm = llm::OpenAiCompatible::new(&config.llm)?;
             println!("Using model {} at {}.", config.llm.model, config.llm.base_url);
-            let result = pipeline::process_pending(&mut db, &fetcher, &llm, &config, &lang, limit).await;
+
+            let embedder = embed::OpenAiEmbedder::new(&config.embeddings, &config.llm)?;
+            let mut embeddings = None;
+            if config.embeddings.enabled {
+                match pipeline::Embeddings::prepare(&db, &embedder, config.embeddings.page_chars).await {
+                    Ok(e) => {
+                        println!(
+                            "Using embedding model {} to pick relevant tags.",
+                            config.embeddings.model
+                        );
+                        embeddings = Some(e);
+                    }
+                    Err(err) => println!(
+                        "Warning: embeddings are unavailable ({err:#}).\n\
+                         The model will be shown the most used tags instead of the most relevant ones. \
+                         On Ollama, run: ollama pull {}",
+                        config.embeddings.model
+                    ),
+                }
+            }
+
+            let result = pipeline::process_pending(
+                &mut db,
+                &fetcher,
+                &llm,
+                embeddings.as_mut(),
+                &config,
+                &lang,
+                limit,
+            )
+            .await;
             // Render whatever was finished, even if the run stopped early.
             finish(&db, &cli.out)?;
             let stats = result?;

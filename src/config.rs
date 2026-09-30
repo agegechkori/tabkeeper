@@ -9,8 +9,36 @@ pub const EXAMPLE: &str = include_str!("../config.example.toml");
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub llm: LlmConfig,
+    pub embeddings: EmbeddingsConfig,
     pub fetch: FetchConfig,
     pub tags: TagConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EmbeddingsConfig {
+    pub enabled: bool,
+    pub model: String,
+    /// Defaults to `llm.base_url`.
+    pub base_url: Option<String>,
+    /// Defaults to `llm.api_key_env`.
+    pub api_key_env: Option<String>,
+    /// How much of a page's text is embedded to pick the tags shown to the model.
+    pub page_chars: usize,
+    pub timeout_secs: u64,
+}
+
+impl Default for EmbeddingsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            model: "nomic-embed-text".into(),
+            base_url: None,
+            api_key_env: None,
+            page_chars: 2000,
+            timeout_secs: 60,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
@@ -81,9 +109,11 @@ impl Default for FetchConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TagConfig {
+    /// Levels in the tag tree built at the end of a run (phase 3).
     pub max_depth: usize,
     pub max_per_page: usize,
     pub max_new_per_page: usize,
+    /// How many existing tags are shown to the model for each page.
     pub vocabulary_limit: usize,
 }
 
@@ -92,8 +122,8 @@ impl Default for TagConfig {
         Self {
             max_depth: 3,
             max_per_page: 5,
-            max_new_per_page: 2,
-            vocabulary_limit: 300,
+            max_new_per_page: 3,
+            vocabulary_limit: 50,
         }
     }
 }

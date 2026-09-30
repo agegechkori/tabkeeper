@@ -24,28 +24,32 @@ pub fn render_all(db: &Db, out_dir: &Path) -> Result<RenderStats> {
     let mut pages = db.done_pages()?;
     assign_note_files(db, &mut pages)?;
 
-    let tags = db.tags()?;
-    let path_by_id: HashMap<i64, &str> = tags.iter().map(|t| (t.id, t.path.as_str())).collect();
-    let mut tags_by_page: HashMap<i64, Vec<&str>> = HashMap::new();
     let links = db.tag_links()?;
+    let counted = count_tree(&db.tags()?, &links);
+    let by_id: HashMap<i64, &CountedTag> = counted.iter().map(|t| (t.id, t)).collect();
+    let mut tags_by_page: HashMap<i64, Vec<&CountedTag>> = HashMap::new();
     for (page_id, tag_id) in &links {
-        if let Some(path) = path_by_id.get(tag_id) {
-            tags_by_page.entry(*page_id).or_default().push(path);
+        if let Some(tag) = by_id.get(tag_id) {
+            tags_by_page.entry(*page_id).or_default().push(tag);
         }
     }
     for list in tags_by_page.values_mut() {
-        list.sort_unstable();
+        list.sort_unstable_by(|a, b| a.path.cmp(&b.path));
     }
 
     for page in &pages {
         let file = page.note_file.as_deref().expect("note files were just assigned");
-        let page_tags = tags_by_page.get(&page.id).map(Vec::as_slice).unwrap_or_default();
+        let page_tags: Vec<&str> = tags_by_page
+            .get(&page.id)
+            .into_iter()
+            .flatten()
+            .map(|t| t.path.as_str())
+            .collect();
         let path = notes_dir.join(file);
-        std::fs::write(&path, note(page, page_tags))
+        std::fs::write(&path, note(page, &page_tags))
             .with_context(|| format!("writing {}", path.display()))?;
     }
 
-    let counted = count_tree(&tags, &links);
     std::fs::write(out_dir.join("_tags.md"), tags_markdown(&counted))?;
     std::fs::write(out_dir.join("_index.md"), index_markdown(&pages, &tags_by_page))?;
     Ok(RenderStats { notes: pages.len() })
@@ -128,12 +132,11 @@ pub fn note(page: &DonePage, tags: &[&str]) -> String {
 }
 
 fn tags_markdown(counted: &[CountedTag]) -> String {
-    let mut out = String::from(
-        "# Tags\n\nPages per tag. The first number includes pages tagged with anything below the tag.\n\n",
-    );
+    let mut out = String::from("# Tags\n\nPages per tag, most used first.\n\n");
     for t in counted.iter().filter(|t| t.total > 0) {
         let indent = "  ".repeat(t.depth);
-        write!(out, "{indent}- **{}**: {} pages", t.name, t.total).unwrap();
+        let noun = if t.total == 1 { "page" } else { "pages" };
+        write!(out, "{indent}- **{}**: {} {noun}", t.name, t.total).unwrap();
         if t.direct != t.total {
             write!(out, " ({} tagged directly)", t.direct).unwrap();
         }
@@ -152,21 +155,20 @@ fn markdown_link_text(s: &str) -> String {
         .replace(']', "\\]")
 }
 
-fn index_markdown(pages: &[DonePage], tags_by_page: &HashMap<i64, Vec<&str>>) -> String {
+/// Lists every page once, under its most used tag, so sections are big
+/// topics rather than one section per tag.
+fn index_markdown(pages: &[DonePage], tags_by_page: &HashMap<i64, Vec<&CountedTag>>) -> String {
     let mut groups: BTreeMap<&str, Vec<&DonePage>> = BTreeMap::new();
     let mut untagged = Vec::new();
     for page in pages {
-        let roots: HashSet<&str> = tags_by_page
+        let main_tag = tags_by_page
             .get(&page.id)
             .into_iter()
             .flatten()
-            .map(|path| path.split('/').next().unwrap_or(path))
-            .collect();
-        if roots.is_empty() {
-            untagged.push(page);
-        }
-        for root in roots {
-            groups.entry(root).or_default().push(page);
+            .min_by(|a, b| b.total.cmp(&a.total).then(a.path.cmp(&b.path)));
+        match main_tag {
+            Some(tag) => groups.entry(tag.path.as_str()).or_default().push(page),
+            None => untagged.push(page),
         }
     }
 
@@ -216,7 +218,6 @@ pub fn report(counted: &[CountedTag]) -> String {
 mod tests {
     use super::*;
     use crate::db::PageResult;
-    use crate::tags::TagPath;
 
     fn page(title: &str) -> DonePage {
         DonePage {
@@ -254,16 +255,18 @@ mod tests {
     #[test]
     fn renders_files_with_stable_unique_names() {
         let mut db = Db::open_in_memory().unwrap();
-        let tag = db
-            .ensure_tag(&TagPath::parse("tech/rust", 3).unwrap(), None)
+        let rust = db
+            .create_tag("rust-programming", Some("The Rust language"))
             .unwrap();
+        let safety = db.create_tag("memory-safety", None).unwrap();
         for url in ["https://a.com/", "https://b.com/", "https://c.com/"] {
             db.add_page(url, url, None, "import").unwrap();
         }
         let ids: Vec<i64> = db.pending_pages().unwrap().iter().map(|p| p.id).collect();
-        let tagged = [("tech/rust".to_string(), tag)];
-        for (i, id) in ids.iter().enumerate() {
-            let tags: &[(String, i64)] = if i < 2 { &tagged } else { &[] };
+        let both = [("Rust".to_string(), rust), ("memory-safety".to_string(), safety)];
+        let one = [("rust-programming".to_string(), rust)];
+        let tag_sets: [&[(String, i64)]; 3] = [&both, &one, &[]];
+        for (id, tags) in ids.iter().zip(tag_sets) {
             db.save_result(
                 *id,
                 &PageResult {
@@ -292,20 +295,25 @@ mod tests {
                 Some("same-title-3.md".into())
             ]
         );
-        assert!(dir.path().join("notes/same-title-2.md").exists());
+        let first = std::fs::read_to_string(dir.path().join("notes/same-title.md")).unwrap();
+        assert!(first.ends_with("#memory-safety #rust-programming\n"), "{first}");
 
+        // Each page is listed once, under its most used tag.
         let index = std::fs::read_to_string(dir.path().join("_index.md")).unwrap();
         assert!(
-            index.contains("## tech\n\n- [Same Title](notes/same-title.md)"),
+            index.contains("## rust-programming\n\n- [Same Title](notes/same-title.md)\n- [Same Title](notes/same-title-2.md)\n"),
             "{index}"
         );
+        assert!(!index.contains("## memory-safety"), "{index}");
         assert!(
             index.contains("## Untagged\n\n- [Same Title](notes/same-title-3.md)"),
             "{index}"
         );
         let tags_md = std::fs::read_to_string(dir.path().join("_tags.md")).unwrap();
         assert!(
-            tags_md.contains("- **tech**: 2 pages (0 tagged directly)\n  - **rust**: 2 pages\n"),
+            tags_md.contains(
+                "- **rust-programming**: 2 pages - The Rust language\n- **memory-safety**: 1 page\n"
+            ),
             "{tags_md}"
         );
 

@@ -28,15 +28,30 @@ timeout_secs = 300
 # [llm.extra_body]
 # reasoning_effort = "none"
 
+[embeddings]
+# Embeddings pick which existing tags the model sees for each page: the most
+# similar to the page. Without them tabkeeper shows the most used tags, which
+# works less well once there are hundreds of tags.
+# On Ollama: ollama pull nomic-embed-text
+enabled = true
+model = "nomic-embed-text"
+# Server and API key default to the [llm] ones.
+# base_url = "http://localhost:11434/v1"
+# api_key_env = "OPENAI_API_KEY"
+# How much of each page's text is embedded to pick its tags.
+page_chars = 2000
+timeout_secs = 60
+
 [fetch]
 timeout_secs = 20
 user_agent = "Mozilla/5.0 (compatible; tabkeeper/0.1; +https://github.com/agegechkori/tabkeeper)"
 
 [tags]
-# Maximum number of levels in a tag path, e.g. technology/ai/llm is 3.
-max_depth = 3
 # Maximum tags per page, and how many of them may be new tags.
 max_per_page = 5
-max_new_per_page = 2
-# How many existing tags (the most used ones) are shown to the model.
-vocabulary_limit = 300
+max_new_per_page = 3
+# How many existing tags are shown to the model for each page.
+vocabulary_limit = 50
+# Maximum number of levels in the tag tree, e.g. technology/ai/llm is 3.
+# The tree is built at the end of a run; not implemented yet.
+max_depth = 3
