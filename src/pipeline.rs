@@ -181,6 +181,7 @@ pub async fn process_pending<F: Fetcher, L: Llm, E: Embedder>(
             semaphores: RefCell::default(),
         },
         progress: &progress,
+        model_failures: RefCell::default(),
     };
     let stats = RefCell::new(stats);
     let fatal: RefCell<Option<(String, anyhow::Error)>> = RefCell::new(None);
@@ -249,7 +250,13 @@ struct Run<'r, 'e, F, L, E: Embedder> {
     lang: &'r LangMode,
     domains: DomainLimiter,
     progress: &'r Progress,
+    /// Pages that failed at the model in a row, most recent last.
+    model_failures: RefCell<Vec<i64>>,
 }
+
+/// After this many pages in a row fail at the model, the problem is most
+/// likely the model or its settings rather than the pages, so the run stops.
+const MODEL_FAILURE_STREAK: usize = 3;
 
 impl<F: Fetcher, L: Llm, E: Embedder> Run<'_, '_, F, L, E> {
     async fn process(&self, page: &PendingPage) -> Outcome {
@@ -298,12 +305,31 @@ impl<F: Fetcher, L: Llm, E: Embedder> Run<'_, '_, F, L, E> {
             tags: &self.config.tags,
         };
         let summary = match self.llm.summarize(&request).await {
-            Ok(summary) => summary,
+            Ok(summary) => {
+                self.model_failures.borrow_mut().clear();
+                summary
+            }
             Err(err) => {
                 let Some(rejected) = err.downcast_ref::<PageRejected>() else {
                     return Err(err.context("LLM request failed"));
                 };
                 let message = format!("{err:#}");
+                let streak = {
+                    let mut failures = self.model_failures.borrow_mut();
+                    failures.push(page.id);
+                    failures.clone()
+                };
+                if streak.len() >= MODEL_FAILURE_STREAK {
+                    // Those pages were probably fine: give them another chance.
+                    self.db.borrow().reset_to_pending(&streak)?;
+                    return Err(anyhow::anyhow!(
+                        "{} pages in a row failed at the model; the last one with: {message}. This usually \
+                         means a problem with the model or its settings rather than with the pages, e.g. a \
+                         parameter the server doesn't accept, or a model that has stopped responding. \
+                         Those pages were left pending",
+                        streak.len()
+                    ));
+                }
                 self.save_stub(page, Stub::Failed, rejected.kind, &message)?;
                 return Ok(Outcome::Failed(message));
             }
@@ -1241,6 +1267,51 @@ mod tests {
         let embeddings = Embeddings::prepare(&db, &FakeEmbedder, 2000).await.unwrap();
         assert_eq!(embeddings.index.len(), 2);
         assert!(db.pages_missing_embedding("fake").unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn three_model_failures_in_a_row_stop_the_run_and_keep_the_pages() {
+        let mut db = db_with(&[
+            "https://a.com/",
+            "https://b.com/",
+            "https://c.com/",
+            "https://d.com/",
+        ]);
+        let llm = FakeLlm::new(vec![Err("reject"), Err("reject"), Err("reject")]);
+        let err = run(&mut db, &llm).await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("3 pages in a row failed at the model"),
+            "{err:#}"
+        );
+        // None of them got a failed stub: they are all still pending.
+        let counts = db.status_counts().unwrap();
+        assert_eq!((counts.failed, counts.pending), (0, 4));
+        assert!(db.failure_kinds().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_success_resets_the_model_failure_count() {
+        let mut db = db_with(&[
+            "https://a.com/",
+            "https://b.com/",
+            "https://c.com/",
+            "https://d.com/",
+        ]);
+        let llm = FakeLlm::new(vec![
+            Err("reject"),
+            Ok(summary("B", &["beta"], &[])),
+            Err("reject"),
+            Err("reject"),
+        ]);
+        let stats = run(&mut db, &llm).await.unwrap();
+        assert_eq!(
+            stats,
+            Stats {
+                done: 1,
+                failed: 3,
+                ..Stats::default()
+            }
+        );
     }
 
     #[tokio::test]
