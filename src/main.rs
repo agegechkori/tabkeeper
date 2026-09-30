@@ -3,9 +3,11 @@ mod db;
 mod embed;
 mod extract;
 mod fetch;
+mod filter;
 mod import;
 mod llm;
 mod pipeline;
+mod progress;
 mod render;
 mod tags;
 mod urls;
@@ -51,9 +53,16 @@ enum Command {
         /// Model to use, overriding the config file.
         #[arg(long)]
         model: Option<String>,
-        /// Try pages that failed in earlier runs again.
+        /// Try pages that failed or were unreachable in earlier runs again.
         #[arg(long)]
         retry_failed: bool,
+        /// Only process URLs matching this rule, e.g. domain:github.com. Can
+        /// be repeated. Rules: domain:, glob:, regex:, prefix:.
+        #[arg(long, value_name = "RULE")]
+        allow: Vec<String>,
+        /// Skip URLs matching this rule, e.g. domain:mail.google.com. Can be repeated.
+        #[arg(long, value_name = "RULE")]
+        deny: Vec<String>,
     },
     /// Rewrite all notes, _tags.md and _index.md from the database.
     Render,
@@ -83,23 +92,26 @@ async fn run(cli: Cli) -> Result<()> {
             limit,
             model,
             retry_failed,
+            allow,
+            deny,
         } => {
             if let Some(model) = model {
                 config.llm.model = model;
             }
+            let filter = filter::Filter::new(&config.filter, &allow, &deny)?;
             let text =
                 std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
             let mut db = open_db(&cli.out)?;
-            let stats = import::import_url_list(&db, &text)?;
+            let stats = import::import_url_list(&db, &text, &filter)?;
             println!(
-                "Imported {} new URLs ({} already known, {} non-web skipped).",
-                stats.added, stats.known, stats.not_web
+                "Imported {} new URLs ({} already known, {} skipped by the filter, {} non-web skipped).",
+                stats.added, stats.known, stats.filtered, stats.not_web
             );
             for bad in &stats.invalid {
                 println!("Skipped invalid URL: {bad}");
             }
             if retry_failed {
-                println!("Retrying {} failed pages.", db.retry_failed()?);
+                println!("Retrying {} failed and unreachable pages.", db.retry_failed()?);
             }
 
             let fetcher = fetch::HttpFetcher::new(&config.fetch)?;
@@ -137,23 +149,30 @@ async fn run(cli: Cli) -> Result<()> {
                 }
             }
 
-            let result = pipeline::process_pending(
-                &mut db,
-                &fetcher,
-                &llm,
-                embeddings.as_mut(),
-                &config,
-                &lang,
+            let options = pipeline::RunOptions {
+                config: &config,
+                lang: &lang,
+                filter: &filter,
                 limit,
-            )
-            .await;
+            };
+            let result =
+                pipeline::process_pending(&mut db, &fetcher, &llm, embeddings.as_mut(), &options).await;
             // Render whatever was finished, even if the run stopped early.
             finish(&db, &cli.out)?;
             if let Some(errors) = embeddings.as_ref().map(|e| e.errors).filter(|n| *n > 0) {
                 println!("{errors} embedding requests failed; the next run fills in the missing vectors.");
             }
             let stats = result?;
-            println!("This run: {} done, {} failed.", stats.done, stats.failed);
+            println!(
+                "This run: {} done, {} unreachable (stub notes), {} failed.",
+                stats.done, stats.unreachable, stats.failed
+            );
+            if stats.filtered > 0 {
+                println!(
+                    "{} pending pages were skipped by the filter and stay pending.",
+                    stats.filtered
+                );
+            }
         }
         Command::Render => finish(&open_db(&cli.out)?, &cli.out)?,
         Command::Report => {
@@ -191,11 +210,20 @@ fn finish(db: &Db, out: &Path) -> Result<()> {
         render::report(&tags::count_tree(&db.tags()?, &db.tag_links()?))
     );
     let counts = db.status_counts()?;
+    let causes = db.failure_kinds()?;
+    if !causes.is_empty() {
+        let list: Vec<String> = causes
+            .iter()
+            .map(|(kind, n)| format!("{} {n}", kind.replace('_', " ")))
+            .collect();
+        println!("\nUnreachable or failed pages by cause: {}.", list.join(" · "));
+    }
     println!(
-        "\n{} notes in {}. Pages: {} done, {} failed, {} pending.",
+        "\n{} notes in {}. Pages: {} done, {} unreachable, {} failed, {} pending.",
         rendered.notes,
         out.display(),
         counts.done,
+        counts.unreachable,
         counts.failed,
         counts.pending
     );

@@ -20,6 +20,12 @@ max_input_chars = 12000
 temperature = 0.2
 # Local models can be slow on long pages.
 timeout_secs = 300
+# Retries after a connection error, timeout, HTTP 429 or server error, with
+# increasing waits (honoring Retry-After). After that the run stops, and
+# running it again continues where it stopped.
+retries = 3
+# Limit on requests per minute, for cloud APIs with rate limits. 0: no limit.
+requests_per_minute = 0
 
 # Extra fields added to every request, for server-specific options.
 # Thinking models (qwen3, deepseek-r1, gpt-oss, ...) spend minutes per page
@@ -44,6 +50,8 @@ timeout_secs = 60
 
 [fetch]
 timeout_secs = 20
+# Retries after a timeout, connection error, HTTP 429 or server error.
+retries = 2
 user_agent = "Mozilla/5.0 (compatible; tabkeeper/0.1; +https://github.com/agegechkori/tabkeeper)"
 
 [tags]
@@ -55,3 +63,25 @@ vocabulary_limit = 50
 # Maximum number of levels in the tag tree, e.g. technology/ai/llm is 3.
 # The tree is built at the end of a run; not implemented yet.
 max_depth = 3
+
+[filter]
+# "deny": skip URLs matching any rule. "allow": process only URLs matching a
+# rule. Browser-internal and local URLs (chrome://, about:, file://) are
+# always skipped. --allow and --deny add rules for one run.
+mode = "deny"
+rules = [
+  # "domain:bank.example.com",          # the domain and its subdomains
+  # "glob:https://*.corp.internal/*",
+  # "regex:^https://mail\\.google\\.com/",
+  # "prefix:http://localhost",
+]
+
+[run]
+# Pages processed at the same time. Local servers such as Ollama handle a
+# few requests at once; more mainly helps with fetching.
+concurrency = 4
+# Pages fetched at the same time from one domain.
+per_domain = 2
+# The first pages are processed one at a time, so their tags are there for
+# the pages that follow.
+sequential_start = 20

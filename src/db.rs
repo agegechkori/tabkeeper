@@ -5,9 +5,9 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::tags::TagRow;
 
-const SCHEMA_VERSION: i32 = 2;
+const SCHEMA_VERSION: i32 = 3;
 
-const SCHEMA: &str = "
+const PAGES_TABLE: &str = "
 CREATE TABLE pages (
     id            INTEGER PRIMARY KEY,
     url           TEXT NOT NULL UNIQUE,   -- normalized, used for deduplication
@@ -15,8 +15,9 @@ CREATE TABLE pages (
     browser_title TEXT,
     source        TEXT NOT NULL,          -- where the URL came from, e.g. 'import'
     status        TEXT NOT NULL DEFAULT 'pending'
-                  CHECK (status IN ('pending', 'done', 'failed')),
+                  CHECK (status IN ('pending', 'done', 'failed', 'unreachable')),
     error         TEXT,
+    error_kind    TEXT,                   -- why it failed or was unreachable, e.g. 'not_found'
     title         TEXT,
     summary       TEXT,
     lang          TEXT,
@@ -24,7 +25,9 @@ CREATE TABLE pages (
     added_at      TEXT NOT NULL,
     processed_at  TEXT
 );
+";
 
+const SCHEMA: &str = "
 -- Every tag has a unique flat name. parent_id places it in the tag tree,
 -- which the end-of-run reconciliation builds; until then all tags are roots.
 CREATE TABLE tags (
@@ -103,6 +106,7 @@ pub struct StatusCounts {
     pub pending: usize,
     pub done: usize,
     pub failed: usize,
+    pub unreachable: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,9 +155,11 @@ impl Db {
         let version: i32 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
         match version {
             0 => {
+                conn.execute_batch(PAGES_TABLE)?;
                 conn.execute_batch(SCHEMA)?;
                 conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             }
+            2 => migrate_v2_to_v3(&conn)?,
             1 => bail!(
                 "this output folder was created by an early development version of tabkeeper that used \
                  hierarchical tags per page; use a new --out folder"
@@ -182,9 +188,11 @@ impl Db {
         Ok(n == 1)
     }
 
+    /// Makes failed and unreachable pages pending again.
     pub fn retry_failed(&self) -> Result<usize> {
         Ok(self.conn.execute(
-            "UPDATE pages SET status = 'pending', error = NULL WHERE status = 'failed'",
+            "UPDATE pages SET status = 'pending', error = NULL, error_kind = NULL
+             WHERE status IN ('failed', 'unreachable')",
             [],
         )?)
     }
@@ -215,26 +223,74 @@ impl Db {
             match status.as_str() {
                 "pending" => counts.pending = n,
                 "done" => counts.done = n,
+                "unreachable" => counts.unreachable = n,
                 _ => counts.failed = n,
             }
         }
         Ok(counts)
     }
 
-    pub fn mark_failed(&self, page_id: i64, error: &str) -> Result<()> {
+    /// (error kind, pages) for failed and unreachable pages, by kind.
+    pub fn failure_kinds(&self) -> Result<Vec<(String, usize)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT ifnull(error_kind, 'unknown'), COUNT(*) FROM pages
+             WHERE status IN ('failed', 'unreachable') GROUP BY 1 ORDER BY 1",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+        rows.map(|row| {
+            let (kind, n) = row?;
+            Ok((kind, usize::try_from(n)?))
+        })
+        .collect()
+    }
+
+    pub fn mark_failed(&self, page_id: i64, kind: &str, error: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE pages SET status = 'failed', error = ?2, processed_at = ?3 WHERE id = ?1",
-            params![page_id, error, now()],
+            "UPDATE pages SET status = 'failed', error_kind = ?2, error = ?3, processed_at = ?4 WHERE id = ?1",
+            params![page_id, kind, error, now()],
         )?;
         Ok(())
     }
 
+    /// Saves a stub for a page that couldn't be reached: a title and a
+    /// one-line summary saying why, tagged `status/unreachable`.
+    pub fn save_unreachable(
+        &mut self,
+        page_id: i64,
+        stub: &PageResult,
+        kind: &str,
+        error: &str,
+    ) -> Result<()> {
+        self.save(page_id, "unreachable", Some((kind, error)), stub)
+    }
+
     pub fn save_result(&mut self, page_id: i64, result: &PageResult) -> Result<()> {
+        self.save(page_id, "done", None, result)
+    }
+
+    fn save(
+        &mut self,
+        page_id: i64,
+        status: &str,
+        error: Option<(&str, &str)>,
+        result: &PageResult,
+    ) -> Result<()> {
+        let (kind, message) = error.unzip();
         let tx = self.conn.transaction()?;
         tx.execute(
-            "UPDATE pages SET status = 'done', error = NULL, title = ?2, summary = ?3, lang = ?4, processed_at = ?5
+            "UPDATE pages SET status = ?2, error_kind = ?3, error = ?4, title = ?5, summary = ?6, lang = ?7,
+                              processed_at = ?8
              WHERE id = ?1",
-            params![page_id, result.title, result.summary, result.lang, now()],
+            params![
+                page_id,
+                status,
+                kind,
+                message,
+                result.title,
+                result.summary,
+                result.lang,
+                now()
+            ],
         )?;
         tx.execute("DELETE FROM page_tags WHERE page_id = ?1", [page_id])?;
         for (raw, tag_id) in result.tags {
@@ -309,21 +365,22 @@ impl Db {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Distinct (page id, tag id) pairs for pages that are done.
+    /// Distinct (page id, tag id) pairs for pages with notes: done or unreachable.
     pub fn tag_links(&self) -> Result<Vec<(i64, i64)>> {
         let mut stmt = self.conn.prepare(
             "SELECT DISTINCT pt.page_id, pt.resolved_tag_id
              FROM page_tags pt JOIN pages p ON p.id = pt.page_id
-             WHERE p.status = 'done'",
+             WHERE p.status IN ('done', 'unreachable')",
         )?;
         let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Pages that get a note: done, and unreachable (stub notes).
     pub fn done_pages(&self) -> Result<Vec<DonePage>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, url, source, title, summary, lang, note_file, processed_at
-             FROM pages WHERE status = 'done' ORDER BY id",
+             FROM pages WHERE status IN ('done', 'unreachable') ORDER BY id",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok(DonePage {
@@ -398,6 +455,32 @@ impl Db {
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
+}
+
+/// Version 3 adds the 'unreachable' page status and pages.error_kind. SQLite
+/// can't change a CHECK constraint, so the pages table is rebuilt, keeping
+/// every row and id.
+fn migrate_v2_to_v3(conn: &Connection) -> Result<()> {
+    const COLUMNS: &str = "id, url, original_url, browser_title, source, status, error, title, summary, lang, \
+                           note_file, added_at, processed_at";
+    // Foreign keys can only be switched off outside a transaction.
+    conn.pragma_update(None, "foreign_keys", "OFF")?;
+    let result = conn.execute_batch(&format!(
+        "BEGIN;
+         {new_table}
+         INSERT INTO pages_v3 ({COLUMNS}) SELECT {COLUMNS} FROM pages;
+         DROP TABLE pages;
+         ALTER TABLE pages_v3 RENAME TO pages;
+         PRAGMA user_version = 3;
+         COMMIT;",
+        new_table = PAGES_TABLE.replace("CREATE TABLE pages (", "CREATE TABLE pages_v3 ("),
+    ));
+    if result.is_err() {
+        conn.execute_batch("ROLLBACK").ok();
+    }
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    result.context("upgrading the database to version 3")?;
+    Ok(())
 }
 
 /// What is embedded for a tag: its name, which is kebab-case, plus its description.
@@ -484,7 +567,8 @@ mod tests {
             StatusCounts {
                 pending: 0,
                 done: 1,
-                failed: 0
+                failed: 0,
+                unreachable: 0
             }
         );
     }
@@ -533,6 +617,76 @@ mod tests {
             db.pages_missing_embedding("m").unwrap(),
             [(page, "T\nS.".to_string())]
         );
+    }
+
+    /// The version 2 schema, as released in phase 2a.
+    const SCHEMA_V2_PAGES: &str = "
+        CREATE TABLE pages (
+            id INTEGER PRIMARY KEY, url TEXT NOT NULL UNIQUE, original_url TEXT NOT NULL, browser_title TEXT,
+            source TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'done', 'failed')),
+            error TEXT, title TEXT, summary TEXT, lang TEXT, note_file TEXT UNIQUE, added_at TEXT NOT NULL,
+            processed_at TEXT
+        );";
+
+    #[test]
+    fn migrates_version_two_keeping_pages_and_tags() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        {
+            let conn = Connection::open(file.path()).unwrap();
+            conn.execute_batch(SCHEMA_V2_PAGES).unwrap();
+            conn.execute_batch(SCHEMA).unwrap();
+            conn.execute_batch(
+                "INSERT INTO pages (id, url, original_url, source, status, title, summary, note_file, added_at,
+                                    processed_at)
+                 VALUES (7, 'https://a.com/', 'https://a.com/', 'import', 'done', 'T', 'S.', 't.md', 'x', 'y'),
+                        (8, 'https://b.com/', 'https://b.com/', 'import', 'failed', NULL, NULL, NULL, 'x', 'y');
+                 INSERT INTO tags (id, name, created_at) VALUES (3, 'rust', 'x');
+                 INSERT INTO page_tags VALUES (7, 'rust', 3);
+                 PRAGMA user_version = 2;",
+            )
+            .unwrap();
+        }
+        let mut db = Db::open(file.path()).unwrap();
+        let version: i32 = db
+            .conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let pages = db.done_pages().unwrap();
+        assert_eq!(
+            (
+                pages[0].id,
+                pages[0].title.as_str(),
+                pages[0].note_file.as_deref()
+            ),
+            (7, "T", Some("t.md"))
+        );
+        assert_eq!(db.tag_links().unwrap(), [(7, 3)]);
+        let fk: bool = db
+            .conn
+            .pragma_query_value(None, "foreign_keys", |r| r.get(0))
+            .unwrap();
+        assert!(fk, "foreign keys are back on");
+
+        // The new status works.
+        let stub = PageResult {
+            title: "B",
+            summary: "Unreachable.",
+            lang: None,
+            tags: &[],
+        };
+        db.save_unreachable(8, &stub, "not_found", "HTTP 404").unwrap();
+        assert_eq!(
+            db.status_counts().unwrap(),
+            StatusCounts {
+                pending: 0,
+                done: 1,
+                failed: 0,
+                unreachable: 1
+            }
+        );
+        assert_eq!(db.failure_kinds().unwrap(), [("not_found".to_string(), 1)]);
     }
 
     #[test]

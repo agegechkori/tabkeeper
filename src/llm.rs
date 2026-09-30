@@ -63,11 +63,31 @@ pub struct NewTag {
 /// because the reply was invalid or the request was too large. Other errors
 /// (connection refused, authentication, server errors) affect every page.
 #[derive(Debug)]
-pub struct PageRejected(pub String);
+pub struct PageRejected {
+    /// Stored with the page for the final report: `invalid_reply` or `rejected`.
+    pub kind: &'static str,
+    pub message: String,
+}
+
+impl PageRejected {
+    pub fn invalid_reply(message: String) -> Self {
+        Self {
+            kind: "invalid_reply",
+            message,
+        }
+    }
+
+    pub fn rejected(message: String) -> Self {
+        Self {
+            kind: "rejected",
+            message,
+        }
+    }
+}
 
 impl std::fmt::Display for PageRejected {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.message)
     }
 }
 
@@ -83,6 +103,8 @@ pub struct OpenAiCompatible {
     client: reqwest::Client,
     config: LlmConfig,
     api_key: Option<String>,
+    /// When the next request may start, if requests per minute are limited.
+    next_slot: tokio::sync::Mutex<tokio::time::Instant>,
 }
 
 impl OpenAiCompatible {
@@ -101,28 +123,65 @@ impl OpenAiCompatible {
             client,
             config: config.clone(),
             api_key,
+            next_slot: tokio::sync::Mutex::new(tokio::time::Instant::now()),
         })
     }
 
+    /// Waits until the requests-per-minute limit allows another request.
+    async fn wait_for_slot(&self) {
+        if self.config.requests_per_minute == 0 {
+            return;
+        }
+        let interval = Duration::from_secs_f64(60.0 / f64::from(self.config.requests_per_minute));
+        // Holding the lock while sleeping queues concurrent requests in order.
+        let mut next = self.next_slot.lock().await;
+        tokio::time::sleep_until(*next).await;
+        *next = tokio::time::Instant::now() + interval;
+    }
+
+    /// Sends one chat request, retrying connection errors, timeouts, HTTP 429
+    /// and server errors with increasing waits. Other errors are returned at once.
     async fn complete(&self, messages: &[Value]) -> Result<String> {
         let url = format!("{}/chat/completions", self.config.base_url.trim_end_matches('/'));
         let body = request_body(&self.config, messages);
-        let mut request = self.client.post(&url).json(&body);
-        if let Some(key) = &self.api_key {
-            request = request.bearer_auth(key);
-        }
-        let response = request.send().await.with_context(|| format!("calling {url}"))?;
-        let status = response.status();
-        let text = response.text().await?;
-        if !status.is_success() {
-            let message = format!("LLM server returned HTTP {status}: {}", snippet(&text));
-            // Bad request / too large / unprocessable usually means this page's
-            // prompt, e.g. more tokens than the model's context window.
-            if matches!(status.as_u16(), 400 | 413 | 422) {
-                return Err(PageRejected(message).into());
+        let mut attempt = 0;
+        let text = loop {
+            self.wait_for_slot().await;
+            let mut request = self.client.post(&url).json(&body);
+            if let Some(key) = &self.api_key {
+                request = request.bearer_auth(key);
             }
-            bail!(message);
-        }
+            let (error, wait) = match request.send().await {
+                Err(err) => (anyhow::Error::new(err).context(format!("calling {url}")), None),
+                Ok(response) => {
+                    let status = response.status();
+                    let wait = crate::fetch::retry_after(&response);
+                    let text = response.text().await?;
+                    if status.is_success() {
+                        break text;
+                    }
+                    let message = format!("LLM server returned HTTP {status}: {}", snippet(&text));
+                    // Bad request / too large / unprocessable usually means this page's
+                    // prompt, e.g. more tokens than the model's context window.
+                    if matches!(status.as_u16(), 400 | 413 | 422) {
+                        return Err(PageRejected::rejected(message).into());
+                    }
+                    if status.as_u16() != 429 && !status.is_server_error() {
+                        bail!(message);
+                    }
+                    (anyhow!(message), wait)
+                }
+            };
+            if attempt >= self.config.retries {
+                return Err(error.context(format!("gave up after {} attempts", attempt + 1)));
+            }
+            tokio::time::sleep(
+                wait.unwrap_or_else(|| crate::fetch::backoff(attempt))
+                    .min(Duration::from_secs(60)),
+            )
+            .await;
+            attempt += 1;
+        };
         let value: Value =
             serde_json::from_str(&text).with_context(|| format!("invalid response: {}", snippet(&text)))?;
         value["choices"][0]["message"]["content"]
@@ -149,7 +208,8 @@ impl Llm for OpenAiCompatible {
                 )}));
                 let content = self.complete(&messages).await?;
                 parse_summary(&content).map_err(|err| {
-                    PageRejected(format!("model returned an invalid reply twice: {err:#}")).into()
+                    PageRejected::invalid_reply(format!("model returned an invalid reply twice: {err:#}"))
+                        .into()
                 })
             }
         }
