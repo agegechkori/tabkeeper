@@ -1,0 +1,10 @@
+[package]
+name = "tabkeeper"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Summarize and tag every open browser tab into Markdown notes"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/agegechkori/tabkeeper"
+
+[dependencies]
