@@ -134,27 +134,35 @@ fn resolve_tags(db: &Db, summary: &PageSummary, limits: &TagConfig) -> Result<Ve
         .collect();
 
     let mut seen = HashSet::new();
+    let candidates: Vec<(&String, TagPath)> = summary
+        .tags
+        .iter()
+        .filter_map(|raw| Some((raw, TagPath::parse(raw, limits.max_depth)?)))
+        .filter(|(_, path)| !path.is_reserved() && seen.insert(path.clone()))
+        .collect();
+    // A tag is implied by its descendants, so drop it when one is present:
+    // programming-languages + programming-languages/rust keeps only the latter.
+    let has_descendant = |path: &TagPath| {
+        candidates.iter().any(|(_, other)| {
+            other.segments().len() > path.segments().len() && other.segments().starts_with(path.segments())
+        })
+    };
+
     let mut resolved = Vec::new();
     let mut new_count = 0;
-    for raw in &summary.tags {
+    for (raw, path) in candidates.iter().filter(|(_, path)| !has_descendant(path)) {
         if resolved.len() >= limits.max_per_page {
             break;
         }
-        let Some(path) = TagPath::parse(raw, limits.max_depth) else {
-            continue;
-        };
-        if path.is_reserved() || !seen.insert(path.clone()) {
-            continue;
-        }
-        if db.tag_id(&path)?.is_none() {
+        if db.tag_id(path)?.is_none() {
             // Over the new-tag limit: skip, unless the page would end up untagged.
             if new_count >= limits.max_new_per_page && !resolved.is_empty() {
                 continue;
             }
             new_count += 1;
         }
-        let id = db.ensure_tag(&path, descriptions.get(&path).copied())?;
-        resolved.push((raw.clone(), id));
+        let id = db.ensure_tag(path, descriptions.get(path).copied())?;
+        resolved.push(((*raw).clone(), id));
     }
     Ok(resolved)
 }
@@ -290,6 +298,27 @@ mod tests {
         run(&mut db, &llm).await.unwrap();
         let paths: Vec<String> = db.tags().unwrap().into_iter().map(|t| t.path).collect();
         assert_eq!(paths, ["a", "b"]);
+    }
+
+    #[tokio::test]
+    async fn drops_tags_implied_by_a_descendant() {
+        let mut db = db_with(&["https://a.com/"]);
+        let llm = FakeLlm::new(vec![Ok(summary(
+            "T",
+            &["lang", "lang/rust", "Lang/Rust", "food"],
+            &[],
+        ))]);
+        run(&mut db, &llm).await.unwrap();
+        let tags = db.tags().unwrap();
+        let tagged: Vec<&str> = db
+            .tag_links()
+            .unwrap()
+            .iter()
+            .map(|(_, id)| tags.iter().find(|t| t.id == *id).unwrap().path.as_str())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        assert_eq!(tagged, ["food", "lang/rust"]);
     }
 
     #[tokio::test]

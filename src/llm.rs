@@ -201,6 +201,9 @@ fn request_body(config: &LlmConfig, messages: &[Value]) -> Value {
         StructuredOutput::JsonObject => body["response_format"] = json!({"type": "json_object"}),
         StructuredOutput::None => {}
     }
+    for (key, value) in &config.extra_body {
+        body[key] = value.clone();
+    }
     body
 }
 
@@ -325,6 +328,15 @@ mod tests {
         );
         config.structured_output = StructuredOutput::None;
         assert!(request_body(&config, &[]).get("response_format").is_none());
+    }
+
+    #[test]
+    fn extra_body_is_merged_from_config() {
+        let config =
+            crate::config::Config::parse("[llm.extra_body]\nthink = false\ntemperature = 0.0").unwrap();
+        let body = request_body(&config.llm, &[]);
+        assert_eq!(body["think"], false);
+        assert_eq!(body["temperature"], 0.0);
     }
 
     #[test]

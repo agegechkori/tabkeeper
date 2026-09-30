@@ -40,6 +40,9 @@ pub struct LlmConfig {
     pub max_input_chars: usize,
     pub temperature: f32,
     pub timeout_secs: u64,
+    /// Extra fields merged into every request body, for server-specific
+    /// options such as turning off a model's thinking step.
+    pub extra_body: serde_json::Map<String, serde_json::Value>,
 }
 
 impl Default for LlmConfig {
@@ -53,6 +56,7 @@ impl Default for LlmConfig {
             max_input_chars: 12_000,
             temperature: 0.2,
             timeout_secs: 300,
+            extra_body: serde_json::Map::new(),
         }
     }
 }

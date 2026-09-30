@@ -15,6 +15,13 @@ cargo build --release
 ./target/release/tabkeeper import urls.txt --model qwen3:4b
 ```
 
+With a thinking model such as `qwen3`, turn thinking off in the config file (see `tabkeeper config`); otherwise each page can take minutes instead of seconds:
+
+```toml
+[llm.extra_body]
+reasoning_effort = "none"
+```
+
 This writes to `tabkeeper-out/` (change it with `--out`):
 
 - `notes/*.md`: one note per page, with a title, the URL, a short summary and hierarchical tags such as `#technology/programming-languages/rust`

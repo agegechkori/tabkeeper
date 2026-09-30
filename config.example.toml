@@ -21,6 +21,13 @@ temperature = 0.2
 # Local models can be slow on long pages.
 timeout_secs = 300
 
+# Extra fields added to every request, for server-specific options.
+# Thinking models (qwen3, deepseek-r1, gpt-oss, ...) spend minutes per page
+# reasoning before they answer. On Ollama this turns that off, which makes
+# them roughly 50 times faster:
+# [llm.extra_body]
+# reasoning_effort = "none"
+
 [fetch]
 timeout_secs = 20
 user_agent = "Mozilla/5.0 (compatible; tabkeeper/0.1; +https://github.com/agegechkori/tabkeeper)"
