@@ -1,0 +1,42 @@
+{
+  "permissions": {
+    "deny": [
+      "Bash(rm -rf *)",
+      "Bash(rm -fr *)",
+      "Bash(sudo *)",
+      "Read(~/.ssh/**)",
+      "Edit(~/.ssh/**)",
+      "Read(~/.aws/**)",
+      "Read(~/.gnupg/**)",
+      "Read(~/.config/gcloud/**)",
+      "Edit(~/.mozilla/**)",
+      "Edit(~/.config/google-chrome/**)",
+      "Edit(~/.config/chromium/**)",
+      "Edit(~/.config/BraveSoftware/**)",
+      "Edit(~/.config/microsoft-edge/**)",
+      "Edit(~/.config/vivaldi/**)",
+      "Edit(~/Library/Application Support/Firefox/**)",
+      "Edit(~/Library/Application Support/Google/Chrome/**)",
+      "Edit(~/Library/Application Support/BraveSoftware/**)",
+      "Edit(~/Library/Application Support/Microsoft Edge/**)",
+      "Edit(~/Library/Application Support/Vivaldi/**)",
+      "Edit(~/Library/Safari/**)"
+    ],
+    "ask": [
+      "Bash(git push --force *)",
+      "Bash(git push -f *)",
+      "Bash(git reset --hard *)"
+    ]
+  },
+  "sandbox": {
+    "enabled": true,
+    "network": {
+      "allowedDomains": [
+        "crates.io",
+        "*.crates.io",
+        "github.com",
+        "*.githubusercontent.com"
+      ]
+    }
+  }
+}
