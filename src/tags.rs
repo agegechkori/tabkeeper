@@ -33,45 +33,6 @@ fn kebab_case(raw: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-/// Singular and plural spellings of a tag's last word, so `board-games`
-/// finds an existing `board-game` and the other way around. Only used to
-/// look up tags that already exist, so a wrong guess like `gam` is harmless.
-pub fn plural_variants(name: &str) -> Vec<String> {
-    let (head, last) = match name.rsplit_once('-') {
-        Some((head, last)) => (Some(head), last),
-        None => (None, name),
-    };
-    let mut words = Vec::new();
-    if last.chars().count() > 3
-        && last.ends_with('s')
-        && !(last.ends_with("ss") || last.ends_with("us") || last.ends_with("is"))
-    {
-        if let Some(stem) = last.strip_suffix("ies") {
-            words.push(format!("{stem}y"));
-        }
-        if let Some(stem) = last.strip_suffix("es") {
-            words.push(stem.to_string());
-        }
-        words.push(last[..last.len() - 1].to_string());
-    } else if !last.ends_with('s') {
-        words.push(format!("{last}s"));
-        if ["x", "z", "ch", "sh"].iter().any(|end| last.ends_with(end)) {
-            words.push(format!("{last}es"));
-        }
-        if let Some(stem) = last.strip_suffix('y') {
-            words.push(format!("{stem}ies"));
-        }
-    }
-    words
-        .into_iter()
-        .filter(|w| w != last && !w.is_empty())
-        .map(|w| match head {
-            Some(head) => format!("{head}-{w}"),
-            None => w,
-        })
-        .collect()
-}
-
 /// A tag as stored in the database.
 #[derive(Debug, Clone)]
 pub struct TagRow {
@@ -202,21 +163,6 @@ mod tests {
         assert_eq!(normalize_name("///"), None);
         assert_eq!(normalize_name("2024"), None);
         assert_eq!(normalize_name("web3").as_deref(), Some("web3"));
-    }
-
-    #[test]
-    fn plural_variants_both_ways() {
-        assert!(plural_variants("board-games").contains(&"board-game".to_string()));
-        assert!(plural_variants("board-game").contains(&"board-games".to_string()));
-        assert!(plural_variants("policies").contains(&"policy".to_string()));
-        assert!(plural_variants("policy").contains(&"policies".to_string()));
-        assert!(plural_variants("boxes").contains(&"box".to_string()));
-        assert!(plural_variants("box").contains(&"boxes".to_string()));
-        // Words that end in s without being plural are left alone.
-        assert!(plural_variants("css").is_empty());
-        assert!(plural_variants("status").is_empty());
-        assert!(plural_variants("analysis").is_empty());
-        assert!(plural_variants("gas").is_empty());
     }
 
     fn row(id: i64, parent: Option<i64>, name: &str) -> TagRow {

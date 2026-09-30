@@ -34,6 +34,9 @@ pub struct Embeddings<'a, E: Embedder> {
     embedder: &'a E,
     index: TagIndex,
     page_chars: usize,
+    /// Embedding requests that failed during the run. A failure only costs
+    /// that page its relevant tags, and the next run fills in missing vectors.
+    pub errors: usize,
 }
 
 impl<'a, E: Embedder> Embeddings<'a, E> {
@@ -61,7 +64,20 @@ impl<'a, E: Embedder> Embeddings<'a, E> {
             embedder,
             index,
             page_chars,
+            errors: 0,
         })
+    }
+
+    /// Records a failed embedding request. Only the first one is printed,
+    /// so a flaky embeddings server doesn't flood the output.
+    fn note_error(&mut self, what: &str, err: &anyhow::Error) {
+        if self.errors == 0 {
+            println!(
+                "Warning: {what} failed ({err:#}). Continuing: affected pages are shown the most used tags, \
+                 and the next run fills in missing vectors. Further embedding errors are counted, not shown."
+            );
+        }
+        self.errors += 1;
     }
 }
 
@@ -111,7 +127,7 @@ async fn process_one<F: Fetcher, L: Llm, E: Embedder>(
     db: &mut Db,
     fetcher: &F,
     llm: &L,
-    embeddings: Option<&mut Embeddings<'_, E>>,
+    mut embeddings: Option<&mut Embeddings<'_, E>>,
     config: &Config,
     lang: &LangMode,
     page: &PendingPage,
@@ -128,19 +144,23 @@ async fn process_one<F: Fetcher, L: Llm, E: Embedder>(
         .map(|info| info.lang().eng_name());
 
     let counted = count_tree(&db.tags()?, &db.tag_links()?);
-    let shown = match embeddings.as_deref() {
-        Some(e) if e.index.len() > 0 => {
-            let query = format!("{title}\n{}", truncate_chars(&extracted.text, e.page_chars));
-            let vector = e
-                .embedder
-                .embed(&[query])
-                .await
-                .context("embedding the page")?
-                .remove(0);
-            relevant_tags(&counted, &e.index, &vector, config.tags.vocabulary_limit)
+    let mut shown = None;
+    if let Some(e) = embeddings.as_deref_mut().filter(|e| e.index.len() > 0) {
+        let query = format!("{title}\n{}", truncate_chars(&extracted.text, e.page_chars));
+        match e.embedder.embed(&[query]).await {
+            Ok(mut vectors) => {
+                let vector = vectors.remove(0);
+                shown = Some(relevant_tags(
+                    &counted,
+                    &e.index,
+                    &vector,
+                    config.tags.vocabulary_limit,
+                ));
+            }
+            Err(err) => e.note_error("embedding a page", &err),
         }
-        _ => most_used(&counted, config.tags.vocabulary_limit),
-    };
+    }
+    let shown = shown.unwrap_or_else(|| most_used(&counted, config.tags.vocabulary_limit));
     let vocabulary = format_vocabulary(&shown);
 
     let request = SummaryRequest {
@@ -160,7 +180,10 @@ async fn process_one<F: Fetcher, L: Llm, E: Embedder>(
         }
     })?;
 
-    let ResolvedTags { page_tags: tags, created } = resolve_tags(db, &summary, &config.tags)?;
+    let ResolvedTags {
+        page_tags: tags,
+        created,
+    } = resolve_tags(db, &summary, &config.tags)?;
     let title = summary.title.trim();
     let text = summary.summary.trim();
     let language = summary.language.trim().to_ascii_lowercase();
@@ -176,12 +199,18 @@ async fn process_one<F: Fetcher, L: Llm, E: Embedder>(
     .context("saving result")?;
 
     // New tags must be searchable for the next page; the page's own vector is
-    // kept for the end-of-run tag reconciliation. If this fails, the next run
-    // fills in what's missing.
+    // kept for the end-of-run tag reconciliation. The page is already saved,
+    // so a failure here only costs vectors, which the next run fills in.
     if let Some(e) = embeddings {
         let mut texts: Vec<String> = created.iter().map(|(_, text)| text.clone()).collect();
         texts.push(page_embedding_text(title, text));
-        let mut vectors = e.embedder.embed(&texts).await.context("embedding new tags")?;
+        let mut vectors = match e.embedder.embed(&texts).await {
+            Ok(vectors) => vectors,
+            Err(err) => {
+                e.note_error("embedding new tags", &err);
+                return Ok(title.to_string());
+            }
+        };
         let model = e.embedder.model().to_string();
         db.put_embedding(
             EmbeddingKind::Page,
@@ -226,11 +255,7 @@ struct ResolvedTags {
 /// Normalizes the model's tags, maps spelling variants to existing tags,
 /// enforces the per-page limits, and creates new tags with their
 /// descriptions.
-fn resolve_tags(
-    db: &Db,
-    summary: &PageSummary,
-    limits: &TagConfig,
-) -> Result<ResolvedTags> {
+fn resolve_tags(db: &Db, summary: &PageSummary, limits: &TagConfig) -> Result<ResolvedTags> {
     let descriptions: HashMap<String, &str> = summary
         .new_tags
         .iter()
@@ -279,7 +304,10 @@ fn resolve_tags(
             resolved.push((raw.clone(), id));
         }
     }
-    Ok(ResolvedTags { page_tags: resolved, created })
+    Ok(ResolvedTags {
+        page_tags: resolved,
+        created,
+    })
 }
 
 #[cfg(test)]
@@ -367,6 +395,30 @@ mod tests {
                     v.into_iter().map(|x| x / norm).collect()
                 })
                 .collect())
+        }
+    }
+
+    /// Works while a run is being prepared, then fails the chosen requests:
+    /// embedding a page before the model call ("query"), or storing a
+    /// finished page's vectors ("store").
+    struct FlakyEmbedder {
+        fail_query: bool,
+        fail_store: bool,
+    }
+
+    impl Embedder for FlakyEmbedder {
+        fn model(&self) -> &str {
+            "fake"
+        }
+
+        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            // The fake fetcher's pages are titled "Page <url>".
+            let is_query = texts.len() == 1 && texts[0].starts_with("Page ");
+            let is_probe = texts.len() == 1 && texts[0] == "tabkeeper";
+            if !is_probe && ((is_query && self.fail_query) || (!is_query && self.fail_store)) {
+                bail!("embeddings server returned HTTP 500");
+            }
+            FakeEmbedder.embed(texts).await
         }
     }
 
@@ -472,28 +524,17 @@ mod tests {
     async fn merges_spelling_variants_into_existing_tags() {
         let mut db = db_with(&["https://a.com/", "https://b.com/"]);
         let llm = FakeLlm::new(vec![
-            Ok(summary("T", &["board-games", "machine-learning"], &[])),
-            Ok(summary(
-                "T",
-                &["Board Game", "machinelearning", "board-games"],
-                &[],
-            )),
+            Ok(summary("T", &["board-games", "machine-learning", "glass"], &[])),
+            Ok(summary("T", &["Board Games", "machinelearning", "glasses"], &[])),
         ]);
         run(&mut db, &llm).await.unwrap();
+        // Spacing and hyphen variants resolve to the existing tags; a plural is
+        // a new tag until reconciliation decides whether it means the same.
         let names: Vec<String> = db.tags().unwrap().into_iter().map(|t| t.name).collect();
-        assert_eq!(names, ["board-games", "machine-learning"]);
-        assert_eq!(
-            page_tag_names(&db),
-            [
-                "board-games",
-                "board-games",
-                "machine-learning",
-                "machine-learning"
-            ]
-        );
+        assert_eq!(names, ["board-games", "glass", "glasses", "machine-learning"]);
         // The variant is recorded, so the next page finds it directly.
         assert_eq!(
-            db.find_tag("board-game").unwrap().map(|(_, other)| other),
+            db.find_tag("machinelearning").unwrap().map(|(_, other)| other),
             Some(true)
         );
     }
@@ -546,6 +587,67 @@ mod tests {
         assert!(db.tags_missing_embedding("fake").unwrap().is_empty());
         assert!(db.pages_missing_embedding("fake").unwrap().is_empty());
         assert_eq!(db.embeddings(EmbeddingKind::Page, "fake").unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn failed_page_embedding_falls_back_to_most_used_tags() {
+        let mut db = db_with(&["https://a.com/", "https://b.com/"]);
+        let llm = FakeLlm::new(vec![
+            Ok(summary("First", &["alpha"], &[])),
+            Ok(summary("Second", &["beta"], &[])),
+        ]);
+        let embedder = FlakyEmbedder {
+            fail_query: true,
+            fail_store: false,
+        };
+        let mut embeddings = Embeddings::prepare(&db, &embedder, 2000).await.unwrap();
+        let stats = process_pending(
+            &mut db,
+            &FakeFetcher,
+            &llm,
+            Some(&mut embeddings),
+            &Config::default(),
+            &LangMode::English,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats, Stats { done: 2, failed: 0 });
+        assert_eq!(embeddings.errors, 1);
+        // The second page couldn't be embedded, so it was shown the most used tags.
+        assert!(llm.seen_vocab.borrow()[1].starts_with("alpha (1)"));
+    }
+
+    #[tokio::test]
+    async fn failed_vector_storage_keeps_the_page_and_is_backfilled() {
+        let mut db = db_with(&["https://a.com/", "https://b.com/"]);
+        let llm = FakeLlm::new(vec![
+            Ok(summary("First", &["alpha"], &[])),
+            Ok(summary("Second", &["beta"], &[])),
+        ]);
+        let embedder = FlakyEmbedder {
+            fail_query: false,
+            fail_store: true,
+        };
+        let mut embeddings = Embeddings::prepare(&db, &embedder, 2000).await.unwrap();
+        let stats = process_pending(
+            &mut db,
+            &FakeFetcher,
+            &llm,
+            Some(&mut embeddings),
+            &Config::default(),
+            &LangMode::English,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats, Stats { done: 2, failed: 0 });
+        assert_eq!(embeddings.errors, 2);
+        assert_eq!(db.tags_missing_embedding("fake").unwrap().len(), 2);
+        // The next run fills in what's missing.
+        Embeddings::prepare(&db, &FakeEmbedder, 2000).await.unwrap();
+        assert!(db.tags_missing_embedding("fake").unwrap().is_empty());
+        assert!(db.pages_missing_embedding("fake").unwrap().is_empty());
     }
 
     #[tokio::test]

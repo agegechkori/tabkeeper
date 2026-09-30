@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::tags::{TagRow, plural_variants};
+use crate::tags::TagRow;
 
 const SCHEMA_VERSION: i32 = 2;
 
@@ -253,9 +253,11 @@ impl Db {
     }
 
     /// Finds the existing tag a normalized name refers to: the tag itself, a
-    /// recorded alias, a plural or singular form (`board-games` / `board-game`),
-    /// or the same words without hyphens (`machinelearning` / `machine-learning`).
-    /// Returns the tag id and whether it was found under a different name.
+    /// recorded alias, or the same words without hyphens (`machinelearning` /
+    /// `machine-learning`). Returns the tag id and whether it was found under a
+    /// different name. Plural and singular forms are not matched here: `glasses`
+    /// is not `glass`, so those merges are left to the reconciliation pass,
+    /// where they are confirmed.
     pub fn find_tag(&self, name: &str) -> Result<Option<(i64, bool)>> {
         if let Some(id) = self.tag_id_where("name = ?1", name)? {
             return Ok(Some((id, false)));
@@ -268,11 +270,6 @@ impl Db {
             .optional()?;
         if let Some(id) = alias {
             return Ok(Some((id, true)));
-        }
-        for variant in plural_variants(name) {
-            if let Some(id) = self.tag_id_where("name = ?1", &variant)? {
-                return Ok(Some((id, true)));
-            }
         }
         let squashed = name.replace('-', "");
         Ok(self
@@ -441,7 +438,9 @@ mod tests {
         let games = db.create_tag("board-games", Some("Board games")).unwrap();
         let ml = db.create_tag("machine-learning", None).unwrap();
         assert_eq!(db.find_tag("board-games").unwrap(), Some((games, false)));
-        assert_eq!(db.find_tag("board-game").unwrap(), Some((games, true)));
+        assert_eq!(db.find_tag("boardgames").unwrap(), Some((games, true)));
+        // Plurals are not matched: glasses (eyewear) is not glass.
+        assert_eq!(db.find_tag("board-game").unwrap(), None);
         assert_eq!(db.find_tag("machinelearning").unwrap(), Some((ml, true)));
         assert_eq!(db.find_tag("ml").unwrap(), None);
         db.add_alias("ml", ml, "user").unwrap();

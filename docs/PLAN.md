@@ -97,7 +97,7 @@ Embeddings find candidates; the LLM makes the decisions. They are used for:
 **While pages are processed: flat tags**
 - Each page gets 3–5 flat, lowercase kebab-case English tags. Choosing a few topic tags is an easy task that small, fast models do well.
 - The model sees the existing tags most relevant to the page (picked with embeddings), with counts and descriptions, and must reuse one when it fits.
-- Plural, spelling and punctuation variants are normalized in code as each page is processed.
+- Case, spacing, punctuation and missing hyphens are normalized in code as each page is processed (`Machine Learning`, `machinelearning` → `machine-learning`), and recorded as `rule` aliases. Plural and singular forms are not merged here, because the plural can mean something else (`glasses` is not `glass`, `windows` is not `window`); reconciliation proposes those merges for confirmation.
 - Tags under `status/` are reserved for the tool itself, e.g. `status/unreachable`.
 - Pages don't depend on each other's tags beyond the shared vocabulary, so they can be processed in parallel.
 
@@ -105,7 +105,7 @@ Embeddings find candidates; the LLM makes the decisions. They are used for:
 
 It runs once at the end of every run, including a run that stopped early, and on demand with `tabkeeper revise-tags`. There are no checkpoints during the run: with flat tags and embedding-picked vocabulary there's little to fix mid-run, and one pass over all the tags gives a better result. If long runs turn out to fragment the vocabulary, a cheap synonym merge during the run can be added later.
 
-1. Code normalizes tags and writes these as `rule` aliases.
+1. Code proposes the mechanical merges, such as plural and singular forms (`board-games` / `board-game`), for the LLM to confirm with the rest.
 2. Embeddings propose candidates: likely duplicates, tags whose pages fall into separate clusters, and (hierarchical mode) groups of related tags.
 3. The LLM decides, returning only the changes:
    - **merge:** synonyms and variants become one tag.
