@@ -164,7 +164,7 @@ async fn run(cli: Cli) -> Result<()> {
             }
             let stats = result?;
             println!(
-                "This run: {} done, {} unreachable (stub notes), {} failed.",
+                "This run: {} done, {} unreachable, {} failed (both get stub notes).",
                 stats.done, stats.unreachable, stats.failed
             );
             if stats.filtered > 0 {

@@ -30,7 +30,7 @@ reasoning_effort = "none"
 
 This writes to `tabkeeper-out/` (change it with `--out`):
 
-- `notes/*.md`: one note per page, with a title, the URL, a short summary and 3–5 tags such as `#rust-programming #memory-safety`. Pages that can't be loaded (404, dead domain, timeout, blocked) get a short stub note tagged `#status/unreachable`, so no tab is lost.
+- `notes/*.md`: one note per page, with a title, the URL, a short summary and 3–5 tags such as `#rust-programming #memory-safety`. Pages without a summary still get a short stub note saying why, so no tab is lost: `#status/unreachable` when the page can't be loaded (404, dead domain, timeout, blocked), `#status/failed` when it loads but can't be summarized (a PDF, or the model's reply was unusable).
 - `_tags.md`: all tags with page counts
 - `_index.md`: all notes, each listed under its most used tag
 - `tabkeeper.db`: the SQLite database everything is rendered from

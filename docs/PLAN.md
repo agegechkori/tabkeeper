@@ -56,7 +56,7 @@ With thousands of tabs, most are discarded or unloaded by the browser, so page c
 - Readability-style extraction with `dom_smoothie`; PDFs with `pdf-extract`.
 - Text is cut down to fit the configured budget (`llm.max_input_chars`).
 - Language is detected with `whatlang`.
-- **Unreachable pages** (404s, dead domains, login walls, bot blocks) still get a stub note built from the browser's tab title, tagged `#status/unreachable`.
+- **Every tab gets a note.** Unreachable pages (404s, dead domains, login walls, bot blocks) get a stub note built from the browser's tab title, tagged `#status/unreachable`; pages that load but can't be summarized (PDFs until they're supported, invalid model replies, prompts the server rejects) get one tagged `#status/failed`. Each stub says why.
 
 ### LLM layer
 - Thin adapters built directly on `reqwest`, one per protocol:
@@ -161,7 +161,8 @@ Tabs
     Done           2,871
     Unreachable      142   stub notes tagged #status/unreachable
       404/410         71 · DNS/connection 38 · timeout 19 · blocked (403/429) 14
-    Failed            35   (PDF 21 · invalid model reply 9 · too long for model 5)
+    Failed            35   stub notes tagged #status/failed
+      PDF 21 · invalid model reply 9 · too long for model 5
   Pending              0
 
 Languages  en 2,410 · de 301 · fr 88 · ja 45 · other 27
@@ -192,7 +193,7 @@ Revision   87 merges · 9 splits (e.g. rust → rust-programming, rust-corrosion
 
 <tag tree (hierarchical) or tag list (flat), with page counts>
 
-Notes written to tabkeeper-out/ (2,871 notes + 142 stubs)
+Notes written to tabkeeper-out/ (2,871 notes + 177 stubs)
 ```
 
 Where the model numbers come from:

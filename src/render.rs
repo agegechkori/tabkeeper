@@ -21,7 +21,7 @@ pub fn render_all(db: &Db, out_dir: &Path) -> Result<RenderStats> {
     let notes_dir = out_dir.join(NOTES_DIR);
     std::fs::create_dir_all(&notes_dir).with_context(|| format!("creating {}", notes_dir.display()))?;
 
-    let mut pages = db.done_pages()?;
+    let mut pages = db.note_pages()?;
     assign_note_files(db, &mut pages)?;
 
     let links = db.tag_links()?;
@@ -58,7 +58,9 @@ pub fn render_all(db: &Db, out_dir: &Path) -> Result<RenderStats> {
 /// Gives each page without a note file a unique name based on its title.
 /// Names are stored so a note keeps its file name across renders.
 fn assign_note_files(db: &Db, pages: &mut [DonePage]) -> Result<()> {
-    let mut taken: HashSet<String> = pages.iter().filter_map(|p| p.note_file.clone()).collect();
+    // Every name in the database counts, not just these pages': a page sent
+    // back to pending by --retry-failed keeps its file name.
+    let mut taken: HashSet<String> = db.note_files()?.into_iter().collect();
     for page in pages.iter_mut().filter(|p| p.note_file.is_none()) {
         let base = slug(&page.title);
         let mut name = format!("{base}.md");
@@ -282,7 +284,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(render_all(&db, dir.path()).unwrap(), RenderStats { notes: 3 });
         let files: Vec<Option<String>> = db
-            .done_pages()
+            .note_pages()
             .unwrap()
             .into_iter()
             .map(|p| p.note_file)
@@ -320,12 +322,59 @@ mod tests {
         // A second render keeps the same file names.
         render_all(&db, dir.path()).unwrap();
         let again: Vec<Option<String>> = db
-            .done_pages()
+            .note_pages()
             .unwrap()
             .into_iter()
             .map(|p| p.note_file)
             .collect();
         assert_eq!(files, again);
+    }
+
+    #[test]
+    fn retried_page_keeps_its_file_name() {
+        let mut db = Db::open_in_memory().unwrap();
+        db.add_page("https://a.com/", "https://a.com/", Some("Same Title"), "import")
+            .unwrap();
+        let a = db.pending_pages().unwrap()[0].id;
+        let stub = PageResult {
+            title: "Same Title",
+            summary: "Unreachable.",
+            lang: None,
+            tags: &[],
+        };
+        db.save_unreachable(a, &stub, "timeout", "timed out").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        render_all(&db, dir.path()).unwrap();
+
+        // Page a goes back to pending and the run stops before retrying it;
+        // a new page with the same title must not take a's file name.
+        db.retry_failed().unwrap();
+        db.add_page("https://b.com/", "https://b.com/", None, "import")
+            .unwrap();
+        let b = db.pending_pages().unwrap().iter().find(|p| p.id != a).unwrap().id;
+        db.save_result(
+            b,
+            &PageResult {
+                title: "Same Title",
+                summary: "S.",
+                lang: None,
+                tags: &[],
+            },
+        )
+        .unwrap();
+        render_all(&db, dir.path()).unwrap();
+        let files: Vec<_> = db
+            .note_pages()
+            .unwrap()
+            .into_iter()
+            .map(|p| (p.id, p.note_file))
+            .collect();
+        assert_eq!(files, [(b, Some("same-title-2.md".to_string()))]);
+        assert_eq!(
+            db.note_files().unwrap().len(),
+            2,
+            "a keeps same-title.md for when it's done"
+        );
     }
 
     #[test]

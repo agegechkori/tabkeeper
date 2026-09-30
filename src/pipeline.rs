@@ -11,14 +11,22 @@ use crate::config::{Config, TagConfig};
 use crate::db::{Db, EmbeddingKind, PageResult, PendingPage, page_embedding_text, tag_embedding_text};
 use crate::embed::{BATCH_SIZE, Embedder, TagIndex};
 use crate::extract::{extract, truncate_chars};
-use crate::fetch::{FetchError, Fetcher};
+use crate::fetch::Fetcher;
 use crate::filter::Filter;
 use crate::llm::{LangMode, Llm, PageRejected, PageSummary, SummaryRequest};
 use crate::progress::Progress;
 use crate::tags::{CountedTag, count_tree, format_vocabulary, is_offerable, most_used, normalize_name};
 
-/// Reserved tag for stub notes of pages that couldn't be loaded.
+/// Reserved tags for the stub notes of pages without a summary.
 pub const UNREACHABLE_TAG: &str = "status/unreachable";
+pub const FAILED_TAG: &str = "status/failed";
+
+enum Stub {
+    /// The page couldn't be loaded (404, dead domain, timeout, blocked).
+    Unreachable,
+    /// The page loaded but couldn't be summarized (PDF, invalid model reply).
+    Failed,
+}
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Stats {
@@ -34,7 +42,8 @@ enum Outcome {
     Done(String),
     /// Saved as a stub note; the string says why.
     Unreachable(String),
-    /// Recorded as failed; the page is skipped until `--retry-failed`.
+    /// Saved as a stub note and recorded as failed; the page is skipped until
+    /// `--retry-failed`.
     Failed(String),
     /// Every page would fail (e.g. the LLM server is down): stop the run. The
     /// page stays pending.
@@ -258,7 +267,14 @@ impl<F: Fetcher, L: Llm, E: Embedder> Run<'_, '_, F, L, E> {
         };
         let fetched = match fetched {
             Ok(fetched) => fetched,
-            Err(err) => return self.save_fetch_error(page, &err),
+            Err(err) if err.kind.is_unreachable() => {
+                self.save_stub(page, Stub::Unreachable, err.kind.as_str(), &err.message)?;
+                return Ok(Outcome::Unreachable(err.message));
+            }
+            Err(err) => {
+                self.save_stub(page, Stub::Failed, err.kind.as_str(), &err.message)?;
+                return Ok(Outcome::Failed(err.message));
+            }
         };
 
         let extracted = extract(&fetched.html, &fetched.final_url, self.config.llm.max_input_chars);
@@ -288,7 +304,7 @@ impl<F: Fetcher, L: Llm, E: Embedder> Run<'_, '_, F, L, E> {
                     return Err(err.context("LLM request failed"));
                 };
                 let message = format!("{err:#}");
-                self.db.borrow().mark_failed(page.id, rejected.kind, &message)?;
+                self.save_stub(page, Stub::Failed, rejected.kind, &message)?;
                 return Ok(Outcome::Failed(message));
             }
         };
@@ -314,14 +330,18 @@ impl<F: Fetcher, L: Llm, E: Embedder> Run<'_, '_, F, L, E> {
         Ok(Outcome::Done(title.to_string()))
     }
 
-    /// Unreachable pages get a stub note; pages that loaded but can't be used
-    /// (e.g. PDFs) are recorded as failed.
-    fn save_fetch_error(&self, page: &PendingPage, err: &FetchError) -> Result<Outcome> {
-        let mut db = self.db.borrow_mut();
-        if !err.kind.is_unreachable() {
-            db.mark_failed(page.id, err.kind.as_str(), &err.message)?;
-            return Ok(Outcome::Failed(err.message.clone()));
-        }
+    /// Saves a stub note for a page without a summary, so every tab still
+    /// shows up in the archive: a title, a sentence saying why, and a
+    /// reserved status tag.
+    fn save_stub(&self, page: &PendingPage, stub: Stub, kind: &str, message: &str) -> Result<()> {
+        let (tag_name, tag_description, not_what) = match stub {
+            Stub::Unreachable => (UNREACHABLE_TAG, "Pages that could not be loaded", "loaded"),
+            Stub::Failed => (
+                FAILED_TAG,
+                "Pages that loaded but could not be summarized",
+                "summarized",
+            ),
+        };
         let (title, title_note) = match page
             .browser_title
             .as_deref()
@@ -337,23 +357,25 @@ impl<F: Fetcher, L: Llm, E: Embedder> Run<'_, '_, F, L, E> {
                 "The title is the page's address.",
             ),
         };
-        let summary = format!(
-            "This page could not be loaded ({}), so there is no summary. {title_note}",
-            err.message
-        );
-        let tag = match db.find_tag(UNREACHABLE_TAG)? {
+        let summary =
+            format!("This page could not be {not_what} ({message}), so there is no summary. {title_note}");
+
+        let mut db = self.db.borrow_mut();
+        let tag = match db.find_tag(tag_name)? {
             Some((id, _)) => id,
-            None => db.create_tag(UNREACHABLE_TAG, Some("Pages that could not be loaded"))?,
+            None => db.create_tag(tag_name, Some(tag_description))?,
         };
-        let tags = [(UNREACHABLE_TAG.to_string(), tag)];
-        let stub = PageResult {
+        let tags = [(tag_name.to_string(), tag)];
+        let result = PageResult {
             title: &title,
             summary: &summary,
             lang: None,
             tags: &tags,
         };
-        db.save_unreachable(page.id, &stub, err.kind.as_str(), &err.message)?;
-        Ok(Outcome::Unreachable(err.message.clone()))
+        match stub {
+            Stub::Unreachable => db.save_unreachable(page.id, &result, kind, message),
+            Stub::Failed => db.save_failed(page.id, &result, kind, message),
+        }
     }
 
     /// The existing tags to show the model: the most similar to the page, or
@@ -555,7 +577,7 @@ mod tests {
     use anyhow::bail;
 
     use super::*;
-    use crate::fetch::{FetchErrorKind, FetchedPage};
+    use crate::fetch::{FetchError, FetchErrorKind, FetchedPage};
     use crate::llm::NewTag;
 
     struct FakeFetcher;
@@ -811,7 +833,7 @@ mod tests {
             ]
         );
         assert!(!seen[1].contains("status/"));
-        let pages = db.done_pages().unwrap();
+        let pages = db.note_pages().unwrap();
         assert_eq!(pages[0].lang.as_deref(), Some("en"));
         assert_eq!(db.status_counts().unwrap().unreachable, 1);
 
@@ -825,7 +847,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pages_that_load_but_cant_be_used_fail_with_their_cause() {
+    async fn pages_that_load_but_cant_be_used_get_failed_stubs() {
         let mut db = db_with(&["https://a.com/paper.pdf", "https://b.com/"]);
         let llm = FakeLlm::new(vec![Err("reject")]);
         let stats = run(&mut db, &llm).await.unwrap();
@@ -836,15 +858,60 @@ mod tests {
                 ..Stats::default()
             }
         );
-        assert!(
-            db.tags().unwrap().is_empty(),
-            "failed pages get no stub and no tags"
-        );
         let kinds = db.failure_kinds().unwrap();
         assert_eq!(
             kinds,
             [("rejected".to_string(), 1), ("unsupported_type".to_string(), 1)]
         );
+
+        // Both still get a note, so no tab is lost from the archive.
+        assert_eq!(page_tag_names(&db), ["status/failed", "status/failed"]);
+        let pages = db.note_pages().unwrap();
+        assert_eq!(
+            pages[0].summary,
+            "This page could not be summarized (unsupported content type: application/pdf), so there is no \
+             summary. The title is the page's address."
+        );
+        assert!(
+            pages[1]
+                .summary
+                .starts_with("This page could not be summarized (too long)"),
+            "{}",
+            pages[1].summary
+        );
+    }
+
+    #[tokio::test]
+    async fn retried_stub_that_fails_again_is_rewritten() {
+        // An earlier run found the page unreachable and wrote its stub note.
+        let mut db = db_with(&["https://a.com/paper.pdf"]);
+        let page = db.pending_pages().unwrap()[0].id;
+        let tag = db.create_tag(UNREACHABLE_TAG, None).unwrap();
+        let tags = [(UNREACHABLE_TAG.to_string(), tag)];
+        let stub = PageResult {
+            title: "Paper",
+            summary: "Unreachable.",
+            lang: None,
+            tags: &tags,
+        };
+        db.save_unreachable(page, &stub, "timeout", "timed out").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        crate::render::render_all(&db, dir.path()).unwrap();
+
+        // This time it loads, but it's a PDF.
+        db.retry_failed().unwrap();
+        run(&mut db, &FakeLlm::new(vec![])).await.unwrap();
+        crate::render::render_all(&db, dir.path()).unwrap();
+        let note = std::fs::read_to_string(dir.path().join("notes/paper.md")).unwrap();
+        assert!(
+            note.contains("could not be summarized (unsupported content type"),
+            "{note}"
+        );
+        assert!(
+            note.ends_with("#status/failed\n"),
+            "the old status tag is gone: {note}"
+        );
+        assert_eq!(db.failure_kinds().unwrap(), [("unsupported_type".to_string(), 1)]);
     }
 
     #[tokio::test]
@@ -859,7 +926,7 @@ mod tests {
         .unwrap();
         let mut db = db;
         run(&mut db, &FakeLlm::new(vec![])).await.unwrap();
-        let stub = &db.done_pages().unwrap()[0];
+        let stub = &db.note_pages().unwrap()[0];
         assert_eq!(stub.title, "My saved tab");
         assert!(
             stub.summary

@@ -244,14 +244,6 @@ impl Db {
         .collect()
     }
 
-    pub fn mark_failed(&self, page_id: i64, kind: &str, error: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE pages SET status = 'failed', error_kind = ?2, error = ?3, processed_at = ?4 WHERE id = ?1",
-            params![page_id, kind, error, now()],
-        )?;
-        Ok(())
-    }
-
     /// Saves a stub for a page that couldn't be reached: a title and a
     /// one-line summary saying why, tagged `status/unreachable`.
     pub fn save_unreachable(
@@ -262,6 +254,12 @@ impl Db {
         error: &str,
     ) -> Result<()> {
         self.save(page_id, "unreachable", Some((kind, error)), stub)
+    }
+
+    /// Saves a stub note for a page that loaded but couldn't be summarized,
+    /// e.g. a PDF, tagged `status/failed`.
+    pub fn save_failed(&mut self, page_id: i64, stub: &PageResult, kind: &str, error: &str) -> Result<()> {
+        self.save(page_id, "failed", Some((kind, error)), stub)
     }
 
     pub fn save_result(&mut self, page_id: i64, result: &PageResult) -> Result<()> {
@@ -365,22 +363,25 @@ impl Db {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Distinct (page id, tag id) pairs for pages with notes: done or unreachable.
+    /// Distinct (page id, tag id) pairs for pages with notes: every page that
+    /// isn't pending.
     pub fn tag_links(&self) -> Result<Vec<(i64, i64)>> {
         let mut stmt = self.conn.prepare(
             "SELECT DISTINCT pt.page_id, pt.resolved_tag_id
              FROM page_tags pt JOIN pages p ON p.id = pt.page_id
-             WHERE p.status IN ('done', 'unreachable')",
+             WHERE p.status != 'pending'",
         )?;
         let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Pages that get a note: done, and unreachable (stub notes).
-    pub fn done_pages(&self) -> Result<Vec<DonePage>> {
+    /// Pages that get a note: done ones, and the unreachable and failed ones,
+    /// which get stub notes.
+    pub fn note_pages(&self) -> Result<Vec<DonePage>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, url, source, title, summary, lang, note_file, processed_at
-             FROM pages WHERE status IN ('done', 'unreachable') ORDER BY id",
+            "SELECT id, url, source, ifnull(title, url), ifnull(summary, ''), lang, note_file,
+                    ifnull(processed_at, added_at)
+             FROM pages WHERE status != 'pending' ORDER BY id",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok(DonePage {
@@ -394,6 +395,16 @@ impl Db {
                 processed_at: r.get(7)?,
             })
         })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Every note file name in use, including those of pages that went back to
+    /// pending with --retry-failed: they keep their file for when they're done.
+    pub fn note_files(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT note_file FROM pages WHERE note_file IS NOT NULL")?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
@@ -459,7 +470,9 @@ impl Db {
 
 /// Version 3 adds the 'unreachable' page status and pages.error_kind. SQLite
 /// can't change a CHECK constraint, so the pages table is rebuilt, keeping
-/// every row and id.
+/// every row and id. Pages that failed under version 2 have no stub note and
+/// no cause (a 404 and a PDF were both just 'failed'), so they become pending
+/// again: the next run processes them and records why they fail.
 fn migrate_v2_to_v3(conn: &Connection) -> Result<()> {
     const COLUMNS: &str = "id, url, original_url, browser_title, source, status, error, title, summary, lang, \
                            note_file, added_at, processed_at";
@@ -469,6 +482,7 @@ fn migrate_v2_to_v3(conn: &Connection) -> Result<()> {
         "BEGIN;
          {new_table}
          INSERT INTO pages_v3 ({COLUMNS}) SELECT {COLUMNS} FROM pages;
+         UPDATE pages_v3 SET status = 'pending', error = NULL WHERE status = 'failed';
          DROP TABLE pages;
          ALTER TABLE pages_v3 RENAME TO pages;
          PRAGMA user_version = 3;
@@ -653,7 +667,7 @@ mod tests {
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
-        let pages = db.done_pages().unwrap();
+        let pages = db.note_pages().unwrap();
         assert_eq!(
             (
                 pages[0].id,
@@ -668,6 +682,9 @@ mod tests {
             .pragma_query_value(None, "foreign_keys", |r| r.get(0))
             .unwrap();
         assert!(fk, "foreign keys are back on");
+
+        // The page that failed under version 2 is pending again.
+        assert_eq!(db.pending_pages().unwrap().iter().map(|p| p.id).collect::<Vec<_>>(), [8]);
 
         // The new status works.
         let stub = PageResult {
