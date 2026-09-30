@@ -2,7 +2,7 @@
 
 A Rust CLI for declaring tab bankruptcy. It reads every open tab in the major browsers (thousands of them), asks an LLM to summarize and tag each page, and writes one Markdown note per tab. Pages get simple flat tags while they are processed; at the end of each run, one reconciliation pass cleans the tags up and, if you want, organizes them into a hierarchy.
 
-**Status:** phase 1 (the core pipeline, working from a URL list) is in [PR #1](https://github.com/agegechkori/tabkeeper/pull/1). It still tags pages with hierarchical paths directly; phase 2 switches to the flat-tags-then-reconcile design below.
+**Status:** phase 1 (the core pipeline, working from a URL list) is done ([PR #1](https://github.com/agegechkori/tabkeeper/pull/1)). It still tags pages with hierarchical paths directly; phase 2 switches to the flat-tags-then-reconcile design below.
 
 ## Requirements
 
