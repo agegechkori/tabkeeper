@@ -1,6 +1,8 @@
 # tabkeeper — plan
 
-A Rust CLI for declaring tab bankruptcy. It reads every open tab in the major browsers (thousands of them), asks an LLM to summarize and tag each page, and writes one Markdown note per tab. Tags form a hierarchy; the tool keeps them consistent and revises them at the end.
+A Rust CLI for declaring tab bankruptcy. It reads every open tab in the major browsers (thousands of them), asks an LLM to summarize and tag each page, and writes one Markdown note per tab. Pages get simple flat tags while they are processed; at the end of each run, one reconciliation pass cleans the tags up and, if you want, organizes them into a hierarchy.
+
+**Status:** phase 1 (the core pipeline, working from a URL list) is done ([PR #1](https://github.com/agegechkori/tabkeeper/pull/1)). It still tags pages with hierarchical paths directly; phase 2 switches to the flat-tags-then-reconcile design below.
 
 ## Requirements
 
@@ -11,9 +13,10 @@ A Rust CLI for declaring tab bankruptcy. It reads every open tab in the major br
   - a title that briefly describes the page
   - the URL
   - a summary of a few sentences
-  - hierarchical hashtags
+  - hashtags, either hierarchical (`#technology/programming-languages/rust`) or flat (`#rust-programming`), as configured
 - **LLM:** configurable, including local models. Cloud models can be sent just the URL instead of the page content. Responses follow a JSON schema and are validated.
-- **Tags:** the tool reuses existing tags wherever possible, merges duplicates, and revises the hierarchy after the run. It ends by printing a tag tree with page counts.
+- **Tags:** the tool reuses existing tags wherever possible, and reconciles them at the end of each run: synonyms merged, ambiguous tags split, and, in hierarchical mode, tags organized into a tree.
+- **Final report:** tabs processed, failures by cause, model usage and speed, and all tags with page counts. Printed and saved as `_report.md`.
 - **Domain/URL filter:** a configurable allow list or deny list.
 - **Language:** English by default. `--lang <code>` forces another language; `--lang original` writes each summary in the page's own language. Tags are always English.
 - **Read-only by default:** the core tool never modifies browser data. An optional step can close processed tabs (see phase 7).
@@ -21,11 +24,15 @@ A Rust CLI for declaring tab bankruptcy. It reads every open tab in the major br
 ## Architecture
 
 ```
-sources ─► filter/dedupe ─► fetch+extract ─► LLM ─► tag resolution ─► SQLite
-                                                                        │
-                                  revise-tags (merge/move/rename/split) ◄┤
-                                                                        ▼
-                                   render: notes/*.md + _tags.md + _index.md
+sources ─► filter/dedupe ─► fetch+extract ─► LLM: title, summary, flat tags ─► SQLite
+                                  ▲                                           │
+                   embeddings: pick relevant existing tags                    │
+                                                                              ▼
+                     end of run: reconcile tags (merge, split, build tree if hierarchical)
+                                                                              │
+                                                              you approve the changes
+                                                                              ▼
+                          render: notes/*.md + _tags.md + _index.md + _report.md
 ```
 
 SQLite is the source of truth. The Markdown files are always regenerated from it, so fixing a tag is just a database change followed by a re-render.
@@ -47,7 +54,7 @@ With thousands of tabs, most are discarded or unloaded by the browser, so page c
 ### Fetch and extract
 - `reqwest` with a limit on concurrent requests per domain, timeouts, and retries with backoff.
 - Readability-style extraction with `dom_smoothie`; PDFs with `pdf-extract`.
-- Text is cut down to fit the configured token budget.
+- Text is cut down to fit the configured budget (`llm.max_input_chars`).
 - Language is detected with `whatlang`.
 - **Unreachable pages** (404s, dead domains, login walls, bot blocks) still get a stub note built from the browser's tab title, tagged `#status/unreachable`.
 
@@ -56,86 +63,189 @@ With thousands of tabs, most are discarded or unloaded by the browser, so page c
   - **OpenAI-compatible:** covers Ollama, LM Studio, llama.cpp, vLLM, OpenRouter and OpenAI.
   - **Anthropic.**
   - **Gemini.**
-- **Structured output:** the JSON schema is generated from Rust types with `schemars` and passed to the provider's JSON-schema mode or tool calling. Responses are validated with `serde`, and invalid ones are retried once with the error included.
+- **Structured output:** a hand-written JSON schema, passed to the provider's JSON-schema mode or tool calling. Responses are validated with `serde`, and invalid ones are retried once with the error included.
+- **Server-specific options:** `[llm.extra_body]` merges extra fields into every request. On Ollama, `reasoning_effort = "none"` turns off a thinking model's reasoning; in testing, that took `qwen3:4b` from about 3 minutes to about 10 seconds per page.
+- **Separate models per stage:** per-page summaries, embeddings and the end-of-run tag reconciliation can each use a different model, e.g. a fast model for pages and a stronger one, or thinking turned on, for the one-time reconciliation.
 - **URL-only mode:** each provider has a capability flag saying whether its model can fetch pages itself (Anthropic web fetch, Gemini URL context, OpenAI web search). If the model can't fetch the page, the tool automatically sends the content instead.
-- **Prompt layout:** instructions and the tag tree come first in the prompt, so providers that cache repeated prompt prefixes charge less for them.
+- **Prompt layout:** instructions and the tag vocabulary come first in the prompt, so providers that cache repeated prompt prefixes charge less for them.
 - **`--batch` mode:** uses the Anthropic and OpenAI batch APIs, which cost about 50% less and return results asynchronously.
 - **Throughput and cost controls:**
   - a global concurrency limit, with rate limiting via `governor` and `Retry-After` handling
   - `--max-cost` / `--max-tokens` caps
   - `--dry-run` prints the tab count, filter results and a cost estimate without calling the model
+- **Page-level vs. run-level errors:** a page the model can't handle (invalid reply twice, too long) is recorded as failed and the run moves on; a server problem (connection refused, authentication, server error) stops the run and leaves the remaining pages pending.
 
-Response schema:
+Per-page response schema:
 ```json
 { "title": "...", "summary": "...", "language": "en",
-  "tags": ["technology/programming-languages/rust"],
-  "new_tags": [{"path": "technology/programming-languages/zig", "description": "..."}] }
+  "tags": ["rust", "memory-safety"],
+  "new_tags": [{"name": "memory-safety", "description": "..."}] }
 ```
+
+### Embeddings
+Served through the same OpenAI-compatible server's `/v1/embeddings` endpoint, with its own model setting (e.g. `nomic-embed-text` on Ollama, or `bge-m3` when summaries are in many languages). Vectors are stored in SQLite; a brute-force similarity search is fast enough at this scale. No machine-learning runtime is bundled into the binary.
+
+Embeddings find candidates; the LLM makes the decisions. They are used for:
+1. **Choosing which existing tags to show the model** for each page: the most similar to the page, instead of the most used. This is what keeps tag reuse working with thousands of tags.
+2. **Finding likely duplicate tags** (`ml` / `machine-learning`) for the reconciliation pass to confirm. Related-but-different tags (`react` / `react-native`) also score as similar, so the LLM confirms every merge.
+3. **Splitting ambiguous tags:** clustering the summaries of the pages that share a tag, e.g. all `rust` pages, shows whether it covers more than one meaning.
+4. **A first draft of the tree** in hierarchical mode: clusters of similar tags, which the LLM then names and corrects.
+5. **Spotting the same article** saved under different URLs.
 
 ### Tags
 
-**Hierarchy**
-- A tag is identified by its **full path**, so ambiguity is resolved by where a tag sits: `technology/programming-languages/rust` and `science/chemistry/rust` are different tags.
-- Names are kebab-case, with at most 3 levels (configurable).
-- Each tag has one parent; a page can carry several tags.
+**While pages are processed: flat tags**
+- Each page gets 3–5 flat, lowercase kebab-case English tags. Choosing a few topic tags is an easy task that small, fast models do well.
+- The model sees the existing tags most relevant to the page (picked with embeddings), with counts and descriptions, and must reuse one when it fits.
+- Plural, spelling and punctuation variants are normalized in code as each page is processed.
+- Tags under `status/` are reserved for the tool itself, e.g. `status/unreachable`.
+- Pages don't depend on each other's tags beyond the shared vocabulary, so they can be processed in parallel.
+
+**At the end of each run: reconciliation**
+
+It runs once at the end of every run, including a run that stopped early, and on demand with `tabkeeper revise-tags`. There are no checkpoints during the run: with flat tags and embedding-picked vocabulary there's little to fix mid-run, and one pass over all the tags gives a better result. If long runs turn out to fragment the vocabulary, a cheap synonym merge during the run can be added later.
+
+1. Code normalizes tags and writes these as `rule` aliases.
+2. Embeddings propose candidates: likely duplicates, tags whose pages fall into separate clusters, and (hierarchical mode) groups of related tags.
+3. The LLM decides, returning only the changes:
+   - **merge:** synonyms and variants become one tag.
+   - **split:** an ambiguous tag becomes several, and each of its pages is reassigned based on its stored title and summary. In flat mode the names carry the meaning (`rust-programming`, `rust-corrosion`); in hierarchical mode the position does (`technology/programming-languages/rust`, `science/chemistry/rust`).
+   - **place / move** (hierarchical mode only): put each tag in the tree, creating parent categories as needed.
+   - **rename.**
+4. Code validates the proposal:
+   - chains are resolved to the final tag and cycles are rejected
+   - a tag can't be sent to two different targets
+   - new names must be explicitly marked as new
+   - the depth limit and locked entries are enforced
+5. The changes are shown as a list with the number of pages each affects. You approve them, or `--yes` skips approval.
+6. Approved changes are stored, logged, and the affected notes are re-rendered.
+7. If the vocabulary doesn't fit the model's context window, it is reconciled in chunks (one top-level branch, or one cluster, at a time).
+
+**Stability across runs.** The first reconciliation builds the structure. Later runs place new tags into it and propose restructuring as changes you approve, so notes don't get different tags every run. Your manual decisions are `locked` and never overridden by the LLM.
+
+**Flat or hierarchical: `[tags] style = "hierarchical" | "flat"`**
+- Default: `hierarchical`.
+- Every tag has a unique flat name either way, qualified when the plain word is ambiguous (`rust-programming`). The tree is an optional layer on top.
+- Switching from hierarchical to flat is just a re-render (`tabkeeper render`), with no LLM calls. Switching from flat to hierarchical needs the tree built once (`tabkeeper revise-tags`).
+- Flat mode skips building the tree, so its reconciliation is cheaper.
+
+**Hierarchy details** (hierarchical mode)
+- Tags have at most 3 levels (configurable); each tag has one parent; a page can carry several tags.
 - A page may be tagged with an inner node when nothing more specific fits.
 - Notes contain the full path (`#technology/programming-languages/rust`), which works as nested tags in Obsidian.
-- Tags under `status/` are reserved for the tool itself, e.g. `status/unreachable`.
-
-**Top level**
-- By default the top-level categories emerge from the pages.
-- `--taxonomy taxonomy.toml` supplies your own. It's a seed by default; with `strict = true`, only the listed top-level categories are allowed.
-
-**What the model sees for each page**
-- The top of the tree plus the branches most relevant to the page, with counts and descriptions.
-- The model must reuse an existing path or propose a new one with a description.
-
-**Bootstrap:** the first ~50 pages run one at a time so the tree settles; after that, pages run in parallel.
+- The top-level categories emerge from your pages by default. `--taxonomy taxonomy.toml` supplies your own: a seed by default, or with `strict = true`, the only top-level categories allowed.
 
 **Storage**
 ```sql
-tags(id, name, parent_id, description, locked, UNIQUE(parent_id, name))
-page_tags(page_id, raw_tag, resolved_tag_id)   -- raw_tag is never modified
-tag_aliases(alias, tag_id, source, locked)      -- source: rule | llm | user
-page_tag_overrides(page_id, raw_tag, tag_id)    -- per-page reassignments
+tags(id, name UNIQUE, parent_id, path, description, locked)  -- parent_id/path only used in hierarchical mode
+page_tags(page_id, raw_tag, resolved_tag_id)   -- raw_tag is exactly what the model returned, never modified
+tag_aliases(alias, tag_id, source, locked)      -- merges; source: rule | llm | user
+page_tag_overrides(page_id, raw_tag, tag_id)    -- per-page reassignments from splits
 revision_log(run_id, op, payload, approved_at)  -- audit trail and undo
+embeddings(kind, ref_id, model, vector)         -- tags and page summaries
 ```
-Resolution order: per-page override, then alias, then the raw tag. Since the raw tags are never modified, undoing a revision means deleting its rows and re-rendering. Entries marked `locked` (your manual decisions) are never overridden by the LLM.
+Resolution order: per-page override, then alias, then the raw tag. Since the raw tags are never modified, undoing a revision means deleting its rows and re-rendering.
 
-**Revision pass.** It runs at checkpoints (after 200 pages, then every ~1,000) and once at the end.
-1. Code normalises tags (case, plurals, punctuation) and writes these as `rule` aliases.
-2. The LLM gets the whole tree, alphabetised, with counts, plus example page titles for tags that could be ambiguous. It returns only the changes it proposes: **merge**, **move** (reparent), **create parent**, **rename**, and **reassign** (moves specific pages to another tag, decided from their stored title and summary).
-3. Code validates the proposal:
-   - chains are resolved to the final tag and cycles are rejected
-   - a tag can't be sent to two different targets
-   - new paths must be explicitly marked as new
-   - the depth limit and locked entries are enforced
-4. The changes are shown as a diff with the number of pages affected. You approve them, or `--yes` skips approval.
-5. Approved changes are stored, logged, and the affected notes are re-rendered.
-6. If the tree doesn't fit the model's context window, it is revised one top-level branch at a time.
+### Final report
+Printed at the end of every run and saved as `_report.md` in the output folder, one per run. For resumed runs it shows this run's numbers alongside the totals for the whole archive. `--json` prints it as JSON for scripting. The full list of failed URLs with their errors goes into `_report.md`, not the terminal.
 
-**Final report:** the tag tree with two counts per tag, pages tagged with that tag exactly and pages anywhere under it. It's printed and saved as `_tags.md`.
+```
+tabkeeper run 2026-09-30 14:02, finished in 1h 42m
+
+Tabs
+  Found            4,812   (Chrome 3,120 · Firefox 1,540 · Safari 152)
+  Duplicates         611   merged into existing notes
+  Filtered out       203   (deny list 181 · non-web 22)
+  Already done       950   from earlier runs, skipped
+  Processed        3,048
+    Done           2,871
+    Unreachable      142   stub notes tagged #status/unreachable
+      404/410         71 · DNS/connection 38 · timeout 19 · blocked (403/429) 14
+    Failed            35   (PDF 21 · invalid model reply 9 · too long for model 5)
+  Pending              0
+
+Languages  en 2,410 · de 301 · fr 88 · ja 45 · other 27
+Domains    github.com 412 · youtube.com 233 · en.wikipedia.org 190 · ...
+
+Model
+  Summaries   qwen3:4b · Ollama at localhost:11434 · reasoning_effort=none
+              7.6 GB loaded, 100% on GPU · context 32k tokens
+  Embeddings  nomic-embed-text · 4,015 vectors in 41 s
+  Tag review  qwen3:4b with thinking · 14 requests · 6m 12s
+
+  Requests    3,112 summary requests · 64 retries (invalid replies)
+  Tokens      9.8M input · 0.9M output · 3,210 input / 295 output per page
+  Speed       input 1,850 tok/s · output 48 tok/s
+              1.4 s model time per page (fetch 0.4 s)
+  Cost        $0.00 (local)
+  Page limits 412 pages cut to fit max_input_chars (12,000)
+              5 rejected as too long for the model
+              9 failed after two invalid replies
+  URL-only    0 pages (the model can't fetch pages itself)
+
+  Warnings    none
+tabkeeper     CPU 38 s · peak memory 64 MB
+
+Tags       1,204 tags (318 new this run) · 12 untagged pages
+Revision   87 merges · 9 splits (e.g. rust → rust-programming, rust-corrosion)
+           · 41 tags used only once
+
+<tag tree (hierarchical) or tag list (flat), with page counts>
+
+Notes written to tabkeeper-out/ (2,871 notes + 142 stubs)
+```
+
+Where the model numbers come from:
+
+| Line | Source | Availability |
+|---|---|---|
+| Model, server, extra options | the config | always |
+| Memory, GPU share, context window | Ollama's `/api/ps` | Ollama only |
+| Requests, retries, invalid replies | counted by tabkeeper | always |
+| Tokens | `usage` field in each response | when the server reports it; otherwise "not reported" |
+| Speed | token counts ÷ measured request time | when tokens are reported |
+| Model vs. fetch time per page | measured by tabkeeper | always |
+| Cost | tokens × prices set in the config | cloud models with prices set |
+| Page limits, URL-only | counted by tabkeeper | always / when used |
+| Embeddings, tag review | same as above, per stage | when those stages ran |
+| tabkeeper CPU and memory | the operating system (`getrusage`; a small crate on Windows) | always |
+
+The model server's own CPU and RAM are not measured: it's a separate process, sometimes on another machine, and on a Mac most of its work is on the GPU, which can't be read without admin rights. Throughput and Ollama's `/api/ps` cover what matters.
+
+Tokens and cost are shown per stage (summaries, embeddings, tag review) and in total.
+
+**Warnings**, printed only when a problem is detected:
+- **Thinking left on:** "Average 2,100 output tokens per page; the model may be thinking. On Ollama, set `reasoning_effort = "none"`."
+- **Model not fully on the GPU:** "Only 60% of the model is on the GPU; a smaller model or a shorter context would be much faster."
+- **Pages being cut:** "30% of pages were cut to fit `max_input_chars`; consider raising it if your model's context allows."
+- **Model context too small:** "Prompts average 7,900 tokens but the model's context is 8k; some pages may be cut off by the server without an error."
+- **Many retries:** "12% of replies were invalid JSON; try `structured_output = "json_schema"` or a larger model."
 
 ### Output
 ```
 tabkeeper-out/
   tabkeeper.db
   notes/<slug-of-title>.md
-  _tags.md
-  _index.md        # all notes, grouped by top-level tag
+  _tags.md         # tag tree or tag list, with page counts
+  _index.md        # all notes, grouped by top-level tag (hierarchical) or by most-used tags (flat)
+  _report.md       # the final report of the latest run, with the full list of failed URLs
 ```
-Note format (Obsidian-compatible):
+Note format (Obsidian-compatible, hierarchical style):
 ```markdown
 ---
-url: https://example.com/article
-browser: firefox
+url: "https://example.com/article"
+title: "Fine-tuning small LLMs on consumer GPUs"
+source: firefox
 captured: 2026-09-30T14:02:00Z
-lang: en
-tags: [technology/ai/llm, technology/hardware/gpu]
+lang: "en"
+tags:
+  - technology/ai/llm
+  - technology/hardware/gpu
 ---
+
 # Fine-tuning small LLMs on consumer GPUs
 
-**URL:** https://example.com/article
+**URL:** <https://example.com/article>
 
 A few sentences of summary…
 
@@ -145,27 +255,33 @@ A few sentences of summary…
 ### CLI
 ```
 tabkeeper sources                    # browsers/profiles found, tab counts
-tabkeeper run [--dry-run] [--batch] [--lang en|<code>|original] [--taxonomy f] [--allow/--deny r] [--max-cost n]
+tabkeeper run [--dry-run] [--batch] [--lang en|<code>|original] [--taxonomy f] [--allow/--deny r] [--max-cost n] [--json]
 tabkeeper import <file>
 tabkeeper revise-tags [--yes]
 tabkeeper undo <run-id>
 tabkeeper render
-tabkeeper report
+tabkeeper report [--json]
+tabkeeper config
 tabkeeper close-tabs                 # optional, phase 7
 ```
-- Config: `config.toml` in the platform's config directory (via `directories`).
+- Config: `config.toml` in the platform's config directory (via `directories`); `tabkeeper config` shows where, with an example.
 - API keys: taken from environment variables named in the config.
 
 ### Crates
-tokio, reqwest, clap, serde, schemars, rusqlite (bundled), lz4_flex, dom_smoothie, pdf-extract, whatlang, globset, regex, governor, indicatif, directories, toml, url.
+tokio, reqwest, clap, serde, serde_json, rusqlite (bundled), lz4_flex, dom_smoothie, pdf-extract, whatlang, globset, regex, governor, indicatif, directories, toml, url, chrono.
 
 ## Phases
-1. **Core:** config, SQLite schema, `import` from a URL list, fetch and extract, OpenAI-compatible/Ollama adapter, hierarchical tag registry, Markdown rendering, report, `_index.md`.
-2. **Scale:** concurrency, rate limits, resume, dedupe, dry-run cost estimate, budget caps, progress bar, unreachable-page stubs.
-3. **Browser sources:** Firefox; the Chromium family via SNSS; Safari and macOS via AppleScript; profile discovery on all three operating systems.
-4. **Tag revision:** checkpoints, validation, approval diff, revision log, undo, taxonomy file.
+1. **Core** ([PR #1](https://github.com/agegechkori/tabkeeper/pull/1)): config, SQLite schema, `import` from a URL list, fetch and extract, OpenAI-compatible/Ollama adapter, tag registry, Markdown rendering, report, `_index.md`.
+2. **Flat tagging and scale:**
+   - per-page flat tags, with embeddings choosing which existing tags the model sees
+   - concurrency, rate limits, dry-run cost estimate, budget caps, progress bar, unreachable-page stubs, domain filter
+   - the final report: everything except per-browser counts and the reconciliation numbers
+3. **Tag reconciliation:** end-of-run pass (merge, split, and the tree in hierarchical mode), validation, approval list, revision log, undo, `tags.style`, taxonomy file. First, compare it with phase 1's direct hierarchical tagging on the same 50–100 URLs: tree depth, tag reuse, whether `rust` is split correctly, speed.
+4. **Browser sources:** Firefox; the Chromium family via SNSS; Safari and macOS via AppleScript; profile discovery on all three operating systems.
 5. **Providers:** Anthropic and Gemini adapters, URL-only mode, `--batch`.
 6. **Distribution:** CI builds for macOS, Linux and Windows; GitHub Releases; `cargo install`.
 7. **Optional:** companion extension (pages behind a login) and `close-tabs`. Closing tabs is only possible via the extension or AppleScript, is off by default, and asks for confirmation.
+
+Tag reconciliation now comes before browser sources, because it changes how pages are tagged and is what the quality of the output depends on.
 
 License: MIT OR Apache-2.0.
