@@ -34,9 +34,12 @@ pub struct Embeddings<'a, E: Embedder> {
     embedder: &'a E,
     index: TagIndex,
     page_chars: usize,
-    /// Embedding requests that failed during the run. A failure only costs
-    /// that page its relevant tags, and the next run fills in missing vectors.
+    /// Embedding requests that failed during the run. The next run fills in
+    /// any vectors that are still missing.
     pub errors: usize,
+    /// (tag id, text) of new tags whose vectors couldn't be stored yet. They
+    /// are retried with the next page, so later pages can still be shown them.
+    unindexed_tags: Vec<(i64, String)>,
 }
 
 impl<'a, E: Embedder> Embeddings<'a, E> {
@@ -65,16 +68,17 @@ impl<'a, E: Embedder> Embeddings<'a, E> {
             index,
             page_chars,
             errors: 0,
+            unindexed_tags: Vec::new(),
         })
     }
 
     /// Records a failed embedding request. Only the first one is printed,
     /// so a flaky embeddings server doesn't flood the output.
-    fn note_error(&mut self, what: &str, err: &anyhow::Error) {
+    fn note_error(&mut self, what: &str, consequence: &str, err: &anyhow::Error) {
         if self.errors == 0 {
             println!(
-                "Warning: {what} failed ({err:#}). Continuing: affected pages are shown the most used tags, \
-                 and the next run fills in missing vectors. Further embedding errors are counted, not shown."
+                "Warning: {what} failed ({err:#}). Continuing: {consequence}. \
+                 Further embedding errors are counted, not shown."
             );
         }
         self.errors += 1;
@@ -145,11 +149,25 @@ async fn process_one<F: Fetcher, L: Llm, E: Embedder>(
 
     let counted = count_tree(&db.tags()?, &db.tag_links()?);
     let mut shown = None;
-    if let Some(e) = embeddings.as_deref_mut().filter(|e| e.index.len() > 0) {
-        let query = format!("{title}\n{}", truncate_chars(&extracted.text, e.page_chars));
-        match e.embedder.embed(&[query]).await {
+    if let Some(e) = embeddings
+        .as_deref_mut()
+        .filter(|e| e.index.len() > 0 || !e.unindexed_tags.is_empty())
+    {
+        // Tags whose vectors failed on an earlier page go along with this
+        // request, so this page can already be shown them.
+        let mut texts: Vec<String> = e.unindexed_tags.iter().map(|(_, text)| text.clone()).collect();
+        texts.push(format!(
+            "{title}\n{}",
+            truncate_chars(&extracted.text, e.page_chars)
+        ));
+        match e.embedder.embed(&texts).await {
             Ok(mut vectors) => {
-                let vector = vectors.remove(0);
+                let vector = vectors.pop().expect("one vector per text");
+                let model = e.embedder.model().to_string();
+                for ((id, _), tag_vector) in std::mem::take(&mut e.unindexed_tags).into_iter().zip(vectors) {
+                    db.put_embedding(EmbeddingKind::Tag, id, &model, &tag_vector)?;
+                    e.index.insert(id, tag_vector);
+                }
                 shown = Some(relevant_tags(
                     &counted,
                     &e.index,
@@ -157,7 +175,11 @@ async fn process_one<F: Fetcher, L: Llm, E: Embedder>(
                     config.tags.vocabulary_limit,
                 ));
             }
-            Err(err) => e.note_error("embedding a page", &err),
+            Err(err) => e.note_error(
+                "embedding a page",
+                "that page is shown the most used tags instead of the most relevant ones",
+                &err,
+            ),
         }
     }
     let shown = shown.unwrap_or_else(|| most_used(&counted, config.tags.vocabulary_limit));
@@ -200,14 +222,22 @@ async fn process_one<F: Fetcher, L: Llm, E: Embedder>(
 
     // New tags must be searchable for the next page; the page's own vector is
     // kept for the end-of-run tag reconciliation. The page is already saved,
-    // so a failure here only costs vectors, which the next run fills in.
+    // so a failure here only costs vectors: the tags are retried with the
+    // next page, and the next run fills in anything still missing.
     if let Some(e) = embeddings {
-        let mut texts: Vec<String> = created.iter().map(|(_, text)| text.clone()).collect();
+        let mut tags = std::mem::take(&mut e.unindexed_tags);
+        tags.extend(created);
+        let mut texts: Vec<String> = tags.iter().map(|(_, text)| text.clone()).collect();
         texts.push(page_embedding_text(title, text));
         let mut vectors = match e.embedder.embed(&texts).await {
             Ok(vectors) => vectors,
             Err(err) => {
-                e.note_error("embedding new tags", &err);
+                e.note_error(
+                    "storing vectors for new tags",
+                    "the tags are retried with the next page, and the next run fills in missing vectors",
+                    &err,
+                );
+                e.unindexed_tags = tags;
                 return Ok(title.to_string());
             }
         };
@@ -218,7 +248,7 @@ async fn process_one<F: Fetcher, L: Llm, E: Embedder>(
             &model,
             &vectors.pop().expect("one vector per text"),
         )?;
-        for ((id, _), vector) in created.iter().zip(vectors) {
+        for ((id, _), vector) in tags.iter().zip(vectors) {
             db.put_embedding(EmbeddingKind::Tag, *id, &model, &vector)?;
             e.index.insert(*id, vector);
         }
@@ -400,10 +430,22 @@ mod tests {
 
     /// Works while a run is being prepared, then fails the chosen requests:
     /// embedding a page before the model call ("query"), or storing a
-    /// finished page's vectors ("store").
+    /// finished page's vectors ("store"). Store requests number from 0;
+    /// those in `failing_stores` fail.
     struct FlakyEmbedder {
         fail_query: bool,
-        fail_store: bool,
+        failing_stores: std::ops::Range<usize>,
+        stores: std::cell::Cell<usize>,
+    }
+
+    impl FlakyEmbedder {
+        fn new(fail_query: bool, failing_stores: std::ops::Range<usize>) -> Self {
+            Self {
+                fail_query,
+                failing_stores,
+                stores: Default::default(),
+            }
+        }
     }
 
     impl Embedder for FlakyEmbedder {
@@ -412,10 +454,20 @@ mod tests {
         }
 
         async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-            // The fake fetcher's pages are titled "Page <url>".
-            let is_query = texts.len() == 1 && texts[0].starts_with("Page ");
+            // The fake fetcher's pages are titled "Page <url>"; a query ends
+            // with the page, after any tags being retried.
+            let is_query = texts.last().is_some_and(|t| t.starts_with("Page "));
             let is_probe = texts.len() == 1 && texts[0] == "tabkeeper";
-            if !is_probe && ((is_query && self.fail_query) || (!is_query && self.fail_store)) {
+            let fails = if is_probe {
+                false
+            } else if is_query {
+                self.fail_query
+            } else {
+                let n = self.stores.get();
+                self.stores.set(n + 1);
+                self.failing_stores.contains(&n)
+            };
+            if fails {
                 bail!("embeddings server returned HTTP 500");
             }
             FakeEmbedder.embed(texts).await
@@ -596,10 +648,7 @@ mod tests {
             Ok(summary("First", &["alpha"], &[])),
             Ok(summary("Second", &["beta"], &[])),
         ]);
-        let embedder = FlakyEmbedder {
-            fail_query: true,
-            fail_store: false,
-        };
+        let embedder = FlakyEmbedder::new(true, 0..0);
         let mut embeddings = Embeddings::prepare(&db, &embedder, 2000).await.unwrap();
         let stats = process_pending(
             &mut db,
@@ -625,10 +674,7 @@ mod tests {
             Ok(summary("First", &["alpha"], &[])),
             Ok(summary("Second", &["beta"], &[])),
         ]);
-        let embedder = FlakyEmbedder {
-            fail_query: false,
-            fail_store: true,
-        };
+        let embedder = FlakyEmbedder::new(false, 0..usize::MAX);
         let mut embeddings = Embeddings::prepare(&db, &embedder, 2000).await.unwrap();
         let stats = process_pending(
             &mut db,
@@ -643,11 +689,72 @@ mod tests {
         .unwrap();
         assert_eq!(stats, Stats { done: 2, failed: 0 });
         assert_eq!(embeddings.errors, 2);
-        assert_eq!(db.tags_missing_embedding("fake").unwrap().len(), 2);
+        // alpha was retried with the second page's query, which worked; beta's
+        // store failed on the last page, and so did both page vectors.
+        let missing: Vec<String> = db
+            .tags_missing_embedding("fake")
+            .unwrap()
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect();
+        assert_eq!(missing, ["beta: first used for: Second"]);
+        assert_eq!(db.pages_missing_embedding("fake").unwrap().len(), 2);
         // The next run fills in what's missing.
         Embeddings::prepare(&db, &FakeEmbedder, 2000).await.unwrap();
         assert!(db.tags_missing_embedding("fake").unwrap().is_empty());
         assert!(db.pages_missing_embedding("fake").unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn tags_from_a_failed_store_are_shown_to_the_next_page() {
+        let mut db = db_with(&[
+            "https://a.com/bread",
+            "https://b.com/rust",
+            "https://c.com/rust-again",
+        ]);
+        let llm = FakeLlm::new(vec![
+            Ok(summary(
+                "Bread",
+                &["sourdough"],
+                &[("sourdough", "Sourdough bread leavened with wild yeast")],
+            )),
+            Ok(summary(
+                "Rust",
+                &["rust-programming"],
+                &[(
+                    "rust-programming",
+                    "Rust is a systems programming language focused on safety",
+                )],
+            )),
+            Ok(summary("Rust again", &["rust-programming"], &[])),
+        ]);
+        // The bread page's vectors are stored; the first rust page's store fails.
+        let embedder = FlakyEmbedder::new(false, 1..2);
+        let mut embeddings = Embeddings::prepare(&db, &embedder, 2000).await.unwrap();
+        let config = Config {
+            tags: TagConfig {
+                vocabulary_limit: 1,
+                ..TagConfig::default()
+            },
+            ..Config::default()
+        };
+        process_pending(
+            &mut db,
+            &FakeFetcher,
+            &llm,
+            Some(&mut embeddings),
+            &config,
+            &LangMode::English,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(embeddings.errors, 1);
+        // With room for one tag, the second rust page was shown rust-programming,
+        // though its vector failed to store on the page that created it.
+        let seen = llm.seen_vocab.borrow();
+        assert!(seen[2].starts_with("rust-programming (1)"), "{}", seen[2]);
+        assert!(db.tags_missing_embedding("fake").unwrap().is_empty());
     }
 
     #[tokio::test]
