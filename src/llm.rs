@@ -231,6 +231,7 @@ Reply with a single JSON object with the fields title, summary, language, tags a
 - {lang}
 - language: the ISO 639-1 code of the language you wrote the title and summary in.
 - tags: 1 to {max_tags} tags for the page. A tag is a path from general to specific, separated by \"/\", at most {depth} levels, in lowercase kebab-case English, for example technology/programming-languages/rust.
+- The first level of every tag is a broad domain, such as technology, science, business, finance, health, food, travel, entertainment, sports, politics, history, culture, education, home or shopping. Use an existing first level whenever one fits; add a new one only for a truly different domain. Use the deeper levels to get specific.
 - Reuse tags from the existing vocabulary whenever one fits, including a general tag when nothing more specific fits. Create a new tag only when nothing existing fits, and put it under an existing parent where possible. At most {max_new} new tags per page.
 - Place an ambiguous word under the branch that matches its meaning, for example technology/programming-languages/rust versus science/chemistry/rust.
 - new_tags: every tag in tags that is not in the existing vocabulary, each with a one-line description of what it covers.
