@@ -30,6 +30,9 @@
   },
   "sandbox": {
     "enabled": true,
+    "filesystem": {
+      "allowWrite": ["~/.cargo/registry", "~/.cargo/git"]
+    },
     "network": {
       "allowedDomains": [
         "crates.io",
