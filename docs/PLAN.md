@@ -2,7 +2,7 @@
 
 A Rust CLI for declaring tab bankruptcy. It reads every open tab in the major browsers (thousands of them), asks an LLM to summarize and tag each page, and writes one Markdown note per tab. Pages get simple flat tags while they are processed; at the end of each run, one reconciliation pass cleans the tags up and, if you want, organizes them into a hierarchy.
 
-**Status:** phase 1 (the core pipeline, working from a URL list) is done ([PR #1](https://github.com/agegechkori/tabkeeper/pull/1)). It still tags pages with hierarchical paths directly; phase 2 switches to the flat-tags-then-reconcile design below.
+**Status:** phase 1 (the core pipeline, working from a URL list) is done ([PR #1](https://github.com/agegechkori/tabkeeper/pull/1)), and so is phase 2a, flat tags per page with embeddings ([PR #3](https://github.com/agegechkori/tabkeeper/pull/3)). Phase 2b is in progress.
 
 ## Requirements
 
@@ -56,7 +56,7 @@ With thousands of tabs, most are discarded or unloaded by the browser, so page c
 - Readability-style extraction with `dom_smoothie`; PDFs with `pdf-extract`.
 - Text is cut down to fit the configured budget (`llm.max_input_chars`).
 - Language is detected with `whatlang`.
-- **Unreachable pages** (404s, dead domains, login walls, bot blocks) still get a stub note built from the browser's tab title, tagged `#status/unreachable`.
+- **Every tab gets a note.** Unreachable pages (404s, dead domains, login walls, bot blocks) get a stub note built from the browser's tab title, tagged `#status/unreachable`; pages that load but can't be summarized (PDFs until they're supported, invalid model replies, prompts the server rejects) get one tagged `#status/failed`. Each stub says why.
 
 ### LLM layer
 - Thin adapters built directly on `reqwest`, one per protocol:
@@ -161,7 +161,8 @@ Tabs
     Done           2,871
     Unreachable      142   stub notes tagged #status/unreachable
       404/410         71 · DNS/connection 38 · timeout 19 · blocked (403/429) 14
-    Failed            35   (PDF 21 · invalid model reply 9 · too long for model 5)
+    Failed            35   stub notes tagged #status/failed
+      PDF 21 · invalid model reply 9 · too long for model 5
   Pending              0
 
 Languages  en 2,410 · de 301 · fr 88 · ja 45 · other 27
@@ -192,7 +193,7 @@ Revision   87 merges · 9 splits (e.g. rust → rust-programming, rust-corrosion
 
 <tag tree (hierarchical) or tag list (flat), with page counts>
 
-Notes written to tabkeeper-out/ (2,871 notes + 142 stubs)
+Notes written to tabkeeper-out/ (2,871 notes + 177 stubs)
 ```
 
 Where the model numbers come from:
@@ -272,10 +273,10 @@ tokio, reqwest, clap, serde, serde_json, rusqlite (bundled), lz4_flex, dom_smoot
 
 ## Phases
 1. **Core** ([PR #1](https://github.com/agegechkori/tabkeeper/pull/1)): config, SQLite schema, `import` from a URL list, fetch and extract, OpenAI-compatible/Ollama adapter, tag registry, Markdown rendering, report, `_index.md`.
-2. **Flat tagging and scale:**
-   - per-page flat tags, with embeddings choosing which existing tags the model sees
-   - concurrency, rate limits, dry-run cost estimate, budget caps, progress bar, unreachable-page stubs, domain filter
-   - the final report: everything except per-browser counts and the reconciliation numbers
+2. **Flat tagging and scale**, in three pull requests:
+   - 2a ([PR #3](https://github.com/agegechkori/tabkeeper/pull/3)): per-page flat tags, with embeddings choosing which existing tags the model sees
+   - 2b: concurrency, retries and rate limits, progress bar, unreachable-page stubs, failure causes, domain filter
+   - 2c: token usage per request, then dry-run cost estimate, budget caps, and the final report (everything except per-browser counts and the reconciliation numbers)
 3. **Tag reconciliation:** end-of-run pass (merge, split, and the tree in hierarchical mode), validation, approval list, revision log, undo, `tags.style`, taxonomy file. First, compare it with phase 1's direct hierarchical tagging on the same 50–100 URLs: tree depth, tag reuse, whether `rust` is split correctly, speed.
 4. **Browser sources:** Firefox; the Chromium family via SNSS; Safari and macOS via AppleScript; profile discovery on all three operating systems.
 5. **Providers:** Anthropic and Gemini adapters, URL-only mode, `--batch`.

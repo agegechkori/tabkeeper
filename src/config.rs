@@ -12,6 +12,46 @@ pub struct Config {
     pub embeddings: EmbeddingsConfig,
     pub fetch: FetchConfig,
     pub tags: TagConfig,
+    pub filter: FilterConfig,
+    pub run: RunConfig,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FilterMode {
+    Allow,
+    #[default]
+    Deny,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FilterConfig {
+    pub mode: FilterMode,
+    /// `domain:`, `glob:`, `regex:` or `prefix:` rules; see `filter.rs`.
+    pub rules: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RunConfig {
+    /// Pages processed at the same time.
+    pub concurrency: usize,
+    /// Pages fetched at the same time from one domain.
+    pub per_domain: usize,
+    /// The first pages of a run are processed one at a time, so the tags they
+    /// create are there for the pages after them.
+    pub sequential_start: usize,
+}
+
+impl Default for RunConfig {
+    fn default() -> Self {
+        Self {
+            concurrency: 4,
+            per_domain: 2,
+            sequential_start: 20,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -71,6 +111,10 @@ pub struct LlmConfig {
     /// Extra fields merged into every request body, for server-specific
     /// options such as turning off a model's thinking step.
     pub extra_body: serde_json::Map<String, serde_json::Value>,
+    /// Retries after a connection error, timeout, HTTP 429 or server error.
+    pub retries: u32,
+    /// Limit on requests per minute, for cloud APIs; 0 means no limit.
+    pub requests_per_minute: u32,
 }
 
 impl Default for LlmConfig {
@@ -85,6 +129,8 @@ impl Default for LlmConfig {
             temperature: 0.2,
             timeout_secs: 300,
             extra_body: serde_json::Map::new(),
+            retries: 3,
+            requests_per_minute: 0,
         }
     }
 }
@@ -94,12 +140,15 @@ impl Default for LlmConfig {
 pub struct FetchConfig {
     pub timeout_secs: u64,
     pub user_agent: String,
+    /// Retries after a timeout, connection error, HTTP 429 or server error.
+    pub retries: u32,
 }
 
 impl Default for FetchConfig {
     fn default() -> Self {
         Self {
             timeout_secs: 20,
+            retries: 2,
             user_agent: "Mozilla/5.0 (compatible; tabkeeper/0.1; +https://github.com/agegechkori/tabkeeper)"
                 .into(),
         }
@@ -153,6 +202,9 @@ impl Config {
 
     pub fn parse(text: &str) -> Result<Self> {
         let config: Self = toml::from_str(text)?;
+        if config.run.concurrency == 0 || config.run.per_domain == 0 {
+            bail!("run.concurrency and run.per_domain must be at least 1");
+        }
         if config.tags.max_depth == 0 || config.tags.max_per_page == 0 {
             bail!("tags.max_depth and tags.max_per_page must be at least 1");
         }

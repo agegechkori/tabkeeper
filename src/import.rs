@@ -1,10 +1,12 @@
 use crate::db::Db;
+use crate::filter::Filter;
 use crate::urls::{Rejected, normalize};
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ImportStats {
     pub added: usize,
     pub known: usize,
+    pub filtered: usize,
     pub not_web: usize,
     pub invalid: Vec<String>,
 }
@@ -22,10 +24,12 @@ pub fn parse_url_list(text: &str) -> Vec<(&str, Option<&str>)> {
         .collect()
 }
 
-pub fn import_url_list(db: &Db, text: &str) -> anyhow::Result<ImportStats> {
+/// Adds the list's web URLs to the database, except those the filter excludes.
+pub fn import_url_list(db: &Db, text: &str, filter: &Filter) -> anyhow::Result<ImportStats> {
     let mut stats = ImportStats::default();
     for (raw, title) in parse_url_list(text) {
         match normalize(raw) {
+            Ok(url) if !filter.allows(&url) => stats.filtered += 1,
             Ok(url) => {
                 if db.add_page(&url, raw, title, "import")? {
                     stats.added += 1;
@@ -54,18 +58,25 @@ mod tests {
     }
 
     #[test]
-    fn imports_with_dedupe() {
+    fn imports_with_dedupe_and_filter() {
         let db = Db::open_in_memory().unwrap();
-        let text = "https://a.com/?utm_source=x\nhttps://a.com/#frag\nchrome://newtab\nnonsense\n";
-        let stats = import_url_list(&db, text).unwrap();
+        let text = "https://a.com/?utm_source=x\nhttps://a.com/#frag\nchrome://newtab\nnonsense\nhttps://bank.example.com/\n";
+        let config = crate::config::FilterConfig {
+            mode: crate::config::FilterMode::Deny,
+            rules: vec!["domain:bank.example.com".into()],
+        };
+        let filter = Filter::new(&config, &[], &[]).unwrap();
+        let stats = import_url_list(&db, text, &filter).unwrap();
         assert_eq!(
             stats,
             ImportStats {
                 added: 1,
                 known: 1,
+                filtered: 1,
                 not_web: 1,
                 invalid: vec!["nonsense".into()]
             }
         );
+        assert_eq!(db.pending_pages().unwrap().len(), 1);
     }
 }

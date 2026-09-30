@@ -1,32 +1,53 @@
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use futures_util::future::ready;
+use futures_util::stream::{self, StreamExt};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::config::{Config, TagConfig};
 use crate::db::{Db, EmbeddingKind, PageResult, PendingPage, page_embedding_text, tag_embedding_text};
 use crate::embed::{BATCH_SIZE, Embedder, TagIndex};
 use crate::extract::{extract, truncate_chars};
 use crate::fetch::Fetcher;
+use crate::filter::Filter;
 use crate::llm::{LangMode, Llm, PageRejected, PageSummary, SummaryRequest};
+use crate::progress::Progress;
 use crate::tags::{CountedTag, count_tree, format_vocabulary, is_offerable, most_used, normalize_name};
+
+/// Reserved tags for the stub notes of pages without a summary.
+pub const UNREACHABLE_TAG: &str = "status/unreachable";
+pub const FAILED_TAG: &str = "status/failed";
+
+enum Stub {
+    /// The page couldn't be loaded (404, dead domain, timeout, blocked).
+    Unreachable,
+    /// The page loaded but couldn't be summarized (PDF, invalid model reply).
+    Failed,
+}
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Stats {
     pub done: usize,
     pub failed: usize,
+    pub unreachable: usize,
+    /// Pending pages the filter excludes; they stay pending.
+    pub filtered: usize,
 }
 
-enum PageError {
-    /// Only this page failed; record it and move on.
-    Page(anyhow::Error),
-    /// Every page would fail (e.g. the LLM server is down); stop the run.
+/// What happened to one page.
+enum Outcome {
+    Done(String),
+    /// Saved as a stub note; the string says why.
+    Unreachable(String),
+    /// Saved as a stub note and recorded as failed; the page is skipped until
+    /// `--retry-failed`.
+    Failed(String),
+    /// Every page would fail (e.g. the LLM server is down): stop the run. The
+    /// page stays pending.
     Fatal(anyhow::Error),
-}
-
-impl From<anyhow::Error> for PageError {
-    fn from(err: anyhow::Error) -> Self {
-        Self::Fatal(err)
-    }
 }
 
 /// Embeddings for a run: the client plus every tag's vector in memory.
@@ -74,186 +95,395 @@ impl<'a, E: Embedder> Embeddings<'a, E> {
 
     /// Records a failed embedding request. Only the first one is printed,
     /// so a flaky embeddings server doesn't flood the output.
-    fn note_error(&mut self, what: &str, consequence: &str, err: &anyhow::Error) {
+    fn note_error(&mut self, progress: &Progress, what: &str, consequence: &str, err: &anyhow::Error) {
         if self.errors == 0 {
-            println!(
+            progress.line(&format!(
                 "Warning: {what} failed ({err:#}). Continuing: {consequence}. \
                  Further embedding errors are counted, not shown."
-            );
+            ));
         }
         self.errors += 1;
     }
 }
 
-/// Processes pending pages one at a time. Each page is saved as soon as it
-/// is done, so an interrupted run continues where it stopped. Without
+/// Limits how many pages are fetched from one domain at the same time.
+struct DomainLimiter {
+    per_domain: usize,
+    semaphores: RefCell<HashMap<String, Arc<Semaphore>>>,
+}
+
+impl DomainLimiter {
+    async fn acquire(&self, url: &str) -> OwnedSemaphorePermit {
+        let host = url::Url::parse(url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_string))
+            .unwrap_or_default();
+        let semaphore = self
+            .semaphores
+            .borrow_mut()
+            .entry(host)
+            .or_insert_with(|| Arc::new(Semaphore::new(self.per_domain)))
+            .clone();
+        semaphore
+            .acquire_owned()
+            .await
+            .expect("semaphores are never closed")
+    }
+}
+
+/// What to process and how, for one run.
+pub struct RunOptions<'a> {
+    pub config: &'a Config,
+    pub lang: &'a LangMode,
+    pub filter: &'a Filter,
+    /// Process at most this many pages.
+    pub limit: Option<usize>,
+}
+
+/// Processes pending pages, several at a time. Each page is saved as soon as
+/// it is done, so an interrupted run continues where it stopped. Without
 /// embeddings, the model is shown the most used tags instead of the most
 /// relevant ones.
 pub async fn process_pending<F: Fetcher, L: Llm, E: Embedder>(
     db: &mut Db,
     fetcher: &F,
     llm: &L,
-    mut embeddings: Option<&mut Embeddings<'_, E>>,
-    config: &Config,
-    lang: &LangMode,
-    limit: Option<usize>,
+    embeddings: Option<&mut Embeddings<'_, E>>,
+    options: &RunOptions<'_>,
 ) -> Result<Stats> {
+    let RunOptions {
+        config,
+        lang,
+        filter,
+        limit,
+    } = *options;
+    let mut stats = Stats::default();
     let mut pending = db.pending_pages()?;
+    pending.retain(|page| {
+        let allowed = filter.allows(&page.url);
+        stats.filtered += usize::from(!allowed);
+        allowed
+    });
     if let Some(n) = limit {
         pending.truncate(n);
     }
-    let total = pending.len();
-    let mut stats = Stats::default();
-    for (i, page) in pending.iter().enumerate() {
-        let progress = format!("[{}/{}]", i + 1, total);
-        match process_one(db, fetcher, llm, embeddings.as_deref_mut(), config, lang, page).await {
-            Ok(title) => {
-                stats.done += 1;
-                println!("{progress} done    {} -> {title}", page.url);
-            }
-            Err(PageError::Page(err)) => {
-                stats.failed += 1;
-                db.mark_failed(page.id, &format!("{err:#}"))?;
-                println!("{progress} failed  {}: {err:#}", page.url);
-            }
-            Err(PageError::Fatal(err)) => {
-                return Err(err.context(format!(
-                    "stopped at {} ({} done, {} failed so far; run again to continue)",
-                    page.url, stats.done, stats.failed
-                )));
-            }
-        }
+
+    let progress = Progress::new(pending.len());
+    let run = Run {
+        db: RefCell::new(db),
+        fetcher,
+        llm,
+        embeddings: RefCell::new(embeddings),
+        config,
+        lang,
+        domains: DomainLimiter {
+            per_domain: config.run.per_domain,
+            semaphores: RefCell::default(),
+        },
+        progress: &progress,
+    };
+    let stats = RefCell::new(stats);
+    let fatal: RefCell<Option<(String, anyhow::Error)>> = RefCell::new(None);
+    let stopped = Cell::new(false);
+    let run = &run;
+
+    // The first pages go one at a time, so the tags they create are there for
+    // the pages after them; the rest run concurrently.
+    let first = pending.len().min(config.run.sequential_start);
+    let (sequential, concurrent) = pending.split_at(first);
+    for (pages, concurrency) in [(sequential, 1), (concurrent, config.run.concurrency)] {
+        stream::iter(pages)
+            .take_while(|_| ready(!stopped.get()))
+            .map(|page| async move { (page, run.process(page).await) })
+            .buffer_unordered(concurrency)
+            .for_each(|(page, outcome)| {
+                let mut stats = stats.borrow_mut();
+                let line = match outcome {
+                    Outcome::Done(title) => {
+                        stats.done += 1;
+                        format!("done         {} -> {title}", page.url)
+                    }
+                    Outcome::Unreachable(why) => {
+                        stats.unreachable += 1;
+                        format!("unreachable  {}: {why}", page.url)
+                    }
+                    Outcome::Failed(why) => {
+                        stats.failed += 1;
+                        format!("failed       {}: {why}", page.url)
+                    }
+                    Outcome::Fatal(err) => {
+                        stopped.set(true);
+                        fatal.borrow_mut().get_or_insert((page.url.clone(), err));
+                        return ready(());
+                    }
+                };
+                progress.line(&line);
+                progress.advance(format!(
+                    "{} done, {} unreachable, {} failed",
+                    stats.done, stats.unreachable, stats.failed
+                ));
+                ready(())
+            })
+            .await;
+    }
+    progress.finish();
+
+    let stats = stats.into_inner();
+    if let Some((url, err)) = fatal.into_inner() {
+        return Err(err.context(format!(
+            "stopped at {url} ({} done, {} unreachable, {} failed so far; run again to continue)",
+            stats.done, stats.unreachable, stats.failed
+        )));
     }
     Ok(stats)
 }
 
-async fn process_one<F: Fetcher, L: Llm, E: Embedder>(
-    db: &mut Db,
-    fetcher: &F,
-    llm: &L,
-    mut embeddings: Option<&mut Embeddings<'_, E>>,
-    config: &Config,
-    lang: &LangMode,
-    page: &PendingPage,
-) -> Result<String, PageError> {
-    let fetched = fetcher.fetch(&page.url).await.map_err(PageError::Page)?;
-    let extracted = extract(&fetched.html, &fetched.final_url, config.llm.max_input_chars);
-    let title = [Some(extracted.title.as_str()), page.browser_title.as_deref()]
-        .into_iter()
-        .flatten()
-        .find(|t| !t.trim().is_empty())
-        .unwrap_or("");
-    let detected_lang = whatlang::detect(&extracted.text)
-        .filter(|info| info.is_reliable())
-        .map(|info| info.lang().eng_name());
+/// Shared state of a run. Pages run concurrently on one task, so the database
+/// and embeddings are only borrowed between awaits, never across one.
+struct Run<'r, 'e, F, L, E: Embedder> {
+    db: RefCell<&'r mut Db>,
+    fetcher: &'r F,
+    llm: &'r L,
+    embeddings: RefCell<Option<&'r mut Embeddings<'e, E>>>,
+    config: &'r Config,
+    lang: &'r LangMode,
+    domains: DomainLimiter,
+    progress: &'r Progress,
+}
 
-    let counted = count_tree(&db.tags()?, &db.tag_links()?);
-    let mut shown = None;
-    if let Some(e) = embeddings
-        .as_deref_mut()
-        .filter(|e| e.index.len() > 0 || !e.unindexed_tags.is_empty())
-    {
-        // Tags whose vectors failed on an earlier page go along with this
-        // request, so this page can already be shown them.
-        let mut texts: Vec<String> = e.unindexed_tags.iter().map(|(_, text)| text.clone()).collect();
-        texts.push(format!(
-            "{title}\n{}",
-            truncate_chars(&extracted.text, e.page_chars)
-        ));
-        match e.embedder.embed(&texts).await {
-            Ok(mut vectors) => {
-                let vector = vectors.pop().expect("one vector per text");
-                let model = e.embedder.model().to_string();
-                for ((id, _), tag_vector) in std::mem::take(&mut e.unindexed_tags).into_iter().zip(vectors) {
-                    db.put_embedding(EmbeddingKind::Tag, id, &model, &tag_vector)?;
-                    e.index.insert(id, tag_vector);
-                }
-                shown = Some(relevant_tags(
-                    &counted,
-                    &e.index,
-                    &vector,
-                    config.tags.vocabulary_limit,
-                ));
-            }
-            Err(err) => e.note_error(
-                "embedding a page",
-                "that page is shown the most used tags instead of the most relevant ones",
-                &err,
-            ),
+impl<F: Fetcher, L: Llm, E: Embedder> Run<'_, '_, F, L, E> {
+    async fn process(&self, page: &PendingPage) -> Outcome {
+        match self.try_process(page).await {
+            Ok(outcome) => outcome,
+            Err(err) => Outcome::Fatal(err),
         }
     }
-    let shown = shown.unwrap_or_else(|| most_used(&counted, config.tags.vocabulary_limit));
-    let vocabulary = format_vocabulary(&shown);
 
-    let request = SummaryRequest {
-        url: &page.url,
-        title,
-        text: &extracted.text,
-        lang,
-        detected_lang,
-        vocabulary: &vocabulary,
-        tags: &config.tags,
-    };
-    let summary = llm.summarize(&request).await.map_err(|err| {
-        if err.downcast_ref::<PageRejected>().is_some() {
-            PageError::Page(err)
-        } else {
-            PageError::Fatal(err.context("LLM request failed"))
-        }
-    })?;
+    /// `Err` is only for problems that affect every page.
+    async fn try_process(&self, page: &PendingPage) -> Result<Outcome> {
+        let fetched = {
+            let _permit = self.domains.acquire(&page.url).await;
+            self.fetcher.fetch(&page.url).await
+        };
+        let fetched = match fetched {
+            Ok(fetched) => fetched,
+            Err(err) if err.kind.is_unreachable() => {
+                self.save_stub(page, Stub::Unreachable, err.kind.as_str(), &err.message)?;
+                return Ok(Outcome::Unreachable(err.message));
+            }
+            Err(err) => {
+                self.save_stub(page, Stub::Failed, err.kind.as_str(), &err.message)?;
+                return Ok(Outcome::Failed(err.message));
+            }
+        };
 
-    let ResolvedTags {
-        page_tags: tags,
-        created,
-    } = resolve_tags(db, &summary, &config.tags)?;
-    let title = summary.title.trim();
-    let text = summary.summary.trim();
-    let language = summary.language.trim().to_ascii_lowercase();
-    db.save_result(
-        page.id,
-        &PageResult {
+        let extracted = extract(&fetched.html, &fetched.final_url, self.config.llm.max_input_chars);
+        let title = [Some(extracted.title.as_str()), page.browser_title.as_deref()]
+            .into_iter()
+            .flatten()
+            .find(|t| !t.trim().is_empty())
+            .unwrap_or("");
+        let detected_lang = whatlang::detect(&extracted.text)
+            .filter(|info| info.is_reliable())
+            .map(|info| info.lang().eng_name());
+
+        let vocabulary = self.vocabulary(title, &extracted.text).await?;
+        let request = SummaryRequest {
+            url: &page.url,
             title,
-            summary: text,
-            lang: (!language.is_empty()).then_some(language.as_str()),
-            tags: &tags,
-        },
-    )
-    .context("saving result")?;
+            text: &extracted.text,
+            lang: self.lang,
+            detected_lang,
+            vocabulary: &vocabulary,
+            tags: &self.config.tags,
+        };
+        let summary = match self.llm.summarize(&request).await {
+            Ok(summary) => summary,
+            Err(err) => {
+                let Some(rejected) = err.downcast_ref::<PageRejected>() else {
+                    return Err(err.context("LLM request failed"));
+                };
+                let message = format!("{err:#}");
+                self.save_stub(page, Stub::Failed, rejected.kind, &message)?;
+                return Ok(Outcome::Failed(message));
+            }
+        };
 
-    // New tags must be searchable for the next page; the page's own vector is
-    // kept for the end-of-run tag reconciliation. The page is already saved,
-    // so a failure here only costs vectors: the tags are retried with the
-    // next page, and the next run fills in anything still missing.
-    if let Some(e) = embeddings {
-        let mut tags = std::mem::take(&mut e.unindexed_tags);
-        tags.extend(created);
+        // Resolving and saving happen without an await in between, so two
+        // pages can't create the same tag twice.
+        let title = summary.title.trim();
+        let text = summary.summary.trim();
+        let created = {
+            let mut db = self.db.borrow_mut();
+            let ResolvedTags { page_tags, created } = resolve_tags(&db, &summary, &self.config.tags)?;
+            let language = summary.language.trim().to_ascii_lowercase();
+            let result = PageResult {
+                title,
+                summary: text,
+                lang: (!language.is_empty()).then_some(language.as_str()),
+                tags: &page_tags,
+            };
+            db.save_result(page.id, &result).context("saving result")?;
+            created
+        };
+        self.store_vectors(page.id, title, text, created).await?;
+        Ok(Outcome::Done(title.to_string()))
+    }
+
+    /// Saves a stub note for a page without a summary, so every tab still
+    /// shows up in the archive: a title, a sentence saying why, and a
+    /// reserved status tag.
+    fn save_stub(&self, page: &PendingPage, stub: Stub, kind: &str, message: &str) -> Result<()> {
+        let (tag_name, tag_description, not_what) = match stub {
+            Stub::Unreachable => (UNREACHABLE_TAG, "Pages that could not be loaded", "loaded"),
+            Stub::Failed => (
+                FAILED_TAG,
+                "Pages that loaded but could not be summarized",
+                "summarized",
+            ),
+        };
+        let (title, title_note) = match page
+            .browser_title
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+        {
+            Some(title) => (title.to_string(), "The title is the one saved with the link."),
+            None => (
+                page.url
+                    .split_once("://")
+                    .map_or(page.url.as_str(), |(_, rest)| rest)
+                    .to_string(),
+                "The title is the page's address.",
+            ),
+        };
+        let summary =
+            format!("This page could not be {not_what} ({message}), so there is no summary. {title_note}");
+
+        let mut db = self.db.borrow_mut();
+        let tag = match db.find_tag(tag_name)? {
+            Some((id, _)) => id,
+            None => db.create_tag(tag_name, Some(tag_description))?,
+        };
+        let tags = [(tag_name.to_string(), tag)];
+        let result = PageResult {
+            title: &title,
+            summary: &summary,
+            lang: None,
+            tags: &tags,
+        };
+        match stub {
+            Stub::Unreachable => db.save_unreachable(page.id, &result, kind, message),
+            Stub::Failed => db.save_failed(page.id, &result, kind, message),
+        }
+    }
+
+    /// The existing tags to show the model: the most similar to the page, or
+    /// the most used ones without embeddings.
+    async fn vocabulary(&self, title: &str, text: &str) -> Result<String> {
+        // Tags whose vectors failed on an earlier page go along with this
+        // request, so this page can already be shown them.
+        let request = {
+            let mut embeddings = self.embeddings.borrow_mut();
+            match embeddings.as_deref_mut() {
+                Some(e) if e.index.len() > 0 || !e.unindexed_tags.is_empty() => {
+                    let retried = std::mem::take(&mut e.unindexed_tags);
+                    let mut texts: Vec<String> = retried.iter().map(|(_, text)| text.clone()).collect();
+                    texts.push(format!("{title}\n{}", truncate_chars(text, e.page_chars)));
+                    Some((e.embedder, retried, texts))
+                }
+                _ => None,
+            }
+        };
+        let mut page_vector = None;
+        if let Some((embedder, retried, texts)) = request {
+            let result = embedder.embed(&texts).await;
+            let mut embeddings = self.embeddings.borrow_mut();
+            let e = embeddings.as_deref_mut().expect("embeddings were checked above");
+            match result {
+                Ok(mut vectors) => {
+                    page_vector = vectors.pop();
+                    let db = self.db.borrow();
+                    for ((id, _), vector) in retried.into_iter().zip(vectors) {
+                        db.put_embedding(EmbeddingKind::Tag, id, embedder.model(), &vector)?;
+                        e.index.insert(id, vector);
+                    }
+                }
+                Err(err) => {
+                    e.unindexed_tags.extend(retried);
+                    e.note_error(
+                        self.progress,
+                        "embedding a page",
+                        "that page is shown the most used tags instead of the most relevant ones",
+                        &err,
+                    );
+                }
+            }
+        }
+
+        let db = self.db.borrow();
+        let counted = count_tree(&db.tags()?, &db.tag_links()?);
+        let limit = self.config.tags.vocabulary_limit;
+        let shown = match (&page_vector, self.embeddings.borrow().as_deref()) {
+            (Some(vector), Some(e)) => relevant_tags(&counted, &e.index, vector, limit),
+            _ => most_used(&counted, limit),
+        };
+        Ok(format_vocabulary(&shown))
+    }
+
+    /// Stores the page's vector (for the end-of-run tag reconciliation) and
+    /// its new tags' vectors, so the next pages can be shown them. The page is
+    /// already saved, so a failure only costs vectors: the tags are retried
+    /// with the next page, and the next run fills in anything still missing.
+    async fn store_vectors(
+        &self,
+        page_id: i64,
+        title: &str,
+        text: &str,
+        created: Vec<(i64, String)>,
+    ) -> Result<()> {
+        let (embedder, tags) = {
+            let mut embeddings = self.embeddings.borrow_mut();
+            let Some(e) = embeddings.as_deref_mut() else {
+                return Ok(());
+            };
+            let mut tags = std::mem::take(&mut e.unindexed_tags);
+            tags.extend(created);
+            (e.embedder, tags)
+        };
         let mut texts: Vec<String> = tags.iter().map(|(_, text)| text.clone()).collect();
         texts.push(page_embedding_text(title, text));
-        let mut vectors = match e.embedder.embed(&texts).await {
+        let result = embedder.embed(&texts).await;
+
+        let mut embeddings = self.embeddings.borrow_mut();
+        let e = embeddings.as_deref_mut().expect("embeddings were checked above");
+        let mut vectors = match result {
             Ok(vectors) => vectors,
             Err(err) => {
+                e.unindexed_tags.extend(tags);
                 e.note_error(
+                    self.progress,
                     "storing vectors for new tags",
                     "the tags are retried with the next page, and the next run fills in missing vectors",
                     &err,
                 );
-                e.unindexed_tags = tags;
-                return Ok(title.to_string());
+                return Ok(());
             }
         };
-        let model = e.embedder.model().to_string();
+        let db = self.db.borrow();
+        let model = embedder.model();
         db.put_embedding(
             EmbeddingKind::Page,
-            page.id,
-            &model,
+            page_id,
+            model,
             &vectors.pop().expect("one vector per text"),
         )?;
-        for ((id, _), vector) in tags.iter().zip(vectors) {
-            db.put_embedding(EmbeddingKind::Tag, *id, &model, &vector)?;
-            e.index.insert(*id, vector);
+        for ((id, _), vector) in tags.into_iter().zip(vectors) {
+            db.put_embedding(EmbeddingKind::Tag, id, model, &vector)?;
+            e.index.insert(id, vector);
         }
+        Ok(())
     }
-    Ok(title.to_string())
 }
 
 /// The `limit` tags most similar to the page, among tags in use.
@@ -347,15 +577,29 @@ mod tests {
     use anyhow::bail;
 
     use super::*;
-    use crate::fetch::FetchedPage;
+    use crate::fetch::{FetchError, FetchErrorKind, FetchedPage};
     use crate::llm::NewTag;
 
     struct FakeFetcher;
 
     impl Fetcher for FakeFetcher {
-        async fn fetch(&self, url: &str) -> Result<FetchedPage> {
+        async fn fetch(&self, url: &str) -> Result<FetchedPage, FetchError> {
+            // Lets other pages run, as a real fetch would.
+            tokio::task::yield_now().await;
+            let fail = |kind, message: &str| {
+                Err(FetchError {
+                    kind,
+                    message: message.to_string(),
+                })
+            };
             if url.contains("broken") {
-                bail!("HTTP 404 Not Found");
+                return fail(FetchErrorKind::NotFound, "HTTP 404 Not Found");
+            }
+            if url.ends_with(".pdf") {
+                return fail(
+                    FetchErrorKind::UnsupportedType,
+                    "unsupported content type: application/pdf",
+                );
             }
             let sentence = if url.contains("bread") {
                 "Sourdough bread is leavened with a starter of wild yeast and flour. "
@@ -392,7 +636,7 @@ mod tests {
             self.seen_vocab.borrow_mut().push(request.vocabulary.to_string());
             match self.replies.borrow_mut().remove(0) {
                 Ok(s) => Ok(s),
-                Err("reject") => Err(PageRejected("too long".into()).into()),
+                Err("reject") => Err(PageRejected::rejected("too long".into()).into()),
                 Err(other) => bail!("{other}"),
             }
         }
@@ -504,9 +748,12 @@ mod tests {
             &FakeFetcher,
             llm,
             None::<&mut Embeddings<FakeEmbedder>>,
-            &Config::default(),
-            &LangMode::English,
-            None,
+            &RunOptions {
+                config: &Config::default(),
+                lang: &LangMode::English,
+                filter: &Filter::default(),
+                limit: None,
+            },
         )
         .await
     }
@@ -518,9 +765,12 @@ mod tests {
             &FakeFetcher,
             llm,
             Some(&mut embeddings),
-            config,
-            &LangMode::English,
-            None,
+            &RunOptions {
+                config,
+                lang: &LangMode::English,
+                filter: &Filter::default(),
+                limit: None,
+            },
         )
         .await
     }
@@ -553,7 +803,14 @@ mod tests {
             )),
         ]);
         let stats = run(&mut db, &llm).await.unwrap();
-        assert_eq!(stats, Stats { done: 2, failed: 1 });
+        assert_eq!(
+            stats,
+            Stats {
+                done: 2,
+                unreachable: 1,
+                ..Stats::default()
+            }
+        );
 
         // The second page was shown the tags the first page created.
         let seen = llm.seen_vocab.borrow();
@@ -563,13 +820,210 @@ mod tests {
             "memory-safety (1) - first used for: Rust intro\nrust-programming (1) - The Rust language"
         );
 
-        // The reserved status/ tag from the model was dropped; paths became flat names.
+        // The model's status/ tag was dropped and paths became flat names; the
+        // only status tag is the one tabkeeper put on the unreachable page,
+        // which the model is never offered.
         assert_eq!(
             page_tag_names(&db),
-            ["memory-safety", "rust-programming", "rust-programming"]
+            [
+                "memory-safety",
+                "rust-programming",
+                "rust-programming",
+                "status/unreachable"
+            ]
         );
-        assert_eq!(db.done_pages().unwrap()[0].lang.as_deref(), Some("en"));
-        assert_eq!(db.status_counts().unwrap().failed, 1);
+        assert!(!seen[1].contains("status/"));
+        let pages = db.note_pages().unwrap();
+        assert_eq!(pages[0].lang.as_deref(), Some("en"));
+        assert_eq!(db.status_counts().unwrap().unreachable, 1);
+
+        // The unreachable page got a stub note saying why.
+        let stub = pages.iter().find(|p| p.url.contains("broken")).unwrap();
+        assert_eq!(stub.title, "broken.com/");
+        assert_eq!(
+            stub.summary,
+            "This page could not be loaded (HTTP 404 Not Found), so there is no summary. The title is the page's address."
+        );
+    }
+
+    #[tokio::test]
+    async fn pages_that_load_but_cant_be_used_get_failed_stubs() {
+        let mut db = db_with(&["https://a.com/paper.pdf", "https://b.com/"]);
+        let llm = FakeLlm::new(vec![Err("reject")]);
+        let stats = run(&mut db, &llm).await.unwrap();
+        assert_eq!(
+            stats,
+            Stats {
+                failed: 2,
+                ..Stats::default()
+            }
+        );
+        let kinds = db.failure_kinds().unwrap();
+        assert_eq!(
+            kinds,
+            [("rejected".to_string(), 1), ("unsupported_type".to_string(), 1)]
+        );
+
+        // Both still get a note, so no tab is lost from the archive.
+        assert_eq!(page_tag_names(&db), ["status/failed", "status/failed"]);
+        let pages = db.note_pages().unwrap();
+        assert_eq!(
+            pages[0].summary,
+            "This page could not be summarized (unsupported content type: application/pdf), so there is no \
+             summary. The title is the page's address."
+        );
+        assert!(
+            pages[1]
+                .summary
+                .starts_with("This page could not be summarized (too long)"),
+            "{}",
+            pages[1].summary
+        );
+    }
+
+    #[tokio::test]
+    async fn retried_stub_that_fails_again_is_rewritten() {
+        // An earlier run found the page unreachable and wrote its stub note.
+        let mut db = db_with(&["https://a.com/paper.pdf"]);
+        let page = db.pending_pages().unwrap()[0].id;
+        let tag = db.create_tag(UNREACHABLE_TAG, None).unwrap();
+        let tags = [(UNREACHABLE_TAG.to_string(), tag)];
+        let stub = PageResult {
+            title: "Paper",
+            summary: "Unreachable.",
+            lang: None,
+            tags: &tags,
+        };
+        db.save_unreachable(page, &stub, "timeout", "timed out").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        crate::render::render_all(&db, dir.path()).unwrap();
+
+        // This time it loads, but it's a PDF.
+        db.retry_failed().unwrap();
+        run(&mut db, &FakeLlm::new(vec![])).await.unwrap();
+        crate::render::render_all(&db, dir.path()).unwrap();
+        let note = std::fs::read_to_string(dir.path().join("notes/paper.md")).unwrap();
+        assert!(
+            note.contains("could not be summarized (unsupported content type"),
+            "{note}"
+        );
+        assert!(
+            note.ends_with("#status/failed\n"),
+            "the old status tag is gone: {note}"
+        );
+        assert_eq!(db.failure_kinds().unwrap(), [("unsupported_type".to_string(), 1)]);
+    }
+
+    #[tokio::test]
+    async fn browser_title_is_used_for_stub_notes() {
+        let db = Db::open_in_memory().unwrap();
+        db.add_page(
+            "https://broken.com/x",
+            "https://broken.com/x",
+            Some("My saved tab"),
+            "import",
+        )
+        .unwrap();
+        let mut db = db;
+        run(&mut db, &FakeLlm::new(vec![])).await.unwrap();
+        let stub = &db.note_pages().unwrap()[0];
+        assert_eq!(stub.title, "My saved tab");
+        assert!(
+            stub.summary
+                .ends_with("The title is the one saved with the link.")
+        );
+        // Retrying makes it pending again.
+        assert_eq!(db.retry_failed().unwrap(), 1);
+        assert_eq!(db.pending_pages().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn filter_leaves_excluded_pages_pending() {
+        let mut db = db_with(&["https://a.com/", "https://skip.example.com/"]);
+        let llm = FakeLlm::new(vec![Ok(summary("A", &["alpha"], &[]))]);
+        let config = crate::config::FilterConfig {
+            mode: crate::config::FilterMode::Deny,
+            rules: vec!["domain:example.com".into()],
+        };
+        let filter = Filter::new(&config, &[], &[]).unwrap();
+        let stats = process_pending(
+            &mut db,
+            &FakeFetcher,
+            &llm,
+            None::<&mut Embeddings<FakeEmbedder>>,
+            &RunOptions {
+                config: &Config::default(),
+                lang: &LangMode::English,
+                filter: &filter,
+                limit: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            stats,
+            Stats {
+                done: 1,
+                filtered: 1,
+                ..Stats::default()
+            }
+        );
+        assert_eq!(db.pending_pages().unwrap()[0].url, "https://skip.example.com/");
+    }
+
+    #[tokio::test]
+    async fn concurrent_pages_share_one_tag_and_all_finish() {
+        let urls: Vec<String> = (0..12).map(|i| format!("https://site{i}.com/")).collect();
+        let mut db = db_with(&urls.iter().map(String::as_str).collect::<Vec<_>>());
+        let replies = (0..12)
+            .map(|i| {
+                Ok(summary(
+                    &format!("Page {i}"),
+                    &["shared-topic", &format!("own-{i}")],
+                    &[],
+                ))
+            })
+            .collect();
+        let llm = FakeLlm::new(replies);
+        let mut config = Config::default();
+        config.run.sequential_start = 2;
+        config.run.concurrency = 5;
+        let stats = process_pending(
+            &mut db,
+            &FakeFetcher,
+            &llm,
+            None::<&mut Embeddings<FakeEmbedder>>,
+            &RunOptions {
+                config: &config,
+                lang: &LangMode::English,
+                filter: &Filter::default(),
+                limit: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            stats,
+            Stats {
+                done: 12,
+                ..Stats::default()
+            }
+        );
+        let shared: Vec<_> = db
+            .tags()
+            .unwrap()
+            .into_iter()
+            .filter(|t| t.name == "shared-topic")
+            .collect();
+        assert_eq!(shared.len(), 1);
+        assert_eq!(
+            db.tag_links()
+                .unwrap()
+                .iter()
+                .filter(|(_, id)| *id == shared[0].id)
+                .count(),
+            12
+        );
     }
 
     #[tokio::test]
@@ -655,13 +1109,22 @@ mod tests {
             &FakeFetcher,
             &llm,
             Some(&mut embeddings),
-            &Config::default(),
-            &LangMode::English,
-            None,
+            &RunOptions {
+                config: &Config::default(),
+                lang: &LangMode::English,
+                filter: &Filter::default(),
+                limit: None,
+            },
         )
         .await
         .unwrap();
-        assert_eq!(stats, Stats { done: 2, failed: 0 });
+        assert_eq!(
+            stats,
+            Stats {
+                done: 2,
+                ..Stats::default()
+            }
+        );
         assert_eq!(embeddings.errors, 1);
         // The second page couldn't be embedded, so it was shown the most used tags.
         assert!(llm.seen_vocab.borrow()[1].starts_with("alpha (1)"));
@@ -681,13 +1144,22 @@ mod tests {
             &FakeFetcher,
             &llm,
             Some(&mut embeddings),
-            &Config::default(),
-            &LangMode::English,
-            None,
+            &RunOptions {
+                config: &Config::default(),
+                lang: &LangMode::English,
+                filter: &Filter::default(),
+                limit: None,
+            },
         )
         .await
         .unwrap();
-        assert_eq!(stats, Stats { done: 2, failed: 0 });
+        assert_eq!(
+            stats,
+            Stats {
+                done: 2,
+                ..Stats::default()
+            }
+        );
         assert_eq!(embeddings.errors, 2);
         // alpha was retried with the second page's query, which worked; beta's
         // store failed on the last page, and so did both page vectors.
@@ -743,9 +1215,12 @@ mod tests {
             &FakeFetcher,
             &llm,
             Some(&mut embeddings),
-            &config,
-            &LangMode::English,
-            None,
+            &RunOptions {
+                config: &config,
+                lang: &LangMode::English,
+                filter: &Filter::default(),
+                limit: None,
+            },
         )
         .await
         .unwrap();
