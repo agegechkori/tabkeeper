@@ -6,7 +6,13 @@ Declare tab bankruptcy without losing anything. tabkeeper reads every open tab i
 
 ## Usage
 
-tabkeeper talks to any OpenAI-compatible chat server. By default it uses [Ollama](https://ollama.com) at `http://localhost:11434/v1` with the model `llama3.1:8b`.
+tabkeeper talks to any OpenAI-compatible chat server. By default it uses [Ollama](https://ollama.com) at `http://localhost:11434/v1` with the model `llama3.1:8b`, plus the embedding model `nomic-embed-text` to pick which existing tags the model sees for each page:
+
+```sh
+ollama pull nomic-embed-text
+```
+
+Without it tabkeeper still works, showing the model the most used tags instead, and says so when it starts.
 
 ```sh
 cargo build --release
@@ -24,9 +30,9 @@ reasoning_effort = "none"
 
 This writes to `tabkeeper-out/` (change it with `--out`):
 
-- `notes/*.md`: one note per page, with a title, the URL, a short summary and hierarchical tags such as `#technology/programming-languages/rust`
-- `_tags.md`: the tag tree with page counts
-- `_index.md`: all notes grouped by top-level tag
+- `notes/*.md`: one note per page, with a title, the URL, a short summary and 3–5 tags such as `#rust-programming #memory-safety`
+- `_tags.md`: all tags with page counts
+- `_index.md`: all notes, each listed under its most used tag
 - `tabkeeper.db`: the SQLite database everything is rendered from
 
 Runs can be interrupted and restarted: finished pages are kept, and URLs already processed are skipped. Other commands:

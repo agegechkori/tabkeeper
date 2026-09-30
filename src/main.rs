@@ -1,5 +1,6 @@
 mod config;
 mod db;
+mod embed;
 mod extract;
 mod fetch;
 mod import;
@@ -104,9 +105,53 @@ async fn run(cli: Cli) -> Result<()> {
             let fetcher = fetch::HttpFetcher::new(&config.fetch)?;
             let llm = llm::OpenAiCompatible::new(&config.llm)?;
             println!("Using model {} at {}.", config.llm.model, config.llm.base_url);
-            let result = pipeline::process_pending(&mut db, &fetcher, &llm, &config, &lang, limit).await;
+
+            // Embeddings are optional: any problem setting them up is a warning,
+            // and the model is shown the most used tags instead.
+            let unavailable = |err: anyhow::Error| {
+                println!(
+                    "Warning: embeddings are unavailable ({err:#}).\n\
+                     The model will be shown the most used tags instead of the most relevant ones. \
+                     If the embedding model is missing on Ollama, run: ollama pull {}",
+                    config.embeddings.model
+                )
+            };
+            let embedder = if config.embeddings.enabled {
+                embed::OpenAiEmbedder::new(&config.embeddings, &config.llm)
+                    .map_err(unavailable)
+                    .ok()
+            } else {
+                None
+            };
+            let mut embeddings = None;
+            if let Some(embedder) = &embedder {
+                match pipeline::Embeddings::prepare(&db, embedder, config.embeddings.page_chars).await {
+                    Ok(e) => {
+                        println!(
+                            "Using embedding model {} to pick relevant tags.",
+                            config.embeddings.model
+                        );
+                        embeddings = Some(e);
+                    }
+                    Err(err) => unavailable(err),
+                }
+            }
+
+            let result = pipeline::process_pending(
+                &mut db,
+                &fetcher,
+                &llm,
+                embeddings.as_mut(),
+                &config,
+                &lang,
+                limit,
+            )
+            .await;
             // Render whatever was finished, even if the run stopped early.
             finish(&db, &cli.out)?;
+            if let Some(errors) = embeddings.as_ref().map(|e| e.errors).filter(|n| *n > 0) {
+                println!("{errors} embedding requests failed; the next run fills in the missing vectors.");
+            }
             let stats = result?;
             println!("This run: {} done, {} failed.", stats.done, stats.failed);
         }

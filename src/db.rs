@@ -3,11 +3,11 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::tags::{TagPath, TagRow};
+use crate::tags::TagRow;
 
-const SCHEMA_VERSION: i32 = 1;
+const SCHEMA_VERSION: i32 = 2;
 
-const SCHEMA_V1: &str = "
+const SCHEMA: &str = "
 CREATE TABLE pages (
     id            INTEGER PRIMARY KEY,
     url           TEXT NOT NULL UNIQUE,   -- normalized, used for deduplication
@@ -25,13 +25,15 @@ CREATE TABLE pages (
     processed_at  TEXT
 );
 
+-- Every tag has a unique flat name. parent_id places it in the tag tree,
+-- which the end-of-run reconciliation builds; until then all tags are roots.
 CREATE TABLE tags (
     id          INTEGER PRIMARY KEY,
+    name        TEXT NOT NULL UNIQUE,
     parent_id   INTEGER REFERENCES tags(id),
-    name        TEXT NOT NULL,
-    path        TEXT NOT NULL UNIQUE,
     description TEXT,
-    locked      INTEGER NOT NULL DEFAULT 0
+    locked      INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT NOT NULL
 );
 
 -- raw_tag is exactly what the model returned and is never modified; tag
@@ -43,6 +45,26 @@ CREATE TABLE page_tags (
     PRIMARY KEY (page_id, raw_tag)
 );
 CREATE INDEX page_tags_by_tag ON page_tags(resolved_tag_id);
+
+-- Other names that resolve to a tag. source: rule (spelling variants merged
+-- in code), llm (merges from reconciliation) or user.
+CREATE TABLE tag_aliases (
+    alias      TEXT PRIMARY KEY,
+    tag_id     INTEGER NOT NULL REFERENCES tags(id),
+    source     TEXT NOT NULL CHECK (source IN ('rule', 'llm', 'user')),
+    locked     INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+
+-- Unit-length f32 vectors, little-endian. kind 'tag' refers to tags.id,
+-- 'page' to pages.id (the page's title and summary).
+CREATE TABLE embeddings (
+    kind   TEXT NOT NULL CHECK (kind IN ('tag', 'page')),
+    ref_id INTEGER NOT NULL,
+    model  TEXT NOT NULL,
+    vector BLOB NOT NULL,
+    PRIMARY KEY (kind, ref_id, model)
+);
 ";
 
 pub struct Db {
@@ -83,8 +105,33 @@ pub struct StatusCounts {
     pub failed: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbeddingKind {
+    Tag,
+    Page,
+}
+
+impl EmbeddingKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Tag => "tag",
+            Self::Page => "page",
+        }
+    }
+}
+
 fn now() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+fn vector_to_blob(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
+fn blob_to_vector(b: &[u8]) -> Vec<f32> {
+    b.chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
 }
 
 impl Db {
@@ -104,9 +151,13 @@ impl Db {
         let version: i32 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
         match version {
             0 => {
-                conn.execute_batch(SCHEMA_V1)?;
+                conn.execute_batch(SCHEMA)?;
                 conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             }
+            1 => bail!(
+                "this output folder was created by an early development version of tabkeeper that used \
+                 hierarchical tags per page; use a new --out folder"
+            ),
             SCHEMA_VERSION => {}
             v => {
                 bail!("database schema version {v} is newer than this tabkeeper supports ({SCHEMA_VERSION})")
@@ -196,49 +247,63 @@ impl Db {
         Ok(())
     }
 
-    pub fn tag_id(&self, path: &TagPath) -> Result<Option<i64>> {
-        Ok(self
-            .conn
-            .query_row("SELECT id FROM tags WHERE path = ?1", [path.to_string()], |r| {
-                r.get(0)
-            })
-            .optional()?)
+    fn tag_id_where(&self, condition: &str, value: &str) -> Result<Option<i64>> {
+        let sql = format!("SELECT id FROM tags WHERE {condition} LIMIT 1");
+        Ok(self.conn.query_row(&sql, [value], |r| r.get(0)).optional()?)
     }
 
-    /// Returns the id of `path`, creating it and any missing ancestors. The
-    /// description is only set on a tag this call creates.
-    pub fn ensure_tag(&self, path: &TagPath, description: Option<&str>) -> Result<i64> {
-        let mut parent: Option<i64> = None;
-        let mut id = 0;
-        let depth = path.segments().len();
-        for (i, prefix) in path.prefixes().enumerate() {
-            id = match self.tag_id(&prefix)? {
-                Some(existing) => existing,
-                None => {
-                    let desc = if i + 1 == depth { description } else { None };
-                    self.conn.execute(
-                        "INSERT INTO tags (parent_id, name, path, description) VALUES (?1, ?2, ?3, ?4)",
-                        params![parent, prefix.segments()[i], prefix.to_string(), desc],
-                    )?;
-                    self.conn.last_insert_rowid()
-                }
-            };
-            parent = Some(id);
+    /// Finds the existing tag a normalized name refers to: the tag itself, a
+    /// recorded alias, or the same words without hyphens (`machinelearning` /
+    /// `machine-learning`). Returns the tag id and whether it was found under a
+    /// different name. Plural and singular forms are not matched here: `glasses`
+    /// is not `glass`, so those merges are left to the reconciliation pass,
+    /// where they are confirmed.
+    pub fn find_tag(&self, name: &str) -> Result<Option<(i64, bool)>> {
+        if let Some(id) = self.tag_id_where("name = ?1", name)? {
+            return Ok(Some((id, false)));
         }
-        Ok(id)
+        let alias: Option<i64> = self
+            .conn
+            .query_row("SELECT tag_id FROM tag_aliases WHERE alias = ?1", [name], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        if let Some(id) = alias {
+            return Ok(Some((id, true)));
+        }
+        let squashed = name.replace('-', "");
+        Ok(self
+            .tag_id_where("replace(name, '-', '') = ?1", &squashed)?
+            .map(|id| (id, true)))
+    }
+
+    pub fn create_tag(&self, name: &str, description: Option<&str>) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO tags (name, description, created_at) VALUES (?1, ?2, ?3)",
+            params![name, description, now()],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Records that `alias` resolves to `tag_id`. An existing alias is kept.
+    pub fn add_alias(&self, alias: &str, tag_id: i64, source: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO tag_aliases (alias, tag_id, source, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![alias, tag_id, source, now()],
+        )?;
+        Ok(())
     }
 
     pub fn tags(&self) -> Result<Vec<TagRow>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, parent_id, name, path, description FROM tags ORDER BY path")?;
+            .prepare("SELECT id, parent_id, name, description FROM tags ORDER BY name")?;
         let rows = stmt.query_map([], |r| {
             Ok(TagRow {
                 id: r.get(0)?,
                 parent_id: r.get(1)?,
                 name: r.get(2)?,
-                path: r.get(3)?,
-                description: r.get(4)?,
+                description: r.get(3)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -282,6 +347,71 @@ impl Db {
         )?;
         Ok(())
     }
+
+    pub fn put_embedding(&self, kind: EmbeddingKind, ref_id: i64, model: &str, vector: &[f32]) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO embeddings (kind, ref_id, model, vector) VALUES (?1, ?2, ?3, ?4)",
+            params![kind.as_str(), ref_id, model, vector_to_blob(vector)],
+        )?;
+        Ok(())
+    }
+
+    pub fn embeddings(&self, kind: EmbeddingKind, model: &str) -> Result<Vec<(i64, Vec<f32>)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT ref_id, vector FROM embeddings WHERE kind = ?1 AND model = ?2")?;
+        let rows = stmt.query_map(params![kind.as_str(), model], |r| {
+            Ok((r.get::<_, i64>(0)?, blob_to_vector(&r.get::<_, Vec<u8>>(1)?)))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Text to embed for every tag that has no vector for `model` yet.
+    pub fn tags_missing_embedding(&self, model: &str) -> Result<Vec<(i64, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT t.id, t.name, t.description FROM tags t
+             WHERE NOT EXISTS (SELECT 1 FROM embeddings e WHERE e.kind = 'tag' AND e.ref_id = t.id AND e.model = ?1)
+             ORDER BY t.id",
+        )?;
+        let rows = stmt.query_map([model], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                tag_embedding_text(&r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?.as_deref()),
+            ))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Text to embed for every done page that has no vector for `model` yet.
+    pub fn pages_missing_embedding(&self, model: &str) -> Result<Vec<(i64, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT p.id, p.title, p.summary FROM pages p
+             WHERE p.status = 'done'
+               AND NOT EXISTS (SELECT 1 FROM embeddings e WHERE e.kind = 'page' AND e.ref_id = p.id AND e.model = ?1)
+             ORDER BY p.id",
+        )?;
+        let rows = stmt.query_map([model], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                page_embedding_text(&r.get::<_, String>(1)?, &r.get::<_, String>(2)?),
+            ))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+}
+
+/// What is embedded for a tag: its name, which is kebab-case, plus its description.
+pub fn tag_embedding_text(name: &str, description: Option<&str>) -> String {
+    let words = name.replace('-', " ");
+    match description {
+        Some(d) if !d.trim().is_empty() => format!("{words}: {}", d.trim()),
+        _ => words,
+    }
+}
+
+/// What is embedded for a processed page: its title and summary.
+pub fn page_embedding_text(title: &str, summary: &str) -> String {
+    format!("{title}\n{summary}")
 }
 
 #[cfg(test)]
@@ -303,30 +433,19 @@ mod tests {
     }
 
     #[test]
-    fn ensure_tag_creates_ancestors_once() {
+    fn find_tag_matches_variants_and_aliases() {
         let db = Db::open_in_memory().unwrap();
-        let rust = TagPath::parse("tech/languages/rust", 3).unwrap();
-        let go = TagPath::parse("tech/languages/go", 3).unwrap();
-        let rust_id = db.ensure_tag(&rust, Some("The Rust language")).unwrap();
-        db.ensure_tag(&go, None).unwrap();
-        assert_eq!(db.ensure_tag(&rust, Some("ignored")).unwrap(), rust_id);
-
-        let tags = db.tags().unwrap();
-        let paths: Vec<&str> = tags.iter().map(|t| t.path.as_str()).collect();
-        assert_eq!(
-            paths,
-            [
-                "tech",
-                "tech/languages",
-                "tech/languages/go",
-                "tech/languages/rust"
-            ]
-        );
-        let rust_row = tags.iter().find(|t| t.id == rust_id).unwrap();
-        assert_eq!(rust_row.description.as_deref(), Some("The Rust language"));
-        assert_eq!(rust_row.name, "rust");
-        let languages = tags.iter().find(|t| t.path == "tech/languages").unwrap();
-        assert_eq!(rust_row.parent_id, Some(languages.id));
+        let games = db.create_tag("board-games", Some("Board games")).unwrap();
+        let ml = db.create_tag("machine-learning", None).unwrap();
+        assert_eq!(db.find_tag("board-games").unwrap(), Some((games, false)));
+        assert_eq!(db.find_tag("boardgames").unwrap(), Some((games, true)));
+        // Plurals are not matched: glasses (eyewear) is not glass.
+        assert_eq!(db.find_tag("board-game").unwrap(), None);
+        assert_eq!(db.find_tag("machinelearning").unwrap(), Some((ml, true)));
+        assert_eq!(db.find_tag("ml").unwrap(), None);
+        db.add_alias("ml", ml, "user").unwrap();
+        assert_eq!(db.find_tag("ml").unwrap(), Some((ml, true)));
+        assert_eq!(db.find_tag("gardening").unwrap(), None);
     }
 
     #[test]
@@ -335,8 +454,8 @@ mod tests {
         db.add_page("https://a.com/", "https://a.com/", None, "import")
             .unwrap();
         let page = db.pending_pages().unwrap()[0].id;
-        let a = db.ensure_tag(&TagPath::parse("a", 3).unwrap(), None).unwrap();
-        let b = db.ensure_tag(&TagPath::parse("b", 3).unwrap(), None).unwrap();
+        let a = db.create_tag("a", None).unwrap();
+        let b = db.create_tag("b", None).unwrap();
         let first = [("A".to_string(), a)];
         db.save_result(
             page,
@@ -368,5 +487,59 @@ mod tests {
                 failed: 0
             }
         );
+    }
+
+    #[test]
+    fn embeddings_round_trip_and_missing_lists() {
+        let mut db = Db::open_in_memory().unwrap();
+        let rust = db
+            .create_tag("rust-programming", Some("The Rust language"))
+            .unwrap();
+        let go = db.create_tag("go", None).unwrap();
+        db.put_embedding(EmbeddingKind::Tag, rust, "m", &[0.6, -0.8])
+            .unwrap();
+        assert_eq!(
+            db.embeddings(EmbeddingKind::Tag, "m").unwrap(),
+            [(rust, vec![0.6, -0.8])]
+        );
+        assert_eq!(db.tags_missing_embedding("m").unwrap(), [(go, "go".to_string())]);
+        // A different model needs its own vectors.
+        assert_eq!(
+            db.tags_missing_embedding("other").unwrap(),
+            [
+                (rust, "rust programming: The Rust language".to_string()),
+                (go, "go".to_string())
+            ]
+        );
+
+        db.add_page("https://a.com/", "https://a.com/", None, "import")
+            .unwrap();
+        let page = db.pending_pages().unwrap()[0].id;
+        assert!(
+            db.pages_missing_embedding("m").unwrap().is_empty(),
+            "pending pages are not embedded"
+        );
+        db.save_result(
+            page,
+            &PageResult {
+                title: "T",
+                summary: "S.",
+                lang: None,
+                tags: &[],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            db.pages_missing_embedding("m").unwrap(),
+            [(page, "T\nS.".to_string())]
+        );
+    }
+
+    #[test]
+    fn refuses_phase_one_databases() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        let err = Db::init(conn).err().unwrap();
+        assert!(err.to_string().contains("new --out folder"), "{err}");
     }
 }
