@@ -280,11 +280,17 @@ pub async fn build(db: &Db, ctx: &RunContext<'_>) -> Result<Report> {
     let processed = stats.done + stats.unreachable + stats.failed;
 
     let counted = count_tree(&db.tags()?, &db.tag_links()?);
+    // Tags pages have, by their own pages: categories of the tree, which
+    // only gather other tags, aren't counted.
     let topic: Vec<_> = counted
         .iter()
-        .filter(|t| t.total > 0 && !t.name.starts_with(RESERVED_PREFIX))
+        .filter(|t| t.direct > 0 && !t.name.starts_with(RESERVED_PREFIX))
         .collect();
-    let mut top: Vec<(String, usize)> = topic.iter().map(|t| (t.path.clone(), t.total)).collect();
+    let label = |t: &crate::tags::CountedTag| match config.tags.style {
+        crate::config::TagStyle::Hierarchical => t.path.clone(),
+        crate::config::TagStyle::Flat => t.name.clone(),
+    };
+    let mut top: Vec<(String, usize)> = topic.iter().map(|t| (label(t), t.direct)).collect();
     top.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     top.truncate(TOP_TAGS);
 
@@ -376,7 +382,7 @@ pub async fn build(db: &Db, ctx: &RunContext<'_>) -> Result<Report> {
         tags: TagCounts {
             in_use: topic.len(),
             new_this_run: db.tags_created_since(ctx.started_at)?,
-            used_once: topic.iter().filter(|t| t.total == 1).count(),
+            used_once: topic.iter().filter(|t| t.direct == 1).count(),
             untagged_pages: db.untagged_pages()?,
             top,
         },
@@ -945,6 +951,46 @@ mod tests {
             (cost - 1.01).abs() < 1e-9,
             "$1 for summaries plus $0.01 for embeddings: {cost}"
         );
+    }
+
+    #[tokio::test]
+    async fn tag_counts_leave_out_tree_categories() {
+        use crate::reconcile::tests::{archive, tag_id};
+        let mut db = archive(&[
+            (&["rust"], [1.0, 0.0, 0.0]),
+            (&["rust", "python"], [1.0, 0.1, 0.0]),
+        ]);
+        db.apply_tag_changes(&[crate::db::TagChange::Place {
+            parent: vec!["technology".into(), "programming-languages".into()],
+            tags: vec![tag_id(&db, "rust"), tag_id(&db, "python")],
+        }])
+        .unwrap();
+        let mut config = Config::default();
+        config.llm.base_url = "https://api.example.com/v1".into();
+        let summary = RunSummary::default();
+        let ctx = |config| RunContext {
+            started_at: "2000-01-01T00:00:00Z",
+            started: std::time::Instant::now(),
+            import: None,
+            summary: &summary,
+            summaries: StageUsage::default(),
+            embeddings: None,
+            review: None,
+            config,
+        };
+        let tags = build(&db, &ctx(&config)).await.unwrap().tags;
+        assert_eq!((tags.in_use, tags.new_this_run, tags.used_once), (2, 2, 1));
+        assert_eq!(
+            tags.top,
+            [
+                ("technology/programming-languages/rust".to_string(), 2),
+                ("technology/programming-languages/python".to_string(), 1)
+            ]
+        );
+        let mut flat = config.clone();
+        flat.tags.style = crate::config::TagStyle::Flat;
+        let tags = build(&db, &ctx(&flat)).await.unwrap().tags;
+        assert_eq!(tags.top[0], ("rust".to_string(), 2));
     }
 
     #[test]

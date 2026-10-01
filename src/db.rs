@@ -573,7 +573,9 @@ impl Db {
     /// Topic tags (not `status/` ones) created at or after `since`.
     pub fn tags_created_since(&self, since: &str) -> Result<usize> {
         let n: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM tags WHERE created_at >= ?1 AND name NOT LIKE 'status/%'",
+            // Categories the tag tree adds have no pages of their own.
+            "SELECT COUNT(*) FROM tags WHERE created_at >= ?1 AND name NOT LIKE 'status/%'
+             AND id IN (SELECT resolved_tag_id FROM page_tags)",
             [since],
             |r| r.get(0),
         )?;
