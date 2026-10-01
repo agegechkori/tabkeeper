@@ -439,6 +439,23 @@ fn return_alias_pages(tx: &Connection, freed: &[(String, i64)]) -> Result<()> {
     Ok(())
 }
 
+/// Moves everything of tag `from` to tag `into` and deletes `from`.
+fn absorb_tag(tx: &Connection, from: i64, into: i64) -> Result<()> {
+    for sql in [
+        "UPDATE page_tags SET resolved_tag_id = ?2 WHERE resolved_tag_id = ?1",
+        "UPDATE tag_aliases SET tag_id = ?2 WHERE tag_id = ?1",
+        "UPDATE tags SET parent_id = ?2 WHERE parent_id = ?1",
+    ] {
+        tx.execute(sql, params![from, into])?;
+    }
+    tx.execute(
+        "DELETE FROM embeddings WHERE kind = 'tag' AND ref_id = ?1",
+        [from],
+    )?;
+    tx.execute("DELETE FROM tags WHERE id = ?1", [from])?;
+    Ok(())
+}
+
 fn undo_step(tx: &Connection, step: Step, freed_aliases: &mut Vec<(String, i64)>) -> Result<()> {
     match step {
         Step::Retargeted { rows, from, to } => {
@@ -474,6 +491,14 @@ fn undo_step(tx: &Connection, step: Step, freed_aliases: &mut Vec<(String, i64)>
         }
         Step::AliasesDeleted { aliases } => {
             for (alias, tag, source, locked, created_at) in aliases {
+                // A later run may have created a tag named like the deleted
+                // alias: it joins the tag the alias stands for again.
+                let newcomer: Option<i64> = tx
+                    .query_row("SELECT id FROM tags WHERE name = ?1", [&alias], |r| r.get(0))
+                    .optional()?;
+                if let Some(newcomer) = newcomer.filter(|id| *id != tag) {
+                    absorb_tag(tx, newcomer, tag)?;
+                }
                 tx.execute(
                     "INSERT OR REPLACE INTO tag_aliases (alias, tag_id, source, locked, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
                     params![alias, tag, source, locked, created_at],
@@ -515,18 +540,7 @@ fn undo_step(tx: &Connection, step: Step, freed_aliases: &mut Vec<(String, i64)>
             )
             .with_context(|| format!("restoring tag {name}"))?;
             if let Some(newcomer) = newcomer {
-                for sql in [
-                    "UPDATE page_tags SET resolved_tag_id = ?2 WHERE resolved_tag_id = ?1",
-                    "UPDATE tag_aliases SET tag_id = ?2 WHERE tag_id = ?1",
-                    "UPDATE tags SET parent_id = ?2 WHERE parent_id = ?1",
-                ] {
-                    tx.execute(sql, params![newcomer, id])?;
-                }
-                tx.execute(
-                    "DELETE FROM embeddings WHERE kind = 'tag' AND ref_id = ?1",
-                    [newcomer],
-                )?;
-                tx.execute("DELETE FROM tags WHERE id = ?1", [newcomer])?;
+                absorb_tag(tx, newcomer, id)?;
             }
         }
         Step::Renamed { id, old_name } => {
@@ -726,6 +740,39 @@ mod tests {
             golang.0 != go && !golang.1,
             "golang is its own tag, not an alias: {golang:?}"
         );
+        db.undo_last_revision().unwrap();
+        assert_eq!(db.find_tag("golang").unwrap(), Some((go, true)));
+        assert_eq!(names(&db), [("go".to_string(), 2)]);
+    }
+
+    #[test]
+    fn undo_absorbs_a_tag_recreated_with_a_deleted_alias_name() {
+        let (mut db, pages) = archive(&[&["go"], &["go"]]);
+        let go = id(&db, "go");
+        db.add_alias("golang", go, "rule").unwrap();
+        let part = |name: &str, page: i64| SplitPart {
+            name: name.into(),
+            description: String::new(),
+            pages: vec![page],
+        };
+        db.apply_tag_changes(&[TagChange::Split {
+            tag: go,
+            into: vec![part("go-language", pages[0]), part("go-game", pages[1])],
+        }])
+        .unwrap();
+        assert_eq!(
+            db.find_tag("golang").unwrap(),
+            None,
+            "the alias went with the tag"
+        );
+        // A later run tags a page golang, creating a tag of that name.
+        let newcomer = db.create_tag("golang", None).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO page_tags (page_id, raw_tag, resolved_tag_id) VALUES (?1, 'golang', ?2)",
+                params![pages[1], newcomer],
+            )
+            .unwrap();
         db.undo_last_revision().unwrap();
         assert_eq!(db.find_tag("golang").unwrap(), Some((go, true)));
         assert_eq!(names(&db), [("go".to_string(), 2)]);
