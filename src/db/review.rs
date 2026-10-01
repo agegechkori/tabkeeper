@@ -2,10 +2,19 @@
 //! revision, and undoing the latest one.
 
 use anyhow::{Context, Result, bail};
-use rusqlite::{OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use super::{Db, now};
+
+/// The outcome of applying tag changes.
+#[derive(Debug)]
+pub struct Applied {
+    /// The revision `undo` reverts, if any change was applied.
+    pub revision: Option<i64>,
+    /// Changes that couldn't be applied, by index, with the reason.
+    pub failed: Vec<(usize, String)>,
+}
 
 /// One change to the tags, as proposed by the review.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -140,27 +149,46 @@ impl Db {
     }
 
     /// Applies the changes as one revision and returns its id.
-    pub fn apply_tag_changes(&mut self, changes: &[TagChange]) -> Result<i64> {
-        let tx = self.conn.transaction()?;
+    /// Applies the changes as one revision. A change that fails is left out,
+    /// and the others are still applied.
+    pub fn apply_tag_changes(&mut self, changes: &[TagChange]) -> Result<Applied> {
+        let mut tx = self.conn.transaction()?;
         let mut steps = Vec::new();
-        for change in changes {
-            match change {
-                TagChange::Merge { from, into } => merge(&tx, *from, *into, &mut steps)?,
-                TagChange::Rename { tag, name } => rename(&tx, *tag, name, &mut steps)?,
-                TagChange::Split { tag, into } => split(&tx, *tag, into, &mut steps)?,
+        let mut applied = Vec::new();
+        let mut failed = Vec::new();
+        for (i, change) in changes.iter().enumerate() {
+            let sp = tx.savepoint()?;
+            let mut change_steps = Vec::new();
+            let result = match change {
+                TagChange::Merge { from, into } => merge(&sp, *from, *into, &mut change_steps),
+                TagChange::Rename { tag, name } => rename(&sp, *tag, name, &mut change_steps),
+                TagChange::Split { tag, into } => split(&sp, *tag, into, &mut change_steps),
+            };
+            match result {
+                Ok(()) => {
+                    sp.commit()?;
+                    steps.extend(change_steps);
+                    applied.push(change.clone());
+                }
+                // Dropping the savepoint rolls this change back.
+                Err(err) => failed.push((i, format!("{err:#}"))),
             }
         }
-        tx.execute(
-            "INSERT INTO revisions (created_at, status, changes, undo) VALUES (?1, 'applied', ?2, ?3)",
-            params![
-                now(),
-                serde_json::to_string(changes)?,
-                serde_json::to_string(&steps)?
-            ],
-        )?;
-        let id = tx.last_insert_rowid();
+        let revision = if applied.is_empty() {
+            None
+        } else {
+            tx.execute(
+                "INSERT INTO revisions (created_at, status, changes, undo) VALUES (?1, 'applied', ?2, ?3)",
+                params![
+                    now(),
+                    serde_json::to_string(&applied)?,
+                    serde_json::to_string(&steps)?
+                ],
+            )?;
+            Some(tx.last_insert_rowid())
+        };
         tx.commit()?;
-        Ok(id)
+        Ok(Applied { revision, failed })
     }
 
     /// Undoes the latest applied revision. Returns its id and how many changes
@@ -188,7 +216,7 @@ impl Db {
     }
 }
 
-fn retarget(tx: &Transaction, from: i64, to: i64, page: Option<i64>, steps: &mut Vec<Step>) -> Result<()> {
+fn retarget(tx: &Connection, from: i64, to: i64, page: Option<i64>, steps: &mut Vec<Step>) -> Result<()> {
     let mut stmt = tx.prepare(
         "SELECT page_id, raw_tag FROM page_tags WHERE resolved_tag_id = ?1 AND (?2 IS NULL OR page_id = ?2)",
     )?;
@@ -207,7 +235,7 @@ fn retarget(tx: &Transaction, from: i64, to: i64, page: Option<i64>, steps: &mut
     Ok(())
 }
 
-fn delete_tag(tx: &Transaction, id: i64, steps: &mut Vec<Step>) -> Result<()> {
+fn delete_tag(tx: &Connection, id: i64, steps: &mut Vec<Step>) -> Result<()> {
     let (name, description, parent_id, locked, created_at) = tx.query_row(
         "SELECT name, description, parent_id, locked, created_at FROM tags WHERE id = ?1",
         [id],
@@ -226,12 +254,12 @@ fn delete_tag(tx: &Transaction, id: i64, steps: &mut Vec<Step>) -> Result<()> {
     Ok(())
 }
 
-fn tag_name(tx: &Transaction, id: i64) -> Result<String> {
+fn tag_name(tx: &Connection, id: i64) -> Result<String> {
     tx.query_row("SELECT name FROM tags WHERE id = ?1", [id], |r| r.get(0))
         .with_context(|| format!("tag {id} no longer exists"))
 }
 
-fn add_alias(tx: &Transaction, alias: &str, tag: i64, steps: &mut Vec<Step>) -> Result<()> {
+fn add_alias(tx: &Connection, alias: &str, tag: i64, steps: &mut Vec<Step>) -> Result<()> {
     let added = tx.execute(
         "INSERT OR IGNORE INTO tag_aliases (alias, tag_id, source, created_at) VALUES (?1, ?2, 'llm', ?3)",
         params![alias, tag, now()],
@@ -244,7 +272,7 @@ fn add_alias(tx: &Transaction, alias: &str, tag: i64, steps: &mut Vec<Step>) -> 
     Ok(())
 }
 
-fn merge(tx: &Transaction, from: i64, into: i64, steps: &mut Vec<Step>) -> Result<()> {
+fn merge(tx: &Connection, from: i64, into: i64, steps: &mut Vec<Step>) -> Result<()> {
     if from == into {
         bail!("can't merge a tag into itself");
     }
@@ -266,7 +294,7 @@ fn merge(tx: &Transaction, from: i64, into: i64, steps: &mut Vec<Step>) -> Resul
     add_alias(tx, &from_name, into, steps)
 }
 
-fn rename(tx: &Transaction, tag: i64, name: &str, steps: &mut Vec<Step>) -> Result<()> {
+fn rename(tx: &Connection, tag: i64, name: &str, steps: &mut Vec<Step>) -> Result<()> {
     let old_name = tag_name(tx, tag)?;
     tx.execute("UPDATE tags SET name = ?2 WHERE id = ?1", params![tag, name])
         .with_context(|| format!("renaming {old_name} to {name}"))?;
@@ -279,7 +307,7 @@ fn rename(tx: &Transaction, tag: i64, name: &str, steps: &mut Vec<Step>) -> Resu
     add_alias(tx, &old_name, tag, steps)
 }
 
-fn split(tx: &Transaction, tag: i64, parts: &[SplitPart], steps: &mut Vec<Step>) -> Result<()> {
+fn split(tx: &Connection, tag: i64, parts: &[SplitPart], steps: &mut Vec<Step>) -> Result<()> {
     let own_name = tag_name(tx, tag)?;
     let mut kept = 0;
     for part in parts {
@@ -343,7 +371,7 @@ fn split(tx: &Transaction, tag: i64, parts: &[SplitPart], steps: &mut Vec<Step>)
     delete_tag(tx, tag, steps)
 }
 
-fn undo_step(tx: &Transaction, step: Step) -> Result<()> {
+fn undo_step(tx: &Connection, step: Step) -> Result<()> {
     match step {
         Step::Retargeted { rows, from, to } => {
             for (page, raw) in rows {
@@ -390,11 +418,36 @@ fn undo_step(tx: &Transaction, step: Step) -> Result<()> {
             locked,
             created_at,
         } => {
+            // A later run may have created a tag with the freed name, for a
+            // page whose raw tag is that name: it joins the restored tag.
+            let newcomer: Option<i64> = tx
+                .query_row("SELECT id FROM tags WHERE name = ?1", [&name], |r| r.get(0))
+                .optional()?;
+            if let Some(newcomer) = newcomer {
+                tx.execute(
+                    "UPDATE tags SET name = name || ' (undone)' WHERE id = ?1",
+                    [newcomer],
+                )?;
+            }
             tx.execute(
                 "INSERT INTO tags (id, name, description, parent_id, locked, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![id, name, description, parent_id, locked, created_at],
             )
-            .with_context(|| format!("restoring tag {name}; a tag with that name was created since"))?;
+            .with_context(|| format!("restoring tag {name}"))?;
+            if let Some(newcomer) = newcomer {
+                for sql in [
+                    "UPDATE page_tags SET resolved_tag_id = ?2 WHERE resolved_tag_id = ?1",
+                    "UPDATE tag_aliases SET tag_id = ?2 WHERE tag_id = ?1",
+                    "UPDATE tags SET parent_id = ?2 WHERE parent_id = ?1",
+                ] {
+                    tx.execute(sql, params![newcomer, id])?;
+                }
+                tx.execute(
+                    "DELETE FROM embeddings WHERE kind = 'tag' AND ref_id = ?1",
+                    [newcomer],
+                )?;
+                tx.execute("DELETE FROM tags WHERE id = ?1", [newcomer])?;
+            }
         }
         Step::Renamed { id, old_name } => {
             tx.execute("UPDATE tags SET name = ?2 WHERE id = ?1", params![id, old_name])?;
@@ -644,8 +697,69 @@ mod tests {
                 pages: vec![pages[0]],
             }],
         };
-        assert!(db.apply_tag_changes(&[change]).is_err());
+        let applied = db.apply_tag_changes(&[change]).unwrap();
+        assert_eq!(applied.revision, None);
+        assert_eq!(applied.failed.len(), 1);
         assert_eq!(names(&db), [("rust".to_string(), 2)], "nothing was changed");
+    }
+
+    #[test]
+    fn a_failing_change_leaves_the_others_applied() {
+        let (mut db, pages) = archive(&[&["rust"], &["rust"], &["ml"], &["machine-learning"]]);
+        let (rust, ml, full) = (id(&db, "rust"), id(&db, "ml"), id(&db, "machine-learning"));
+        let bad_split = TagChange::Split {
+            tag: rust,
+            into: vec![SplitPart {
+                name: "rust-programming".into(),
+                description: "".into(),
+                pages: vec![pages[0]],
+            }],
+        };
+        let applied = db
+            .apply_tag_changes(&[bad_split, TagChange::Merge { from: ml, into: full }])
+            .unwrap();
+        assert_eq!(applied.failed.iter().map(|(i, _)| *i).collect::<Vec<_>>(), [0]);
+        assert_eq!(
+            names(&db),
+            [("machine-learning".to_string(), 2), ("rust".to_string(), 2)]
+        );
+        // The revision holds only the merge.
+        assert_eq!(
+            db.undo_last_revision().unwrap(),
+            Some((applied.revision.unwrap(), 1))
+        );
+        assert_eq!(names(&db).len(), 3);
+    }
+
+    #[test]
+    fn undo_absorbs_a_tag_recreated_with_a_split_tags_name() {
+        let (mut db, pages) = archive(&[&["rust"], &["rust"]]);
+        let rust = id(&db, "rust");
+        let part = |name: &str, page: i64| SplitPart {
+            name: name.into(),
+            description: String::new(),
+            pages: vec![page],
+        };
+        db.apply_tag_changes(&[TagChange::Split {
+            tag: rust,
+            into: vec![
+                part("rust-programming", pages[0]),
+                part("rust-corrosion", pages[1]),
+            ],
+        }])
+        .unwrap();
+        assert_eq!(db.find_tag("rust").unwrap(), None, "the name is free");
+        // A later run tags a page with the raw tag rust again.
+        let newcomer = db.create_tag("rust", None).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO page_tags (page_id, raw_tag, resolved_tag_id) VALUES (?1, 'rust-lang', ?2)",
+                params![pages[0], newcomer],
+            )
+            .unwrap();
+        db.undo_last_revision().unwrap();
+        assert_eq!(db.find_tag("rust").unwrap(), Some((rust, false)));
+        assert_eq!(names(&db), [("rust".to_string(), 2)]);
     }
 
     #[test]

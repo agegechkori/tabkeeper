@@ -425,7 +425,25 @@ async fn review_tags(db: &mut Db, config: &Config, yes: bool, say: &dyn Fn(&str)
     }
     if !apply.is_empty() {
         match db.apply_tag_changes(&apply) {
-            Ok(revision) => outcome.revision = Some(revision),
+            Ok(applied) => {
+                outcome.revision = applied.revision;
+                for (i, reason) in applied.failed {
+                    match &apply[i] {
+                        db::TagChange::Merge { .. } => outcome.merges -= 1,
+                        db::TagChange::Rename { .. } => outcome.renames -= 1,
+                        db::TagChange::Split { .. } => outcome.splits -= 1,
+                    }
+                    let description = review
+                        .proposed
+                        .iter()
+                        .find(|p| p.change == apply[i])
+                        .map_or("a change", |p| p.description.as_str());
+                    outcome.failed.push(format!(
+                        "{}: {reason}",
+                        description.split_whitespace().collect::<Vec<_>>().join(" ")
+                    ));
+                }
+            }
             Err(err) => {
                 outcome.error = Some(format!("applying the changes: {err:#}"));
                 outcome.merges = 0;

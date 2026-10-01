@@ -152,6 +152,8 @@ pub struct ReviewReport {
     pub not_asked: usize,
     /// The revision `tabkeeper undo` reverts.
     pub revision: Option<i64>,
+    /// Approved changes that couldn't be applied, with the reason.
+    pub failed: Vec<String>,
     /// Why the review didn't run or failed.
     pub error: Option<String>,
 }
@@ -179,6 +181,13 @@ impl ReviewReport {
         )];
         if self.declined > 0 {
             parts.push(format!("{} declined", self.declined));
+        }
+        if !self.failed.is_empty() {
+            parts.push(format!(
+                "{} couldn't be applied ({})",
+                self.failed.len(),
+                self.failed.join("; ")
+            ));
         }
         if self.not_asked > 0 {
             parts.push(format!(

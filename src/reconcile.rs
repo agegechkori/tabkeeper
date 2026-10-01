@@ -389,8 +389,9 @@ fn merge_changes(
     }
     let mut votes: HashMap<i64, Vec<String>> = HashMap::new();
     for (a, b, keep) in merges {
-        // A kept name that is another existing tag joins that tag to the group.
-        let joined = by_name.get(keep.as_str()).map(|t| t.id);
+        // A kept name that is another existing tag joins that tag to the
+        // group, unless it is locked.
+        let joined = by_name.get(keep.as_str()).filter(|t| !t.locked).map(|t| t.id);
         for other in [Some(*b), joined].into_iter().flatten() {
             let (ra, rb) = (root(&mut parent, *a), root(&mut parent, other));
             if ra != rb {
@@ -410,6 +411,8 @@ fn merge_changes(
     }
 
     let mut out = Vec::new();
+    // New names already given to another group in this review.
+    let mut renamed_to: HashSet<String> = HashSet::new();
     for (r, mut members) in groups {
         members.sort();
         members.dedup();
@@ -439,9 +442,11 @@ fn merge_changes(
             .max_by(|a, b| a.1.cmp(b.1).then(pages_of(a.0).cmp(&pages_of(b.0))))
             .map(|(name, _)| name.to_string())
             .unwrap_or_else(biggest_name);
-        // A new name already used by a tag outside the group would clash.
+        // A new name already used by a tag outside the group, or given to
+        // another group, would clash.
         if !members.iter().any(|t| t.name == keep)
-            && name_owner(&keep).is_some_and(|id| !members.iter().any(|t| t.id == id))
+            && (renamed_to.contains(&keep)
+                || name_owner(&keep).is_some_and(|id| !members.iter().any(|t| t.id == id)))
         {
             keep = biggest_name();
         }
@@ -457,6 +462,7 @@ fn merge_changes(
                     description: format!("rename {} → {keep} ({})", biggest.name, pages(biggest.pages)),
                     decision_key: format!("rename:{}>{keep}", biggest.name),
                 });
+                renamed_to.insert(keep.clone());
                 biggest
             }
         };
@@ -793,6 +799,38 @@ mod tests {
             ]
         );
         assert_eq!(proposed[0].description, "rename js → javascript (4 pages)");
+    }
+
+    #[test]
+    fn two_groups_dont_get_the_same_new_name() {
+        let tags = [
+            info(1, "js", 4),
+            info(2, "java-script", 1),
+            info(3, "ecmascript", 2),
+            info(4, "es", 1),
+        ];
+        let merges = [(1, 2, "javascript".to_string()), (3, 4, "javascript".to_string())];
+        let renames: Vec<String> = merge_changes(&tags, &merges, &|_| None)
+            .into_iter()
+            .filter_map(|p| match p.change {
+                TagChange::Rename { name, .. } => Some(name),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(renames, ["javascript"]);
+    }
+
+    #[test]
+    fn a_locked_tag_isnt_pulled_into_a_merge() {
+        let mut locked = info(3, "javascript", 1);
+        locked.locked = true;
+        let tags = [info(1, "js", 4), info(2, "java-script", 1), locked];
+        let owner = |name: &str| (name == "javascript").then_some(3);
+        let changes: Vec<TagChange> = merge_changes(&tags, &[(1, 2, "javascript".to_string())], &owner)
+            .into_iter()
+            .map(|p| p.change)
+            .collect();
+        assert_eq!(changes, [TagChange::Merge { from: 2, into: 1 }]);
     }
 
     #[test]
