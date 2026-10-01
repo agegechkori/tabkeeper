@@ -125,6 +125,9 @@ impl OpenAiCompatible {
             None => None,
         };
         let client = reqwest::Client::builder()
+            // A separate, short connect timeout tells a server that can't be
+            // reached (stop the run) from a model that is slow on a page.
+            .connect_timeout(CONNECT_TIMEOUT.min(Duration::from_secs(config.timeout_secs)))
             .timeout(Duration::from_secs(config.timeout_secs))
             .build()?;
         Ok(Self {
@@ -165,7 +168,7 @@ impl OpenAiCompatible {
             }
             let (error, wait) = match request.send().await {
                 Err(err) => {
-                    timed_out = err.is_timeout();
+                    timed_out = is_model_timeout(&err);
                     (anyhow::Error::new(err).context(format!("calling {url}")), None)
                 }
                 Ok(response) => {
@@ -176,7 +179,7 @@ impl OpenAiCompatible {
                     // arrives; that is retried like a failed send.
                     match response.text().await {
                         Err(err) => {
-                            timed_out = err.is_timeout();
+                            timed_out = is_model_timeout(&err);
                             let error =
                                 anyhow::Error::new(err).context(format!("reading the response from {url}"));
                             (error, wait)
@@ -202,9 +205,10 @@ impl OpenAiCompatible {
             if attempt >= self.config.retries {
                 if timed_out {
                     return Err(PageRejected::timed_out(format!(
-                        "the model didn't answer within {} s, {} times; the page may be too long for it",
+                        "the model didn't answer within {} s{}; the page may be too long for it, or the server \
+                         may be overloaded",
                         self.config.timeout_secs,
-                        attempt + 1
+                        if attempt == 0 { String::new() } else { format!(", {} times", attempt + 1) }
                     ))
                     .into());
                 }
@@ -244,6 +248,18 @@ impl Llm for OpenAiCompatible {
             }
         }
     }
+}
+
+/// How long to wait for a connection to the model server.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A timeout after the connection was made: the server took the request but
+/// the model didn't finish in time, which may be this page's fault. Ollama
+/// without streaming sends nothing until the model is done, so a slow model
+/// looks the same whether or not the reply has started. A timeout while
+/// connecting means the server can't be reached at all.
+fn is_model_timeout(err: &reqwest::Error) -> bool {
+    err.is_timeout() && !err.is_connect()
 }
 
 /// The reply text of a successful chat response. A reply without content,
