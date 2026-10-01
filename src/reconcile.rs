@@ -111,10 +111,12 @@ pub async fn review<R: Reviewer, E: Embedder>(
     // Two splits in one review mustn't involve each other's tag: one split's
     // part moving pages onto a tag another split divides would break that
     // split. The later one waits for the next review.
-    let mut split_tags: HashSet<&str> = HashSet::new();
-    let mut part_names: HashSet<String> = HashSet::new();
+    // Part names are compared by the tag they stand for, so an alias counts
+    // as its tag.
+    let mut split_tags: HashSet<i64> = HashSet::new();
+    let mut part_tags: HashSet<i64> = HashSet::new();
     for candidate in splits.iter().filter(|c| !touched.contains(&c.tag.id)) {
-        if part_names.contains(&candidate.tag.name) {
+        if part_tags.contains(&candidate.tag.id) {
             continue;
         }
         let proposed = match review_split(db, reviewer, candidate, &by_name).await {
@@ -128,16 +130,21 @@ pub async fn review<R: Reviewer, E: Embedder>(
         let TagChange::Split { into, .. } = &proposed.change else {
             continue;
         };
-        let others: Vec<&str> = into
+        // Parts that go to existing tags other than this one; new names
+        // can't involve another split.
+        let others: Vec<i64> = into
             .iter()
-            .map(|p| p.name.as_str())
-            .filter(|name| *name != candidate.tag.name)
+            .map(|p| db.tag_named(&p.name))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .filter(|id| *id != candidate.tag.id)
             .collect();
-        if others.iter().any(|name| split_tags.contains(name)) {
+        if others.iter().any(|id| split_tags.contains(id)) {
             continue;
         }
-        split_tags.insert(&candidate.tag.name);
-        part_names.extend(others.into_iter().map(str::to_string));
+        split_tags.insert(candidate.tag.id);
+        part_tags.extend(others);
         review.proposed.push(proposed);
     }
     Ok(review)
@@ -1146,6 +1153,36 @@ mod tests {
             (&["python"], [1.0, 0.0, 0.0]),
         ]);
         let reviewer = CrossSplitter(vec![("rust", "python"), ("python", "rust")]);
+        let review = review(
+            &db,
+            &reviewer,
+            Some(&no_names()),
+            &ReconcileConfig::default(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(review.split_candidates, 2);
+        assert_eq!(
+            review.proposed.len(),
+            1,
+            "the second split waits for the next review"
+        );
+    }
+
+    #[tokio::test]
+    async fn splits_dont_move_pages_onto_each_others_tags_through_an_alias() {
+        let db = archive(&[
+            (&["rust"], [1.0, 0.0, 0.0]),
+            (&["rust"], [1.0, 0.1, 0.0]),
+            (&["rust"], [0.0, 0.0, 1.0]),
+            (&["python"], [0.0, 1.0, 0.0]),
+            (&["python"], [0.0, 1.0, 0.1]),
+            (&["python"], [1.0, 0.0, 0.0]),
+        ]);
+        db.add_alias("py", tag_id(&db, "python"), "rule").unwrap();
+        // rust's part "py" is python under another name.
+        let reviewer = CrossSplitter(vec![("rust", "py"), ("python", "snake")]);
         let review = review(
             &db,
             &reviewer,
