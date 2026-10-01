@@ -66,9 +66,17 @@ max_per_page = 5
 max_new_per_page = 3
 # How many existing tags are shown to the model for each page.
 vocabulary_limit = 50
+# "hierarchical": notes get tags as paths in a tag tree, like
+# #technology/programming-languages/rust. The tag review at the end of a run
+# puts new tags in the tree. "flat": tags only, like #rust, and no tree is
+# built. Switching from hierarchical to flat is just `tabkeeper render`.
+style = "hierarchical"
 # Maximum number of levels in the tag tree, e.g. technology/ai/llm is 3.
-# The tree is built at the end of a run; not implemented yet.
 max_depth = 3
+# Your own top-level categories (see taxonomy.example.toml), relative to
+# this file. By default they emerge from your pages. --taxonomy sets it for
+# one run.
+# taxonomy = "taxonomy.toml"
 
 [filter]
 # "deny": skip URLs matching any rule. "allow": process only URLs matching a
@@ -85,9 +93,10 @@ rules = [
 [reconcile]
 # The tag review: merges tags that mean the same (board-game / board-games,
 # ml / machine-learning) and splits tags used for different meanings (rust
-# for the language and for corrosion). Code proposes candidates, the model
-# decides, and you approve the changes. Runs at the end of every import, or
-# with `tabkeeper revise-tags`.
+# for the language and for corrosion), then, with hierarchical tags, puts new
+# tags in the tag tree. Code proposes candidates, the model decides, and you
+# approve the changes. Runs at the end of every import, or with
+# `tabkeeper revise-tags`.
 at_end_of_run = true
 # The review is only a few requests per run, so a stronger model, or a
 # thinking model allowed to think, is affordable here. Defaults to [llm].

@@ -149,22 +149,45 @@ pub struct ReviewReport {
     pub merges: usize,
     pub renames: usize,
     pub splits: usize,
+    /// Groups of tags put in the tag tree, and how many tags they held.
+    pub placements: usize,
+    pub tags_placed: usize,
+    /// Tags still outside the tag tree (hierarchical mode).
+    pub unplaced: usize,
     pub declined: usize,
     /// Proposed changes left unapplied because nobody could be asked.
     pub not_asked: usize,
-    /// The revision `tabkeeper undo` reverts.
-    pub revision: Option<i64>,
+    /// Approved placements held back because their path goes through a tag
+    /// whose own placement was declined.
+    pub held_back: usize,
+    /// The revisions applied, oldest first; `tabkeeper undo` reverts the last.
+    pub revisions: Vec<i64>,
     /// Approved changes that couldn't be applied, with the reason.
     pub failed: Vec<String>,
     /// Review requests that failed; their tags are checked again next time.
     pub failed_requests: usize,
     /// Why the review didn't run or failed.
     pub error: Option<String>,
+    /// Why putting tags in the tree failed, after the rest of the review.
+    pub tree_error: Option<String>,
 }
 
 impl ReviewReport {
     pub fn applied(&self) -> usize {
-        self.merges + self.renames + self.splits
+        self.merges + self.renames + self.splits + self.placements
+    }
+
+    pub fn count_applied(&mut self, change: &crate::db::TagChange) {
+        use crate::db::TagChange;
+        match change {
+            TagChange::Merge { .. } => self.merges += 1,
+            TagChange::Rename { .. } => self.renames += 1,
+            TagChange::Split { .. } => self.splits += 1,
+            TagChange::Place { tags, .. } => {
+                self.placements += 1;
+                self.tags_placed += tags.len();
+            }
+        }
     }
 
     /// One line for the end of a run or `revise-tags`.
@@ -172,16 +195,36 @@ impl ReviewReport {
         if let Some(error) = &self.error {
             return format!("the tag review failed ({error}); run `tabkeeper revise-tags` to try again");
         }
+        let mut notes: Vec<String> = Vec::new();
+        if self.unplaced > 0 {
+            notes.push(format!(
+                "{} not in the tag tree yet, for the next `tabkeeper revise-tags`",
+                crate::reconcile::count(self.unplaced, "tag", "tags")
+            ));
+        }
+        if let Some(error) = &self.tree_error {
+            notes.push(format!("putting tags in the tree failed ({error})"));
+        }
         if self.proposed == 0 {
-            return "no changes needed".into();
+            if notes.is_empty() {
+                return "no changes needed".into();
+            }
+            return notes.join(" · ");
+        }
+        let mut done = format!(
+            "{} merges · {} renames · {} splits",
+            self.merges, self.renames, self.splits
+        );
+        if self.placements > 0 {
+            done.push_str(&format!(
+                " · {} placed in the tree",
+                crate::reconcile::count(self.tags_placed, "tag", "tags")
+            ));
         }
         let mut parts = vec![format!(
-            "{} of {} proposed changes applied ({} merges · {} renames · {} splits)",
+            "{} of {} proposed changes applied ({done})",
             self.applied(),
-            self.proposed,
-            self.merges,
-            self.renames,
-            self.splits
+            self.proposed
         )];
         if self.declined > 0 {
             parts.push(format!("{} declined", self.declined));
@@ -205,6 +248,13 @@ impl ReviewReport {
                 self.not_asked
             ));
         }
+        if self.held_back > 0 {
+            parts.push(format!(
+                "{} held back: they go through a tag whose placement you declined",
+                self.held_back
+            ));
+        }
+        parts.extend(notes);
         parts.join(" · ")
     }
 }
@@ -230,11 +280,17 @@ pub async fn build(db: &Db, ctx: &RunContext<'_>) -> Result<Report> {
     let processed = stats.done + stats.unreachable + stats.failed;
 
     let counted = count_tree(&db.tags()?, &db.tag_links()?);
+    // Tags pages have, by their own pages: categories of the tree, which
+    // only gather other tags, aren't counted.
     let topic: Vec<_> = counted
         .iter()
-        .filter(|t| t.total > 0 && !t.name.starts_with(RESERVED_PREFIX))
+        .filter(|t| t.direct > 0 && !t.name.starts_with(RESERVED_PREFIX))
         .collect();
-    let mut top: Vec<(String, usize)> = topic.iter().map(|t| (t.path.clone(), t.total)).collect();
+    let label = |t: &crate::tags::CountedTag| match config.tags.style {
+        crate::config::TagStyle::Hierarchical => t.path.clone(),
+        crate::config::TagStyle::Flat => t.name.clone(),
+    };
+    let mut top: Vec<(String, usize)> = topic.iter().map(|t| (label(t), t.direct)).collect();
     top.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     top.truncate(TOP_TAGS);
 
@@ -326,7 +382,7 @@ pub async fn build(db: &Db, ctx: &RunContext<'_>) -> Result<Report> {
         tags: TagCounts {
             in_use: topic.len(),
             new_this_run: db.tags_created_since(ctx.started_at)?,
-            used_once: topic.iter().filter(|t| t.total == 1).count(),
+            used_once: topic.iter().filter(|t| t.direct == 1).count(),
             untagged_pages: db.untagged_pages()?,
             top,
         },
@@ -895,6 +951,46 @@ mod tests {
             (cost - 1.01).abs() < 1e-9,
             "$1 for summaries plus $0.01 for embeddings: {cost}"
         );
+    }
+
+    #[tokio::test]
+    async fn tag_counts_leave_out_tree_categories() {
+        use crate::reconcile::tests::{archive, tag_id};
+        let mut db = archive(&[
+            (&["rust"], [1.0, 0.0, 0.0]),
+            (&["rust", "python"], [1.0, 0.1, 0.0]),
+        ]);
+        db.apply_tag_changes(&[crate::db::TagChange::Place {
+            parent: vec!["technology".into(), "programming-languages".into()],
+            tags: vec![tag_id(&db, "rust"), tag_id(&db, "python")],
+        }])
+        .unwrap();
+        let mut config = Config::default();
+        config.llm.base_url = "https://api.example.com/v1".into();
+        let summary = RunSummary::default();
+        let ctx = |config| RunContext {
+            started_at: "2000-01-01T00:00:00Z",
+            started: std::time::Instant::now(),
+            import: None,
+            summary: &summary,
+            summaries: StageUsage::default(),
+            embeddings: None,
+            review: None,
+            config,
+        };
+        let tags = build(&db, &ctx(&config)).await.unwrap().tags;
+        assert_eq!((tags.in_use, tags.new_this_run, tags.used_once), (2, 2, 1));
+        assert_eq!(
+            tags.top,
+            [
+                ("technology/programming-languages/rust".to_string(), 2),
+                ("technology/programming-languages/python".to_string(), 1)
+            ]
+        );
+        let mut flat = config.clone();
+        flat.tags.style = crate::config::TagStyle::Flat;
+        let tags = build(&db, &ctx(&flat)).await.unwrap().tags;
+        assert_eq!(tags.top[0], ("rust".to_string(), 2));
     }
 
     #[test]

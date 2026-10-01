@@ -30,7 +30,7 @@ reasoning_effort = "none"
 
 This writes to `tabkeeper-out/` (change it with `--out`):
 
-- `notes/*.md`: one note per page, with a title, the URL, a short summary and 3–5 tags such as `#rust-programming #memory-safety`. The title is the page's own title (as in the browser tab) followed by the model's in parentheses, e.g. `Saffron - Wikipedia (Saffron: Spice from Saffron Crocus)`; `[notes] title` in the config picks one or the other instead. Pages without a summary still get a short stub note saying why, so no tab is lost: `#status/unreachable` when the page can't be loaded (404, dead domain, timeout, blocked), `#status/failed` when it loads but can't be summarized (a PDF, or the model's reply was unusable).
+- `notes/*.md`: one note per page, with a title, the URL, a short summary and 3–5 tags such as `#technology/programming-languages/rust #technology/memory-safety`. The title is the page's own title (as in the browser tab) followed by the model's in parentheses, e.g. `Saffron - Wikipedia (Saffron: Spice from Saffron Crocus)`; `[notes] title` in the config picks one or the other instead. Pages without a summary still get a short stub note saying why, so no tab is lost: `#status/unreachable` when the page can't be loaded (404, dead domain, timeout, blocked), `#status/failed` when it loads but can't be summarized (a PDF, or the model's reply was unusable).
 - `_tags.md`: all tags with page counts
 - `_index.md`: all notes, each listed under its most used tag
 - `_report.md`: the report of the latest run, including every page that failed or couldn't be loaded, and why
@@ -55,7 +55,16 @@ At the end of each import, tabkeeper reviews the tags: it merges tags that mean 
 Apply them? [Y]es, [n]o, or the numbers to skip (e.g. 2,5):
 ```
 
-Changes you decline, and pairs the model kept apart, are remembered and not proposed again. `--yes` applies everything without asking; without a terminal nothing is applied. `tabkeeper revise-tags` runs the review on its own, and `tabkeeper undo` reverts the last applied review; its changes then count as declined. The review can use its own model (`[reconcile]` in the config).
+Then it puts tags that aren't in the tag tree yet into it. The model first sorts them into broad domains (technology, science, food, …), then organizes each domain into categories, and you approve the result the same way, one line per category:
+
+```
+   1. place  science/chemistry ← rust-corrosion, oxidation (new: science, chemistry)
+   2. place  technology/programming-languages ← rust, python, go (new: technology, programming-languages)
+```
+
+Notes then carry the tag's whole path (`#science/chemistry/rust-corrosion`), which Obsidian shows as nested tags, `_tags.md` shows the tree, and `_index.md` lists pages by top-level category. Set `style = "flat"` in `[tags]` for plain tags (`#rust-corrosion`) and no tree; switching back and forth is just `tabkeeper render`. The top-level categories come from your pages; to choose them yourself, list them in a file and pass `--taxonomy taxonomy.toml` (or set `taxonomy` in `[tags]`): see [taxonomy.example.toml](taxonomy.example.toml). With `strict = true` only those are allowed.
+
+Changes you decline, and pairs the model kept apart, are remembered and not proposed again. `--yes` applies everything without asking; without a terminal nothing is applied. `tabkeeper revise-tags` runs the review on its own, and `tabkeeper undo` reverts the last applied set of changes (run it twice to revert both the tree and the merges and splits of one review); its changes then count as declined. The review can use its own model (`[reconcile]` in the config).
 
 Before a big run, `--dry-run` shows what would be processed and estimates tokens, cost and time (from your last run, once there is one) without fetching or saving anything. `--max-tokens N` and `--max-cost DOLLARS` stop starting new pages once a limit would be reached; the rest stay pending for the next run. With a limit set, the tag review at the end of the run is skipped; run `tabkeeper revise-tags` when you're ready to spend on it. For cloud models, set `price_input_per_mtok` and `price_output_per_mtok` in `[llm]` to see costs.
 

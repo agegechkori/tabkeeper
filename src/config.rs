@@ -246,11 +246,25 @@ impl Default for FetchConfig {
     }
 }
 
+/// How tags appear in notes.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TagStyle {
+    /// Paths in the tag tree, like `technology/programming-languages/rust`.
+    #[default]
+    Hierarchical,
+    /// Tag names only, like `rust`.
+    Flat,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TagConfig {
-    /// Levels in the tag tree built at the end of a run (phase 3).
+    pub style: TagStyle,
+    /// Levels in the tag tree, counting the tag itself.
     pub max_depth: usize,
+    /// A file with your own top-level categories; see `taxonomy.example.toml`.
+    pub taxonomy: Option<PathBuf>,
     pub max_per_page: usize,
     pub max_new_per_page: usize,
     /// How many existing tags are shown to the model for each page.
@@ -260,7 +274,9 @@ pub struct TagConfig {
 impl Default for TagConfig {
     fn default() -> Self {
         Self {
+            style: TagStyle::Hierarchical,
             max_depth: 3,
+            taxonomy: None,
             max_per_page: 5,
             max_new_per_page: 3,
             vocabulary_limit: 50,

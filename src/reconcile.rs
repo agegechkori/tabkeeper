@@ -105,7 +105,7 @@ pub async fn review<R: Reviewer, E: Embedder>(
         .flat_map(|p| match p.change {
             TagChange::Merge { from, into } => vec![from, into],
             TagChange::Rename { tag, .. } => vec![tag],
-            TagChange::Split { .. } => vec![],
+            TagChange::Split { .. } | TagChange::Place { .. } => vec![],
         })
         .collect();
     // Two splits in one review mustn't involve each other's tag: one split's
@@ -151,7 +151,16 @@ pub async fn review<R: Reviewer, E: Embedder>(
 }
 
 /// "1 page", "3 pages".
-fn pages(n: usize) -> String {
+/// "1 tag", "3 tags".
+pub(crate) fn count(n: usize, one: &str, many: &str) -> String {
+    if n == 1 {
+        format!("1 {one}")
+    } else {
+        format!("{n} {many}")
+    }
+}
+
+pub(crate) fn pages(n: usize) -> String {
     if n == 1 {
         "1 page".into()
     } else {
@@ -352,7 +361,7 @@ fn normalized_mean(vectors: &[&[f32]]) -> Vec<f32> {
 }
 
 /// A tag as the model sees it: name, page count, description, example pages.
-fn describe_tag(db: &Db, tag: &TagInfo) -> Result<String> {
+pub(crate) fn describe_tag(db: &Db, tag: &TagInfo) -> Result<String> {
     let examples: Vec<String> = db
         .tag_pages(tag.id)?
         .into_iter()
@@ -713,7 +722,7 @@ fn place_remaining_pages(parts: &mut [SplitPart], vectors: &HashMap<i64, Vec<f32
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::cell::RefCell;
 
     use serde_json::Value;
@@ -722,13 +731,13 @@ mod tests {
     use crate::db::PageResult;
 
     /// Replies in order and records the prompts it was given.
-    struct FakeReviewer {
+    pub(crate) struct FakeReviewer {
         replies: RefCell<Vec<Value>>,
-        prompts: RefCell<Vec<String>>,
+        pub(crate) prompts: RefCell<Vec<String>>,
     }
 
     impl FakeReviewer {
-        fn new(replies: Vec<Value>) -> Self {
+        pub(crate) fn new(replies: Vec<Value>) -> Self {
             Self {
                 replies: RefCell::new(replies),
                 prompts: RefCell::default(),
@@ -774,7 +783,7 @@ mod tests {
 
     /// Embeds tag names from a fixed table; names not in it get a vector of
     /// their own, unlike any other.
-    struct NameEmbedder(Vec<(&'static str, [f32; 3])>);
+    pub(crate) struct NameEmbedder(Vec<(&'static str, [f32; 3])>);
 
     impl Embedder for NameEmbedder {
         fn model(&self) -> &str {
@@ -801,7 +810,7 @@ mod tests {
         }
     }
 
-    fn no_names() -> NameEmbedder {
+    pub(crate) fn no_names() -> NameEmbedder {
         NameEmbedder(Vec::new())
     }
 
@@ -811,7 +820,7 @@ mod tests {
     }
 
     /// One page per entry: (tags, page vector).
-    fn archive(pages: &[(&[&str], [f32; 3])]) -> Db {
+    pub(crate) fn archive(pages: &[(&[&str], [f32; 3])]) -> Db {
         let mut db = Db::open_in_memory().unwrap();
         for (i, (tags, vector)) in pages.iter().enumerate() {
             let url = format!("https://p{i}.com/");
@@ -852,7 +861,7 @@ mod tests {
         db
     }
 
-    fn tag_id(db: &Db, name: &str) -> i64 {
+    pub(crate) fn tag_id(db: &Db, name: &str) -> i64 {
         db.find_tag(name).unwrap().unwrap().0
     }
 
@@ -862,6 +871,7 @@ mod tests {
             name: name.into(),
             description: None,
             locked: false,
+            placed: false,
             pages,
         }
     }

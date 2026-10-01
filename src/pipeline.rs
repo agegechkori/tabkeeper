@@ -1168,12 +1168,24 @@ mod tests {
         };
         db.save_unreachable(page, &stub, "timeout", "timed out").unwrap();
         let dir = tempfile::tempdir().unwrap();
-        crate::render::render_all(&db, dir.path(), crate::config::TitleStyle::Both).unwrap();
+        crate::render::render_all(
+            &db,
+            dir.path(),
+            crate::config::TitleStyle::Both,
+            crate::config::TagStyle::Hierarchical,
+        )
+        .unwrap();
 
         // This time it loads, but it's a PDF.
         db.retry_failed().unwrap();
         run(&mut db, &FakeLlm::new(vec![])).await.unwrap();
-        crate::render::render_all(&db, dir.path(), crate::config::TitleStyle::Both).unwrap();
+        crate::render::render_all(
+            &db,
+            dir.path(),
+            crate::config::TitleStyle::Both,
+            crate::config::TagStyle::Hierarchical,
+        )
+        .unwrap();
         let note = std::fs::read_to_string(dir.path().join("notes/paper.md")).unwrap();
         assert!(
             note.contains("could not be summarized (unsupported content type"),
