@@ -270,16 +270,25 @@ pub async fn place<R: Reviewer, E: Embedder>(
         .filter(|t| !t.placed && !t.locked)
         .collect();
     placement.unplaced = unplaced.len();
-    if unplaced.is_empty() || levels == 0 {
+    if unplaced.is_empty() {
+        return Ok(placement);
+    }
+    let mut model = TreeModel::new(db)?;
+    let strict = taxonomy.filter(|t| t.strict).map(Taxonomy::names);
+    // A tree of one level: every tag is at the top, with nothing to ask.
+    if levels == 0 {
+        let mut chosen = Vec::new();
+        for tag in &unplaced {
+            choose(db, &mut model, &mut chosen, tag, &[], levels, strict.as_ref())?;
+        }
+        placement.placed = chosen.len();
+        placement.proposed = group(db, chosen)?;
         return Ok(placement);
     }
     if let Some(embedder) = embedder {
         unplaced = similar_together(unplaced, embedder).await?;
     }
     note(&format!("Placing {} tags in the tag tree.", unplaced.len()));
-
-    let mut model = TreeModel::new(db)?;
-    let strict = taxonomy.filter(|t| t.strict).map(Taxonomy::names);
 
     // First each tag's domain, then, a domain at a time, where it goes in it:
     // seeing a domain's tags together, a model groups them consistently.
@@ -326,9 +335,15 @@ pub async fn place<R: Reviewer, E: Embedder>(
                 continue;
             };
             let domain = model.canonical.get(&domain).cloned().unwrap_or(domain);
+            // A domain that is a category further down counts by its top.
+            let top = model
+                .parents
+                .get(&domain)
+                .and_then(|p| p.first())
+                .unwrap_or(&domain);
             if strict
                 .as_ref()
-                .is_some_and(|allowed| !allowed.contains(domain.as_str()))
+                .is_some_and(|allowed| !allowed.contains(top.as_str()))
             {
                 continue;
             }
@@ -353,25 +368,23 @@ pub async fn place<R: Reviewer, E: Embedder>(
         for tag in own {
             choose(db, &mut model, &mut chosen, tag, &[], levels, strict.as_ref())?;
         }
-        if levels == 1 {
+        // The domain may be a category further down the tree: tags go
+        // under its whole path, as deep as the tree allows.
+        let mut base = model.parents.get(domain).cloned().unwrap_or_default();
+        base.push(domain.clone());
+        let sub_levels = levels.saturating_sub(base.len());
+        if sub_levels == 0 {
             for tag in rest {
-                choose(
-                    db,
-                    &mut model,
-                    &mut chosen,
-                    tag,
-                    std::slice::from_ref(domain),
-                    levels,
-                    strict.as_ref(),
-                )?;
+                choose(db, &mut model, &mut chosen, tag, &base, levels, strict.as_ref())?;
             }
             continue;
         }
+        let base_path = base.join("/");
         let system = BRANCH_SYSTEM
-            .replace("{domain}", domain)
-            .replace("{levels}", &(levels - 1).to_string());
+            .replace("{domain}", &base_path)
+            .replace("{levels}", &sub_levels.to_string());
         for batch in rest.chunks(BRANCH_BATCH) {
-            let prefix = format!("{domain}/");
+            let prefix = format!("{base_path}/");
             let mut categories: Vec<String> = model
                 .categories()
                 .into_iter()
@@ -379,7 +392,7 @@ pub async fn place<R: Reviewer, E: Embedder>(
                 .collect();
             let more = categories.len().saturating_sub(MAX_CATEGORIES_SHOWN);
             categories.truncate(MAX_CATEGORIES_SHOWN);
-            let mut user = format!("Existing categories in {domain}:\n");
+            let mut user = format!("Existing categories in {base_path}:\n");
             if categories.is_empty() {
                 user.push_str("(none yet)\n");
             }
@@ -406,7 +419,7 @@ pub async fn place<R: Reviewer, E: Embedder>(
                 let Some(tag) = decision.tag.checked_sub(1).and_then(|i| batch.get(i)) else {
                     continue;
                 };
-                let mut parent = vec![domain.clone()];
+                let mut parent = base.clone();
                 parent.extend(decision.path);
                 choose(db, &mut model, &mut chosen, tag, &parent, levels, strict.as_ref())?;
             }
@@ -727,6 +740,62 @@ mod tests {
                 .iter()
                 .any(|p| p.description.contains("history"))
         );
+    }
+
+    #[tokio::test]
+    async fn a_domain_further_down_the_tree_keeps_its_path() {
+        use crate::reconcile::tests::{FakeReviewer, NameEmbedder, archive, tag_id};
+        let mut db = archive(&[(&["programming"], [1.0, 0.0, 0.0]), (&["rust"], [1.0, 0.1, 0.0])]);
+        db.apply_tag_changes(&[TagChange::Place {
+            parent: vec!["technology".into()],
+            tags: vec![tag_id(&db, "programming")],
+        }])
+        .unwrap();
+        // With three levels, technology/programming has no room for more
+        // categories: rust goes right under it, without asking.
+        let reviewer = FakeReviewer::new(vec![json!({"domains": [{"tag": 1, "domain": "programming"}]})]);
+        let placement = place(
+            &db,
+            &reviewer,
+            None::<&NameEmbedder>,
+            &ReconcileConfig::default(),
+            3,
+            None,
+            |_| {},
+        )
+        .await
+        .unwrap();
+        let descriptions: Vec<&str> = placement
+            .proposed
+            .iter()
+            .map(|p| p.description.as_str())
+            .collect();
+        assert_eq!(descriptions, ["place  technology/programming ← rust"]);
+    }
+
+    #[tokio::test]
+    async fn a_one_level_tree_puts_every_tag_at_the_top() {
+        use crate::reconcile::tests::{FakeReviewer, NameEmbedder, archive};
+        let db = archive(&[(&["rust"], [1.0, 0.0, 0.0]), (&["python"], [1.0, 0.1, 0.0])]);
+        let reviewer = FakeReviewer::new(vec![]);
+        let placement = place(
+            &db,
+            &reviewer,
+            None::<&NameEmbedder>,
+            &ReconcileConfig::default(),
+            1,
+            None,
+            |_| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(placement.placed, 2);
+        let descriptions: Vec<&str> = placement
+            .proposed
+            .iter()
+            .map(|p| p.description.as_str())
+            .collect();
+        assert_eq!(descriptions, ["place  (top level) ← python, rust"]);
     }
 
     #[test]

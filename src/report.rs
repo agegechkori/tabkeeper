@@ -165,6 +165,8 @@ pub struct ReviewReport {
     pub failed_requests: usize,
     /// Why the review didn't run or failed.
     pub error: Option<String>,
+    /// Why putting tags in the tree failed, after the rest of the review.
+    pub tree_error: Option<String>,
 }
 
 impl ReviewReport {
@@ -190,14 +192,21 @@ impl ReviewReport {
         if let Some(error) = &self.error {
             return format!("the tag review failed ({error}); run `tabkeeper revise-tags` to try again");
         }
-        let unplaced = (self.unplaced > 0).then(|| {
-            format!(
+        let mut notes: Vec<String> = Vec::new();
+        if self.unplaced > 0 {
+            notes.push(format!(
                 "{} not in the tag tree yet, for the next `tabkeeper revise-tags`",
                 crate::reconcile::count(self.unplaced, "tag", "tags")
-            )
-        });
+            ));
+        }
+        if let Some(error) = &self.tree_error {
+            notes.push(format!("putting tags in the tree failed ({error})"));
+        }
         if self.proposed == 0 {
-            return unplaced.unwrap_or_else(|| "no changes needed".into());
+            if notes.is_empty() {
+                return "no changes needed".into();
+            }
+            return notes.join(" · ");
         }
         let mut done = format!(
             "{} merges · {} renames · {} splits",
@@ -236,7 +245,7 @@ impl ReviewReport {
                 self.not_asked
             ));
         }
-        parts.extend(unplaced);
+        parts.extend(notes);
         parts.join(" · ")
     }
 }

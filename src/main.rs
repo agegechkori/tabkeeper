@@ -340,6 +340,9 @@ async fn run(cli: Cli) -> Result<()> {
                     review.revisions.len()
                 ),
             }
+            if let Some(error) = &review.tree_error {
+                bail!("putting tags in the tree failed: {error}");
+            }
         }
         Command::Undo => {
             let mut db = open_db(&cli.out)?;
@@ -438,6 +441,7 @@ async fn review_tags(db: &mut Db, config: &Config, yes: bool, say: &dyn Fn(&str)
                 &mut outcome,
                 &review.failed_requests,
                 review.proposed.is_empty(),
+                false,
                 say,
             ) {
                 decide_and_apply(
@@ -474,6 +478,7 @@ async fn review_tags(db: &mut Db, config: &Config, yes: bool, say: &dyn Fn(&str)
                         &mut outcome,
                         &placement.failed_requests,
                         placement.proposed.is_empty(),
+                        true,
                         say,
                     ) {
                         decide_and_apply(
@@ -486,11 +491,12 @@ async fn review_tags(db: &mut Db, config: &Config, yes: bool, say: &dyn Fn(&str)
                         );
                     }
                 }
-                Err(err) => outcome.error = Some(format!("{err:#}")),
+                Err(err) => outcome.tree_error = Some(format!("{err:#}")),
             }
         }
         match db.topic_tags() {
-            Ok(tags) => outcome.unplaced = tags.iter().filter(|t| !t.placed).count(),
+            // Locked tags stay where they are.
+            Ok(tags) => outcome.unplaced = tags.iter().filter(|t| !t.placed && !t.locked).count(),
             Err(err) => say(&format!(
                 "Warning: couldn't count the tags outside the tree: {err:#}"
             )),
@@ -502,11 +508,14 @@ async fn review_tags(db: &mut Db, config: &Config, yes: bool, say: &dyn Fn(&str)
 }
 
 /// Records failed review requests. When they leave nothing to propose, the
-/// review failed; otherwise it goes on with what it has. Returns whether to go on.
+/// step failed; otherwise it goes on with what it has. Returns whether to go
+/// on. The tree step comes after merges and splits may have been applied, so
+/// its failure is reported on its own.
 fn usable_or_fail(
     outcome: &mut report::ReviewReport,
     failed: &[String],
     nothing: bool,
+    tree_step: bool,
     say: &dyn Fn(&str),
 ) -> bool {
     outcome.failed_requests += failed.len();
@@ -514,7 +523,11 @@ fn usable_or_fail(
         return true;
     };
     if nothing {
-        outcome.error = Some(first.clone());
+        if tree_step {
+            outcome.tree_error = Some(first.clone());
+        } else {
+            outcome.error = Some(first.clone());
+        }
         return false;
     }
     say(&format!(
