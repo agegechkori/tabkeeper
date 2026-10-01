@@ -434,7 +434,10 @@ pub async fn place<R: Reviewer, E: Embedder>(
             let Some((domain, tag)) = domain_of.get(name).copied() else {
                 continue;
             };
-            if model.blocked_at_top(domain) {
+            // Its domain can't be in the tree, or is a tag that didn't get
+            // its own place just before in this chain.
+            let unplaced_domain_tag = domain_of.contains_key(domain) && !model.parents.contains_key(domain);
+            if model.blocked_at_top(domain) || unplaced_domain_tag {
                 continue;
             }
             let mut base = model.parents.get(domain).cloned().unwrap_or_default();
@@ -1011,6 +1014,39 @@ mod tests {
             None::<&NameEmbedder>,
             &ReconcileConfig::default(),
             3,
+            None,
+            |_| {},
+        )
+        .await
+        .unwrap();
+        assert!(placement.proposed.is_empty(), "{:?}", placement.proposed);
+    }
+
+    #[tokio::test]
+    async fn a_declined_domain_tag_further_up_a_chain_keeps_its_tags_out() {
+        use crate::reconcile::tests::{FakeReviewer, NameEmbedder, archive};
+        let db = archive(&[
+            (&["a"], [1.0, 0.0, 0.0]),
+            (&["b"], [1.0, 0.1, 0.0]),
+            (&["c"], [1.0, 0.2, 0.0]),
+        ]);
+        db.set_tag_decision("place:c>d", "declined", "user").unwrap();
+        // a is in b, b in c, c in d, and c's place under d was declined: b
+        // mustn't put c at the top on the way.
+        let reviewer = FakeReviewer::new(vec![
+            json!({"domains": [
+                {"tag": 1, "domain": "b"},
+                {"tag": 2, "domain": "c"},
+                {"tag": 3, "domain": "d"}
+            ]}),
+            json!({"placements": [{"tag": 1, "path": []}]}),
+        ]);
+        let placement = place(
+            &db,
+            &reviewer,
+            None::<&NameEmbedder>,
+            &ReconcileConfig::default(),
+            4,
             None,
             |_| {},
         )
