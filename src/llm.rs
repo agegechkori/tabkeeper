@@ -127,7 +127,7 @@ impl OpenAiCompatible {
         let client = reqwest::Client::builder()
             // A separate, short connect timeout tells a server that can't be
             // reached (stop the run) from a model that is slow on a page.
-            .connect_timeout(CONNECT_TIMEOUT.min(Duration::from_secs(config.timeout_secs)))
+            .connect_timeout(connect_timeout(config.timeout_secs))
             .timeout(Duration::from_secs(config.timeout_secs))
             .build()?;
         Ok(Self {
@@ -250,8 +250,12 @@ impl Llm for OpenAiCompatible {
     }
 }
 
-/// How long to wait for a connection to the model server.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long to wait for a connection to the model server: 10 s, but always
+/// less than the whole request may take, so an unreachable server hits this
+/// timeout first and isn't mistaken for a slow model.
+fn connect_timeout(request_timeout_secs: u64) -> Duration {
+    Duration::from_secs(10).min(Duration::from_secs(request_timeout_secs) / 2)
+}
 
 /// A timeout after the connection was made: the server took the request but
 /// the model didn't finish in time, which may be this page's fault. Ollama
@@ -430,6 +434,13 @@ mod tests {
         // Older replies used "path" for the new tag's name.
         let old = "{\"title\":\"T\",\"summary\":\"S.\",\"language\":\"en\",\"tags\":[],\"new_tags\":[{\"path\":\"b\"}]}";
         assert_eq!(parse_summary(old).unwrap().new_tags[0].name, "b");
+    }
+
+    #[test]
+    fn connect_timeout_is_shorter_than_the_request_timeout() {
+        assert_eq!(connect_timeout(300), Duration::from_secs(10));
+        assert_eq!(connect_timeout(10), Duration::from_secs(5));
+        assert_eq!(connect_timeout(1), Duration::from_millis(500));
     }
 
     #[test]
