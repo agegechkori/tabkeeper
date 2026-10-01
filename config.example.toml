@@ -26,6 +26,10 @@ timeout_secs = 300
 retries = 3
 # Limit on requests per minute, for cloud APIs with rate limits. 0: no limit.
 requests_per_minute = 0
+# Prices in US dollars per million tokens, for cost estimates (--dry-run),
+# --max-cost and the report. Leave at 0 for local models.
+price_input_per_mtok = 0.0
+price_output_per_mtok = 0.0
 
 # Extra fields added to every request, for server-specific options.
 # Thinking models (qwen3, deepseek-r1, gpt-oss, ...) spend minutes per page
@@ -47,6 +51,8 @@ model = "nomic-embed-text"
 # How much of each page's text is embedded to pick its tags.
 page_chars = 2000
 timeout_secs = 60
+# US dollars per million tokens; 0 for local models.
+price_per_mtok = 0.0
 
 [fetch]
 timeout_secs = 20

@@ -5,6 +5,8 @@ pub struct Extracted {
     /// Main text of the page, whitespace-cleaned and cut to the requested
     /// length. Empty if no readable content was found.
     pub text: String,
+    /// Whether the text was longer than the requested length and was cut.
+    pub truncated: bool,
 }
 
 /// Extracts the readable title and text of an HTML page.
@@ -17,16 +19,23 @@ pub fn extract(html: &str, url: &str, max_chars: usize) -> Extracted {
         return Extracted {
             title: String::new(),
             text: String::new(),
+            truncated: false,
         };
     };
     match readability.parse() {
-        Ok(article) => Extracted {
-            title: clean_line(&article.title),
-            text: truncate_chars(&clean_text(&article.text_content), max_chars),
-        },
+        Ok(article) => {
+            let full = clean_text(&article.text_content);
+            let text = truncate_chars(&full, max_chars);
+            Extracted {
+                title: clean_line(&article.title),
+                truncated: text.len() < full.len(),
+                text,
+            }
+        }
         Err(_) => Extracted {
             title: clean_line(&readability.get_article_title()),
             text: String::new(),
+            truncated: false,
         },
     }
 }
@@ -82,6 +91,8 @@ mod tests {
         assert!(e.title.contains("Rust ownership"), "title: {}", e.title);
         assert!(e.text.contains("borrow checker"), "text: {}", e.text);
         assert!(!e.text.contains("Copyright"), "text: {}", e.text);
+        assert!(!e.truncated);
+        assert!(extract(ARTICLE, "https://blog.example.com/ownership", 50).truncated);
     }
 
     #[test]

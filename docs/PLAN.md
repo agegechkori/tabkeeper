@@ -2,7 +2,7 @@
 
 A Rust CLI for declaring tab bankruptcy. It reads every open tab in the major browsers (thousands of them), asks an LLM to summarize and tag each page, and writes one Markdown note per tab. Pages get simple flat tags while they are processed; at the end of each run, one reconciliation pass cleans the tags up and, if you want, organizes them into a hierarchy.
 
-**Status:** phase 1 (the core pipeline, working from a URL list) is done ([PR #1](https://github.com/agegechkori/tabkeeper/pull/1)), and so is phase 2a, flat tags per page with embeddings ([PR #3](https://github.com/agegechkori/tabkeeper/pull/3)). Phase 2b is in progress.
+**Status:** phase 1 (the core pipeline, working from a URL list) is done ([PR #1](https://github.com/agegechkori/tabkeeper/pull/1)), and so are phase 2a, flat tags per page with embeddings ([PR #3](https://github.com/agegechkori/tabkeeper/pull/3)), and phase 2b, processing at scale ([PR #4](https://github.com/agegechkori/tabkeeper/pull/4)), followed by fixes from a review of the whole codebase ([PR #5](https://github.com/agegechkori/tabkeeper/pull/5)). Phase 2c, the report, the dry run and budgets, is in progress.
 
 ## Requirements
 
@@ -176,8 +176,8 @@ Model
 
   Requests    3,112 summary requests · 64 retries (invalid replies)
   Tokens      9.8M input · 0.9M output · 3,210 input / 295 output per page
-  Speed       input 1,850 tok/s · output 48 tok/s
-              1.4 s model time per page (fetch 0.4 s)
+  Speed       2.1 s per page (4 at a time) · 140 output tokens/s
+  Time        a summary request took 7.9 s, including any wait in the server's queue · a fetch 0.4 s
   Cost        $0.00 (local)
   Page limits 412 pages cut to fit max_input_chars (12,000)
               5 rejected as too long for the model
@@ -204,7 +204,7 @@ Where the model numbers come from:
 | Memory, GPU share, context window | Ollama's `/api/ps` | Ollama only |
 | Requests, retries, invalid replies | counted by tabkeeper | always |
 | Tokens | `usage` field in each response | when the server reports it; otherwise "not reported" |
-| Speed | token counts ÷ measured request time | when tokens are reported |
+| Speed | pages and output tokens ÷ the run's wall time; request time measured by tabkeeper | always. The OpenAI-compatible API gives only a total time per request, which includes time queued at the server when several pages run at once, so it can't be split into input and output speed |
 | Model vs. fetch time per page | measured by tabkeeper | always |
 | Cost | tokens × prices set in the config | cloud models with prices set |
 | Page limits, URL-only | counted by tabkeeper | always / when used |
@@ -275,7 +275,7 @@ tokio, reqwest, clap, serde, serde_json, rusqlite (bundled), lz4_flex, dom_smoot
 1. **Core** ([PR #1](https://github.com/agegechkori/tabkeeper/pull/1)): config, SQLite schema, `import` from a URL list, fetch and extract, OpenAI-compatible/Ollama adapter, tag registry, Markdown rendering, report, `_index.md`.
 2. **Flat tagging and scale**, in three pull requests:
    - 2a ([PR #3](https://github.com/agegechkori/tabkeeper/pull/3)): per-page flat tags, with embeddings choosing which existing tags the model sees
-   - 2b: concurrency, retries and rate limits, progress bar, unreachable-page stubs, failure causes, domain filter
+   - 2b ([PR #4](https://github.com/agegechkori/tabkeeper/pull/4)): concurrency, retries and rate limits, progress bar, unreachable-page stubs, failure causes, domain filter
    - 2c: token usage per request, then dry-run cost estimate, budget caps, and the final report (everything except per-browser counts and the reconciliation numbers)
 3. **Tag reconciliation:** end-of-run pass (merge, split, and the tree in hierarchical mode), validation, approval list, revision log, undo, `tags.style`, taxonomy file. First, compare it with phase 1's direct hierarchical tagging on the same 50–100 URLs: tree depth, tag reuse, whether `rust` is split correctly, speed.
 4. **Browser sources:** Firefox; the Chromium family via SNSS; Safari and macOS via AppleScript; profile discovery on all three operating systems.

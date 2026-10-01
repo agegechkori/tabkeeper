@@ -2038,6 +2038,7 @@ dependencies = [
  "futures-util",
  "globset",
  "indicatif",
+ "libc",
  "regex",
  "reqwest",
  "rusqlite",

@@ -5,7 +5,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::tags::TagRow;
 
-const SCHEMA_VERSION: i32 = 3;
+const SCHEMA_VERSION: i32 = 4;
 
 const PAGES_TABLE: &str = "
 CREATE TABLE pages (
@@ -70,6 +70,18 @@ CREATE TABLE embeddings (
 );
 ";
 
+/// Added in version 4.
+const RUNS_TABLE: &str = "
+-- One row per run, with its final report as JSON, so `tabkeeper report`
+-- can show the latest one and --dry-run can estimate from past runs.
+CREATE TABLE runs (
+    id          INTEGER PRIMARY KEY,
+    started_at  TEXT NOT NULL,
+    finished_at TEXT NOT NULL,
+    report      TEXT NOT NULL
+);
+";
+
 pub struct Db {
     conn: Connection,
 }
@@ -124,7 +136,7 @@ impl EmbeddingKind {
     }
 }
 
-fn now() -> String {
+pub fn now() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
@@ -152,22 +164,30 @@ impl Db {
     fn init(conn: Connection) -> Result<Self> {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
-        let version: i32 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        match version {
-            0 => {
-                conn.execute_batch(PAGES_TABLE)?;
-                conn.execute_batch(SCHEMA)?;
-                conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-            }
-            2 => migrate_v2_to_v3(&conn)?,
-            1 => bail!(
+        let mut version: i32 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if version == 0 {
+            conn.execute_batch(&format!("BEGIN; {PAGES_TABLE} {SCHEMA} {RUNS_TABLE} COMMIT;"))?;
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            version = SCHEMA_VERSION;
+        }
+        if version == 1 {
+            bail!(
                 "this output folder was created by an early development version of tabkeeper that used \
                  hierarchical tags per page; use a new --out folder"
-            ),
-            SCHEMA_VERSION => {}
-            v => {
-                bail!("database schema version {v} is newer than this tabkeeper supports ({SCHEMA_VERSION})")
-            }
+            );
+        }
+        if version == 2 {
+            migrate_v2_to_v3(&conn)?;
+            version = 3;
+        }
+        if version == 3 {
+            conn.execute_batch(&format!("BEGIN; {RUNS_TABLE} PRAGMA user_version = 4; COMMIT;"))?;
+            version = 4;
+        }
+        if version != SCHEMA_VERSION {
+            bail!(
+                "database schema version {version} is newer than this tabkeeper supports ({SCHEMA_VERSION})"
+            );
         }
         Ok(Self { conn })
     }
@@ -232,16 +252,10 @@ impl Db {
 
     /// (error kind, pages) for failed and unreachable pages, by kind.
     pub fn failure_kinds(&self) -> Result<Vec<(String, usize)>> {
-        let mut stmt = self.conn.prepare(
+        self.counts(
             "SELECT ifnull(error_kind, 'unknown'), COUNT(*) FROM pages
              WHERE status IN ('failed', 'unreachable') GROUP BY 1 ORDER BY 1",
-        )?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
-        rows.map(|row| {
-            let (kind, n) = row?;
-            Ok((kind, usize::try_from(n)?))
-        })
-        .collect()
+        )
     }
 
     /// Saves a stub for a page that couldn't be reached: a title and a
@@ -406,6 +420,100 @@ impl Db {
             .prepare("SELECT note_file FROM pages WHERE note_file IS NOT NULL")?;
         let rows = stmt.query_map([], |r| r.get(0))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The status of a page with this (normalized) URL, if it's known.
+    pub fn page_status(&self, url: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT status FROM pages WHERE url = ?1", [url], |r| r.get(0))
+            .optional()?)
+    }
+
+    /// URLs of pages with any of these statuses.
+    pub fn urls_with_status(&self, statuses: &[&str]) -> Result<Vec<String>> {
+        let placeholders = vec!["?"; statuses.len()].join(", ");
+        let mut stmt = self
+            .conn
+            .prepare(&format!("SELECT url FROM pages WHERE status IN ({placeholders})"))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(statuses), |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// (language, pages) for done pages, most common first.
+    pub fn language_counts(&self) -> Result<Vec<(String, usize)>> {
+        self.counts(
+            "SELECT ifnull(lang, 'unknown'), COUNT(*) FROM pages WHERE status = 'done'
+             GROUP BY 1 ORDER BY 2 DESC, 1",
+        )
+    }
+
+    /// URLs of all pages with notes.
+    pub fn note_page_urls(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT url FROM pages WHERE status != 'pending'")?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Done pages without a single tag.
+    pub fn untagged_pages(&self) -> Result<usize> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM pages p WHERE p.status = 'done'
+             AND NOT EXISTS (SELECT 1 FROM page_tags pt WHERE pt.page_id = p.id)",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(usize::try_from(n)?)
+    }
+
+    /// Topic tags (not `status/` ones) created at or after `since`.
+    pub fn tags_created_since(&self, since: &str) -> Result<usize> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM tags WHERE created_at >= ?1 AND name NOT LIKE 'status/%'",
+            [since],
+            |r| r.get(0),
+        )?;
+        Ok(usize::try_from(n)?)
+    }
+
+    /// (url, status, cause, error) of every failed or unreachable page.
+    pub fn failed_pages(&self) -> Result<Vec<(String, String, String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT url, status, ifnull(error_kind, 'unknown'), ifnull(error, '') FROM pages
+             WHERE status IN ('failed', 'unreachable') ORDER BY status, error_kind, url",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn save_run(&self, started_at: &str, finished_at: &str, report_json: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO runs (started_at, finished_at, report) VALUES (?1, ?2, ?3)",
+            params![started_at, finished_at, report_json],
+        )?;
+        Ok(())
+    }
+
+    /// The report of the latest run, as JSON.
+    pub fn latest_run_report(&self) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT report FROM runs ORDER BY id DESC LIMIT 1", [], |r| {
+                r.get(0)
+            })
+            .optional()?)
+    }
+
+    fn counts(&self, sql: &str) -> Result<Vec<(String, usize)>> {
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+        rows.map(|row| {
+            let (key, n) = row?;
+            Ok((key, usize::try_from(n)?))
+        })
+        .collect()
     }
 
     pub fn set_note_file(&self, page_id: i64, file: &str) -> Result<()> {

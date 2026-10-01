@@ -33,13 +33,18 @@ This writes to `tabkeeper-out/` (change it with `--out`):
 - `notes/*.md`: one note per page, with a title, the URL, a short summary and 3–5 tags such as `#rust-programming #memory-safety`. Pages without a summary still get a short stub note saying why, so no tab is lost: `#status/unreachable` when the page can't be loaded (404, dead domain, timeout, blocked), `#status/failed` when it loads but can't be summarized (a PDF, or the model's reply was unusable).
 - `_tags.md`: all tags with page counts
 - `_index.md`: all notes, each listed under its most used tag
+- `_report.md`: the report of the latest run, including every page that failed or couldn't be loaded, and why
 - `tabkeeper.db`: the SQLite database everything is rendered from
 
 Several pages are processed at once (`[run]` in the config). Runs can be interrupted and restarted: finished pages are kept, and URLs already processed are skipped. If the model server stops responding, the run stops after a few retries and leaves the remaining pages for the next run. Other commands:
 
-- `tabkeeper report`: print the tag tree with page counts
+- `tabkeeper report`: print the report of the latest run again (`--json` for scripts)
 - `tabkeeper render`: rewrite the notes from the database
 - `tabkeeper config`: show where the config file goes, with an example ([config.example.toml](config.example.toml))
+
+Each run ends with a report: how many tabs were done, unreachable or failed (by cause), languages and domains, the model's token use, speed and cost, Ollama's memory and GPU use, the tags, and warnings about problems it noticed, such as a thinking model or pages cut short.
+
+Before a big run, `--dry-run` shows what would be processed and estimates tokens, cost and time (from your last run, once there is one) without fetching or saving anything. `--max-tokens N` and `--max-cost DOLLARS` stop starting new pages once a limit would be reached; the rest stay pending for the next run. For cloud models, set `price_input_per_mtok` and `price_output_per_mtok` in `[llm]` to see costs.
 
 Useful `import` options: `--lang de` or `--lang original` for summaries in another language (tags stay English), `--limit N` to process only N pages, `--retry-failed` to try failed and unreachable pages again, and `--deny RULE` / `--allow RULE` to skip or limit URLs for one run, e.g. `--deny domain:mail.google.com`. Rules are `domain:`, `glob:`, `regex:` or `prefix:`; permanent ones go in `[filter]` in the config.
 

@@ -5,6 +5,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::config::{LlmConfig, StructuredOutput, TagConfig};
+use crate::usage::{StageUsage, UsageCounter};
 
 /// Which language titles and summaries are written in. Tags are always English.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,6 +104,11 @@ impl std::error::Error for PageRejected {}
 
 pub trait Llm {
     async fn summarize(&self, request: &SummaryRequest<'_>) -> Result<PageSummary>;
+
+    /// Requests and tokens so far.
+    fn usage(&self) -> StageUsage {
+        StageUsage::default()
+    }
 }
 
 /// Client for OpenAI-compatible chat-completions servers (Ollama, LM Studio,
@@ -113,6 +119,7 @@ pub struct OpenAiCompatible {
     api_key: Option<String>,
     /// When the next request may start, if requests per minute are limited.
     next_slot: tokio::sync::Mutex<tokio::time::Instant>,
+    usage: UsageCounter,
 }
 
 impl OpenAiCompatible {
@@ -135,6 +142,7 @@ impl OpenAiCompatible {
             config: config.clone(),
             api_key,
             next_slot: tokio::sync::Mutex::new(tokio::time::Instant::now()),
+            usage: UsageCounter::default(),
         })
     }
 
@@ -160,8 +168,10 @@ impl OpenAiCompatible {
         let body = request_body(&self.config, messages);
         let mut attempt = 0;
         let mut timed_out;
-        let text = loop {
+        let (text, elapsed) = loop {
             self.wait_for_slot().await;
+            self.usage.update(|u| u.requests += 1);
+            let started = std::time::Instant::now();
             let mut request = self.client.post(&url).json(&body);
             if let Some(key) = &self.api_key {
                 request = request.bearer_auth(key);
@@ -186,7 +196,7 @@ impl OpenAiCompatible {
                         }
                         Ok(text) => {
                             if status.is_success() {
-                                break text;
+                                break (text, started.elapsed());
                             }
                             let message = format!("LLM server returned HTTP {status}: {}", snippet(&text));
                             // Bad request / too large / unprocessable usually means this page's
@@ -220,7 +230,11 @@ impl OpenAiCompatible {
             )
             .await;
             attempt += 1;
+            self.usage.update(|u| u.retries += 1);
         };
+        if let Ok(value) = serde_json::from_str::<Value>(&text) {
+            self.usage.update(|u| u.record_response(&value, elapsed));
+        }
         message_content(&text)
     }
 }
@@ -236,6 +250,7 @@ impl Llm for OpenAiCompatible {
             Ok(summary) => Ok(summary),
             Err(err) => {
                 // One retry, telling the model what was wrong.
+                self.usage.update(|u| u.invalid_replies += 1);
                 messages.push(json!({"role": "assistant", "content": content}));
                 messages.push(json!({"role": "user", "content": format!(
                     "That response was invalid: {err:#}. Reply again with only the JSON object."
@@ -247,6 +262,10 @@ impl Llm for OpenAiCompatible {
                 })
             }
         }
+    }
+
+    fn usage(&self) -> StageUsage {
+        self.usage.snapshot()
     }
 }
 
