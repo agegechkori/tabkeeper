@@ -548,11 +548,9 @@ impl<F: Fetcher, L: Llm, E: Embedder> Run<'_, '_, F, L, E> {
                 summary: text,
                 lang: (!language.is_empty()).then_some(language.as_str()),
                 tags: &page_tags,
+                page_title: page_title.as_deref(),
             };
             db.save_result(page.id, &result).context("saving result")?;
-            if let Some(page_title) = &page_title {
-                db.set_page_title(page.id, page_title)?;
-            }
             created
         };
         self.store_vectors(page.id, title, text, created).await?;
@@ -609,13 +607,11 @@ impl<F: Fetcher, L: Llm, E: Embedder> Run<'_, '_, F, L, E> {
             summary: &summary,
             lang: None,
             tags: &tags,
+            page_title: saved.or(html_title),
         };
         match stub {
             Stub::Unreachable => db.save_unreachable(page.id, &result, kind, message)?,
             Stub::Failed => db.save_failed(page.id, &result, kind, message)?,
-        }
-        if let Some(own) = saved.or(html_title) {
-            db.set_page_title(page.id, own)?;
         }
         Ok(())
     }
@@ -1168,6 +1164,7 @@ mod tests {
             summary: "Unreachable.",
             lang: None,
             tags: &tags,
+            page_title: None,
         };
         db.save_unreachable(page, &stub, "timeout", "timed out").unwrap();
         let dir = tempfile::tempdir().unwrap();
@@ -1234,6 +1231,7 @@ mod tests {
                 summary: "S.",
                 lang: None,
                 tags: &[],
+                page_title: None,
             },
             "rejected",
             "x",

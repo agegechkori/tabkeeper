@@ -121,6 +121,9 @@ pub struct PageResult<'a> {
     pub lang: Option<&'a str>,
     /// (raw tag as returned by the model, resolved tag id)
     pub tags: &'a [(String, i64)],
+    /// The page's own title, if this attempt found one; saved in the same
+    /// update, so a page is never left done without it.
+    pub page_title: Option<&'a str>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -328,7 +331,7 @@ impl Db {
         let tx = self.conn.transaction()?;
         tx.execute(
             "UPDATE pages SET status = ?2, error_kind = ?3, error = ?4, title = ?5, summary = ?6, lang = ?7,
-                              processed_at = ?8, page_title = NULL
+                              processed_at = ?8, page_title = ?9
              WHERE id = ?1",
             params![
                 page_id,
@@ -338,7 +341,8 @@ impl Db {
                 result.title,
                 result.summary,
                 result.lang,
-                now()
+                now(),
+                result.page_title
             ],
         )?;
         tx.execute("DELETE FROM page_tags WHERE page_id = ?1", [page_id])?;
@@ -557,6 +561,7 @@ impl Db {
         .collect()
     }
 
+    #[cfg(test)]
     pub fn set_page_title(&self, page_id: i64, title: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE pages SET page_title = ?2 WHERE id = ?1",
@@ -718,6 +723,7 @@ mod tests {
                 summary: "S",
                 lang: Some("en"),
                 tags: &first,
+                page_title: None,
             },
         )
         .unwrap();
@@ -729,6 +735,7 @@ mod tests {
                 summary: "S",
                 lang: None,
                 tags: &second,
+                page_title: None,
             },
         )
         .unwrap();
@@ -781,6 +788,7 @@ mod tests {
                 summary: "S.",
                 lang: None,
                 tags: &[],
+                page_title: None,
             },
         )
         .unwrap();
@@ -856,6 +864,7 @@ mod tests {
             summary: "Unreachable.",
             lang: None,
             tags: &[],
+            page_title: None,
         };
         db.save_unreachable(8, &stub, "not_found", "HTTP 404").unwrap();
         assert_eq!(

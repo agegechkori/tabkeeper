@@ -345,6 +345,7 @@ mod tests {
                     summary: "S.",
                     lang: None,
                     tags,
+                    page_title: None,
                 },
             )
             .unwrap();
@@ -413,6 +414,7 @@ mod tests {
             summary: "Unreachable.",
             lang: None,
             tags: &[],
+            page_title: None,
         };
         db.save_unreachable(a, &stub, "timeout", "timed out").unwrap();
         let dir = tempfile::tempdir().unwrap();
@@ -431,6 +433,7 @@ mod tests {
                 summary: "S.",
                 lang: None,
                 tags: &[],
+                page_title: None,
             },
         )
         .unwrap();
@@ -462,6 +465,7 @@ mod tests {
                 summary: "S.",
                 lang: None,
                 tags: &[],
+                page_title: None,
             },
         )
         .unwrap();
@@ -565,6 +569,7 @@ mod tests {
                 summary: "S.",
                 lang: None,
                 tags: &[],
+                page_title: None,
             },
         )
         .unwrap();
@@ -592,6 +597,7 @@ mod tests {
                 summary: "S.",
                 lang: None,
                 tags: &[],
+                page_title: None,
             },
         )
         .unwrap();
