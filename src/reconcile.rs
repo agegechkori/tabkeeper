@@ -26,8 +26,8 @@ const NEIGHBOURS: usize = 5;
 pub struct Proposed {
     pub change: TagChange,
     pub description: String,
-    /// Recorded as declined when the user turns the change down.
-    pub decision_key: String,
+    /// Recorded as declined when the user turns the change down, or undoes it.
+    pub decision_keys: Vec<String>,
 }
 
 #[derive(Debug, Default)]
@@ -114,6 +114,29 @@ fn pages(n: usize) -> String {
     } else {
         format!("{n} pages")
     }
+}
+
+/// The keys a merge of `from` into `into` is remembered by: its own pair, and
+/// the pairs the model was asked about that led to it, which can differ when
+/// the model chose a third tag's name.
+fn merge_keys(
+    from: &TagInfo,
+    into: &TagInfo,
+    merges: &[(i64, i64, String)],
+    by_id: &HashMap<i64, &TagInfo>,
+) -> Vec<String> {
+    let mut keys = vec![pair_key(&from.name, &into.name)];
+    for (a, b, _) in merges {
+        if (*a == from.id || *b == from.id)
+            && let (Some(a), Some(b)) = (by_id.get(a), by_id.get(b))
+        {
+            let key = pair_key(&a.name, &b.name);
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+    }
+    keys
 }
 
 fn pair_key(a: &str, b: &str) -> String {
@@ -460,7 +483,7 @@ fn merge_changes(
                         name: keep.clone(),
                     },
                     description: format!("rename {} → {keep} ({})", biggest.name, pages(biggest.pages)),
-                    decision_key: format!("rename:{}>{keep}", biggest.name),
+                    decision_keys: vec![format!("rename:{}>{keep}", biggest.name)],
                 });
                 renamed_to.insert(keep.clone());
                 biggest
@@ -476,7 +499,7 @@ fn merge_changes(
                     "merge  {} → {keep} ({} + {} pages)",
                     from.name, from.pages, into.pages
                 ),
-                decision_key: pair_key(&from.name, &into.name),
+                decision_keys: merge_keys(from, into, merges, &by_id),
             });
         }
     }
@@ -570,7 +593,7 @@ async fn review_split<R: Reviewer>(
             into: parts,
         },
         description,
-        decision_key: key,
+        decision_keys: vec![key],
     }))
 }
 
@@ -831,6 +854,21 @@ mod tests {
             .map(|p| p.change)
             .collect();
         assert_eq!(changes, [TagChange::Merge { from: 2, into: 1 }]);
+    }
+
+    #[test]
+    fn a_merge_into_a_third_tag_remembers_the_asked_pair() {
+        let tags = [
+            info(1, "js", 4),
+            info(2, "java-script", 1),
+            info(3, "javascript", 2),
+        ];
+        let proposed = merge_changes(&tags, &[(1, 2, "javascript".to_string())], &|_| None);
+        let keys: Vec<&str> = proposed
+            .iter()
+            .flat_map(|p| p.decision_keys.iter().map(String::as_str))
+            .collect();
+        assert!(keys.contains(&"merge:java-script|js"), "{keys:?}");
     }
 
     #[test]

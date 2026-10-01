@@ -155,11 +155,11 @@ impl Db {
 
     /// Applies the changes as one revision. A change that fails is left out,
     /// and the others are still applied. `decision_keys` holds each change's
-    /// tag_decisions key; undoing the revision declines those changes.
+    /// tag_decisions keys; undoing the revision declines those changes.
     pub fn apply_reviewed_changes(
         &mut self,
         changes: &[TagChange],
-        decision_keys: &[String],
+        decision_keys: &[Vec<String>],
     ) -> Result<Applied> {
         let mut tx = self.conn.transaction()?;
         let mut steps = Vec::new();
@@ -179,7 +179,7 @@ impl Db {
                     sp.commit()?;
                     steps.extend(change_steps);
                     applied.push(change.clone());
-                    keys.extend(decision_keys.get(i).cloned());
+                    keys.extend(decision_keys.get(i).into_iter().flatten().cloned());
                 }
                 // Dropping the savepoint rolls this change back.
                 Err(err) => failed.push((i, format!("{err:#}"))),
@@ -221,9 +221,11 @@ impl Db {
         };
         let changes: Vec<TagChange> = serde_json::from_str(&changes)?;
         let steps: Vec<Step> = serde_json::from_str(&undo).context("reading the revision's undo record")?;
+        let mut freed_aliases = Vec::new();
         for step in steps.into_iter().rev() {
-            undo_step(&tx, step)?;
+            undo_step(&tx, step, &mut freed_aliases)?;
         }
+        return_alias_pages(&tx, &freed_aliases)?;
         let keys: Vec<String> = serde_json::from_str(&keys)?;
         for key in keys {
             tx.execute(
@@ -392,7 +394,39 @@ fn split(tx: &Connection, tag: i64, parts: &[SplitPart], steps: &mut Vec<Step>) 
     delete_tag(tx, tag, steps)
 }
 
-fn undo_step(tx: &Connection, step: Step) -> Result<()> {
+/// Pages tagged after the revision reached the merged-into tag through an
+/// alias the revision added or moved there. Once undone, those names are
+/// tags (or aliases of tags) of their own again, and the pages follow them.
+/// `freed` holds (alias, the tag it pointed to during the revision).
+fn return_alias_pages(tx: &Connection, freed: &[(String, i64)]) -> Result<()> {
+    for (alias, was) in freed {
+        let now_on: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM tags WHERE name = ?1 UNION ALL SELECT tag_id FROM tag_aliases WHERE alias = ?1 LIMIT 1",
+                [alias],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(now_on) = now_on.filter(|id| id != was) else {
+            continue;
+        };
+        let rows: Vec<(i64, String)> = tx
+            .prepare("SELECT page_id, raw_tag FROM page_tags WHERE resolved_tag_id = ?1")?
+            .query_map([was], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        for (page, raw) in rows {
+            if crate::tags::normalize_name(&raw).as_deref() == Some(alias.as_str()) {
+                tx.execute(
+                    "UPDATE OR IGNORE page_tags SET resolved_tag_id = ?3 WHERE page_id = ?1 AND raw_tag = ?2",
+                    params![page, raw, now_on],
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn undo_step(tx: &Connection, step: Step, freed_aliases: &mut Vec<(String, i64)>) -> Result<()> {
     match step {
         Step::Retargeted { rows, from, to } => {
             for (page, raw) in rows {
@@ -404,6 +438,12 @@ fn undo_step(tx: &Connection, step: Step) -> Result<()> {
         }
         Step::AliasesMoved { aliases, from } => {
             for alias in aliases {
+                let was: Option<i64> = tx
+                    .query_row("SELECT tag_id FROM tag_aliases WHERE alias = ?1", [&alias], |r| {
+                        r.get(0)
+                    })
+                    .optional()?;
+                freed_aliases.extend(was.map(|was| (alias.clone(), was)));
                 tx.execute(
                     "UPDATE tag_aliases SET tag_id = ?2 WHERE alias = ?1",
                     params![alias, from],
@@ -411,7 +451,13 @@ fn undo_step(tx: &Connection, step: Step) -> Result<()> {
             }
         }
         Step::AliasAdded { alias } => {
-            tx.execute("DELETE FROM tag_aliases WHERE alias = ?1", [alias])?;
+            let was: Option<i64> = tx
+                .query_row("SELECT tag_id FROM tag_aliases WHERE alias = ?1", [&alias], |r| {
+                    r.get(0)
+                })
+                .optional()?;
+            tx.execute("DELETE FROM tag_aliases WHERE alias = ?1", [&alias])?;
+            freed_aliases.extend(was.map(|was| (alias, was)));
         }
         Step::AliasesDeleted { aliases } => {
             for (alias, tag, source, locked, created_at) in aliases {
@@ -620,14 +666,31 @@ mod tests {
         let (mut db, _) = archive(&[&["ml"], &["machine-learning"]]);
         let (ml, full) = (id(&db, "ml"), id(&db, "machine-learning"));
         let key = "merge:machine-learning|ml".to_string();
-        db.apply_reviewed_changes(
-            &[TagChange::Merge { from: ml, into: full }],
-            std::slice::from_ref(&key),
-        )
-        .unwrap();
+        db.apply_reviewed_changes(&[TagChange::Merge { from: ml, into: full }], &[vec![key.clone()]])
+            .unwrap();
         assert_eq!(db.tag_decision(&key).unwrap(), None);
         db.undo_last_revision().unwrap();
         assert_eq!(db.tag_decision(&key).unwrap().as_deref(), Some("declined"));
+    }
+
+    #[test]
+    fn undoing_a_merge_returns_pages_tagged_since() {
+        let (mut db, pages) = archive(&[&["ml"], &["machine-learning"]]);
+        let (ml, full) = (id(&db, "ml"), id(&db, "machine-learning"));
+        db.apply_tag_changes(&[TagChange::Merge { from: ml, into: full }])
+            .unwrap();
+        // A later run resolves a page's raw tag "ML" through the new alias.
+        db.conn
+            .execute(
+                "INSERT INTO page_tags (page_id, raw_tag, resolved_tag_id) VALUES (?1, 'ML', ?2)",
+                params![pages[1], full],
+            )
+            .unwrap();
+        db.undo_last_revision().unwrap();
+        assert_eq!(
+            names(&db),
+            [("machine-learning".to_string(), 1), ("ml".to_string(), 2)]
+        );
     }
 
     #[test]

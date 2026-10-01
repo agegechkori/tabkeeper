@@ -254,9 +254,16 @@ async fn run(cli: Cli) -> Result<()> {
             // Render and report whatever was finished, even if the run stopped early.
             render::render_all(&db, &cli.out, config.notes.title)?;
             let mut summary = result?;
-            // A run stopped by an error or a budget limit skips the review,
-            // which would make more model requests.
-            let review = if config.reconcile.at_end_of_run && summary.stop.is_none() {
+            // A run stopped by an error skips the review, which would make
+            // more model requests; so does a run with a budget, which the
+            // review could take it over.
+            let budgeted = max_tokens.is_some() || max_cost.is_some();
+            if config.reconcile.at_end_of_run && summary.stop.is_none() && budgeted {
+                say(
+                    "The tag review was skipped because of --max-tokens/--max-cost; run `tabkeeper revise-tags` for it.",
+                );
+            }
+            let review = if config.reconcile.at_end_of_run && summary.stop.is_none() && !budgeted {
                 let review = review_tags(&mut db, &config, yes, &say).await;
                 render::render_all(&db, &cli.out, config.notes.title)?;
                 Some(review)
@@ -406,7 +413,14 @@ async fn review_tags(db: &mut Db, config: &Config, yes: bool, say: &dyn Fn(&str)
         outcome.not_asked = review.proposed.len();
         return outcome;
     } else {
-        ask_which(review.proposed.len())
+        match ask_which(review.proposed.len()) {
+            Some(chosen) => chosen,
+            // No answer: nothing is applied, and nothing counts as declined.
+            None => {
+                outcome.not_asked = review.proposed.len();
+                return outcome;
+            }
+        }
     };
 
     let mut apply = Vec::new();
@@ -419,11 +433,13 @@ async fn review_tags(db: &mut Db, config: &Config, yes: bool, say: &dyn Fn(&str)
                 db::TagChange::Split { .. } => outcome.splits += 1,
             }
             apply.push(p.change.clone());
-            keys.push(p.decision_key.clone());
+            keys.push(p.decision_keys.clone());
         } else {
             outcome.declined += 1;
-            if let Err(err) = db.set_tag_decision(&p.decision_key, "declined", "user") {
-                say(&format!("Warning: couldn't remember a declined change: {err:#}"));
+            for key in &p.decision_keys {
+                if let Err(err) = db.set_tag_decision(key, "declined", "user") {
+                    say(&format!("Warning: couldn't remember a declined change: {err:#}"));
+                }
             }
         }
     }
@@ -460,18 +476,19 @@ async fn review_tags(db: &mut Db, config: &Config, yes: bool, say: &dyn Fn(&str)
 }
 
 /// Asks which of `n` numbered changes to apply: all (the default), none, or
-/// all except the listed numbers. Asked on stderr, so --json output stays clean.
-fn ask_which(n: usize) -> Vec<bool> {
+/// all except the listed numbers. Asked on stderr, so --json output stays
+/// clean. `None` if there was no answer.
+fn ask_which(n: usize) -> Option<Vec<bool>> {
     loop {
         eprint!("Apply them? [Y]es, [n]o, or the numbers to skip (e.g. 2,5): ");
         let mut answer = String::new();
-        // End of input (Ctrl-D) or an error means no.
+        // End of input (Ctrl-D) or an error: no answer.
         if !matches!(std::io::stdin().read_line(&mut answer), Ok(read) if read > 0) {
             eprintln!();
-            return vec![false; n];
+            return None;
         }
         match parse_choice(&answer, n) {
-            Some(chosen) => return chosen,
+            Some(chosen) => return Some(chosen),
             None => eprintln!("Please answer y, n, or numbers between 1 and {n}."),
         }
     }
