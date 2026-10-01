@@ -254,9 +254,9 @@ async fn run(cli: Cli) -> Result<()> {
             // Render and report whatever was finished, even if the run stopped early.
             render::render_all(&db, &cli.out, config.notes.title)?;
             let mut summary = result?;
-            let review = if config.reconcile.at_end_of_run
-                && !matches!(summary.stop, Some(pipeline::Stop::Error(_)))
-            {
+            // A run stopped by an error or a budget limit skips the review,
+            // which would make more model requests.
+            let review = if config.reconcile.at_end_of_run && summary.stop.is_none() {
                 let review = review_tags(&mut db, &config, yes, &say).await;
                 render::render_all(&db, &cli.out, config.notes.title)?;
                 Some(review)
@@ -443,7 +443,9 @@ fn ask_which(n: usize) -> Vec<bool> {
     loop {
         eprint!("Apply them? [Y]es, [n]o, or the numbers to skip (e.g. 2,5): ");
         let mut answer = String::new();
-        if std::io::stdin().read_line(&mut answer).is_err() {
+        // End of input (Ctrl-D) or an error means no.
+        if !matches!(std::io::stdin().read_line(&mut answer), Ok(read) if read > 0) {
+            eprintln!();
             return vec![false; n];
         }
         match parse_choice(&answer, n) {

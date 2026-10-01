@@ -83,23 +83,62 @@ pub async fn review<R: Reviewer, E: Embedder>(
     for batch in pairs.chunks(config.batch_size) {
         merges.extend(review_merges(db, reviewer, batch).await?);
     }
-    review.proposed.extend(merge_changes(&tags, &merges));
+    let name_owner = |name: &str| db.tag_named(name).ok().flatten();
+    review.proposed.extend(merge_changes(&tags, &merges, &name_owner));
 
-    // A tag merged away isn't also split.
-    let merged: HashSet<i64> = review
-        .proposed
-        .iter()
-        .filter_map(|p| match p.change {
-            TagChange::Merge { from, .. } => Some(from),
-            _ => None,
-        })
-        .collect();
-    for candidate in splits.iter().filter(|c| !merged.contains(&c.tag.id)) {
-        if let Some(proposed) = review_split(db, reviewer, candidate, &by_name).await? {
+    // A tag that a merge or rename changes isn't also split: the split's pages
+    // and names were taken before the merge. Split parts naming a tag that is
+    // merged away go to the tag it is merged into.
+    let mut touched = HashSet::new();
+    let mut final_name: HashMap<i64, String> = HashMap::new();
+    for p in &review.proposed {
+        match &p.change {
+            TagChange::Rename { tag, name } => {
+                touched.insert(*tag);
+                final_name.insert(*tag, name.clone());
+            }
+            TagChange::Merge { from, into } => {
+                touched.extend([*from, *into]);
+            }
+            TagChange::Split { .. } => {}
+        }
+    }
+    let by_id: HashMap<i64, &TagInfo> = tags.iter().map(|t| (t.id, t)).collect();
+    let mut merged_into: HashMap<&str, String> = HashMap::new();
+    for p in &review.proposed {
+        if let TagChange::Merge { from, into } = p.change
+            && let (Some(from), Some(into)) = (by_id.get(&from), by_id.get(&into))
+        {
+            let name = final_name.get(&into.id).unwrap_or(&into.name).clone();
+            merged_into.insert(from.name.as_str(), name);
+        }
+    }
+    for candidate in splits.iter().filter(|c| !touched.contains(&c.tag.id)) {
+        if let Some(mut proposed) = review_split(db, reviewer, candidate, &by_name).await? {
+            if let TagChange::Split { into, .. } = &mut proposed.change {
+                redirect_parts(into, &merged_into);
+            }
             review.proposed.push(proposed);
         }
     }
     Ok(review)
+}
+
+/// Renames split parts that name a tag being merged away, joining parts that
+/// end up with the same name.
+fn redirect_parts(parts: &mut Vec<SplitPart>, merged_into: &HashMap<&str, String>) {
+    let mut out: Vec<SplitPart> = Vec::new();
+    for mut part in parts.drain(..) {
+        if let Some(name) = merged_into.get(part.name.as_str()) {
+            part.name = name.clone();
+            part.description.clear();
+        }
+        match out.iter_mut().find(|p| p.name == part.name) {
+            Some(existing) => existing.pages.extend(part.pages),
+            None => out.push(part),
+        }
+    }
+    *parts = out;
 }
 
 /// "1 page", "3 pages".
@@ -362,7 +401,13 @@ async fn review_merges<R: Reviewer>(
 /// Turns the model's merges into changes: tags merged in chains end up in one
 /// tag, named by the most voted `keep`. A name that isn't one of the group's
 /// tags renames the group's most used tag.
-fn merge_changes(tags: &[TagInfo], merges: &[(i64, i64, String)]) -> Vec<Proposed> {
+/// `name_owner` finds the tag that already uses a name, as a tag or an alias,
+/// including tags on no finished page.
+fn merge_changes(
+    tags: &[TagInfo],
+    merges: &[(i64, i64, String)],
+    name_owner: &dyn Fn(&str) -> Option<i64>,
+) -> Vec<Proposed> {
     let by_id: HashMap<i64, &TagInfo> = tags.iter().map(|t| (t.id, t)).collect();
     let by_name: HashMap<&str, &TagInfo> = tags.iter().map(|t| (t.name.as_str(), t)).collect();
     // Union-find over tag ids.
@@ -415,18 +460,25 @@ fn merge_changes(tags: &[TagInfo], merges: &[(i64, i64, String)]) -> Vec<Propose
             *counts.entry(name.as_str()).or_default() += 1;
         }
         let pages_of = |name: &str| members.iter().find(|t| t.name == name).map_or(0, |t| t.pages);
-        let keep = counts
+        let biggest_name = || {
+            members
+                .iter()
+                .max_by_key(|t| t.pages)
+                .expect("two members")
+                .name
+                .clone()
+        };
+        let mut keep = counts
             .iter()
             .max_by(|a, b| a.1.cmp(b.1).then(pages_of(a.0).cmp(&pages_of(b.0))))
             .map(|(name, _)| name.to_string())
-            .unwrap_or_else(|| {
-                members
-                    .iter()
-                    .max_by_key(|t| t.pages)
-                    .expect("two members")
-                    .name
-                    .clone()
-            });
+            .unwrap_or_else(biggest_name);
+        // A new name already used by a tag outside the group would clash.
+        if !members.iter().any(|t| t.name == keep)
+            && name_owner(&keep).is_some_and(|id| !members.iter().any(|t| t.id == id))
+        {
+            keep = biggest_name();
+        }
         let into = match members.iter().find(|t| t.name == keep) {
             Some(existing) => *existing,
             None => {
@@ -522,12 +574,12 @@ async fn review_split<R: Reviewer>(
             .await?,
     )?;
     let key = format!("split:{}", tag.name);
-    let parts = reply
-        .split
-        .then(|| split_parts(sample, &reply, by_name))
-        .flatten();
-    let Some(mut parts) = parts else {
+    if !reply.split {
         db.set_tag_decision(&key, "single-meaning", "llm")?;
+        return Ok(None);
+    }
+    // An unusable split isn't remembered, so the next review asks again.
+    let Some(mut parts) = split_parts(sample, &reply, by_name) else {
         return Ok(None);
     };
     place_remaining_pages(&mut parts, vectors);
@@ -750,7 +802,7 @@ mod tests {
             (1, 2, "machine-learning".to_string()),
             (3, 1, "machine-learning".to_string()),
         ];
-        let changes: Vec<TagChange> = merge_changes(&tags, &merges)
+        let changes: Vec<TagChange> = merge_changes(&tags, &merges, &|_| None)
             .into_iter()
             .map(|p| p.change)
             .collect();
@@ -762,7 +814,7 @@ mod tests {
     #[test]
     fn a_better_name_renames_the_most_used_tag() {
         let tags = [info(1, "js", 4), info(2, "java-script", 1)];
-        let proposed = merge_changes(&tags, &[(1, 2, "javascript".to_string())]);
+        let proposed = merge_changes(&tags, &[(1, 2, "javascript".to_string())], &|_| None);
         let changes: Vec<TagChange> = proposed.iter().map(|p| p.change.clone()).collect();
         assert_eq!(
             changes,
@@ -775,6 +827,18 @@ mod tests {
             ]
         );
         assert_eq!(proposed[0].description, "rename js → javascript (4 pages)");
+    }
+
+    #[test]
+    fn a_name_used_elsewhere_is_not_taken() {
+        let tags = [info(1, "js", 4), info(2, "java-script", 1)];
+        // An unused tag, or another tag's alias, is already called javascript.
+        let owner = |name: &str| (name == "javascript").then_some(9);
+        let changes: Vec<TagChange> = merge_changes(&tags, &[(1, 2, "javascript".to_string())], &owner)
+            .into_iter()
+            .map(|p| p.change)
+            .collect();
+        assert_eq!(changes, [TagChange::Merge { from: 2, into: 1 }]);
     }
 
     #[tokio::test]
@@ -905,9 +969,63 @@ mod tests {
         .await
         .unwrap();
         assert!(review.proposed.is_empty());
+        // Not remembered: the model did say the tag should be split.
+        assert_eq!(db.tag_decision("split:rust").unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_merged_tag_is_not_also_split() {
+        let db = archive(&[
+            (&["rust"], [1.0, 0.0, 0.0]),
+            (&["rust"], [1.0, 0.1, 0.0]),
+            (&["rust"], [0.0, 0.0, 1.0]),
+            (&["rusts"], [0.1, 0.0, 1.0]),
+        ]);
+        // Only the merge is asked; a split request would find no reply.
+        let reviewer = FakeReviewer::new(vec![json!({"decisions": [
+            {"pair": 1, "merge": true, "keep": "rust"}
+        ]})]);
+        let review = review(
+            &db,
+            &reviewer,
+            Some(&no_names()),
+            &ReconcileConfig {
+                split_min_pages: 3,
+                ..ReconcileConfig::default()
+            },
+            |_| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(review.split_candidates, 1);
+        let changes: Vec<TagChange> = review.proposed.into_iter().map(|p| p.change).collect();
         assert_eq!(
-            db.tag_decision("split:rust").unwrap().as_deref(),
-            Some("single-meaning")
+            changes,
+            [TagChange::Merge {
+                from: tag_id(&db, "rusts"),
+                into: tag_id(&db, "rust")
+            }]
+        );
+    }
+
+    #[test]
+    fn split_parts_follow_merges() {
+        let part = |name: &str, pages: Vec<i64>| SplitPart {
+            name: name.into(),
+            description: "d".into(),
+            pages,
+        };
+        let mut parts = vec![
+            part("rust", vec![1]),
+            part("oxides", vec![2]),
+            part("oxide", vec![3]),
+        ];
+        let merged_into = HashMap::from([("oxides", "oxide".to_string())]);
+        redirect_parts(&mut parts, &merged_into);
+        assert_eq!(parts.len(), 2);
+        assert_eq!(
+            (parts[1].name.as_str(), parts[1].pages.as_slice()),
+            ("oxide", &[2, 3][..])
         );
     }
 

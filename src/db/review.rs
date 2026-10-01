@@ -110,6 +110,18 @@ impl Db {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// The tag that uses `name`, as its name or as an alias.
+    pub fn tag_named(&self, name: &str) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id FROM tags WHERE name = ?1 UNION ALL SELECT tag_id FROM tag_aliases WHERE alias = ?1 LIMIT 1",
+                [name],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
     pub fn tag_decision(&self, key: &str) -> Result<Option<String>> {
         Ok(self
             .conn
@@ -276,8 +288,15 @@ fn split(tx: &Transaction, tag: i64, parts: &[SplitPart], steps: &mut Vec<Step>)
             kept += part.pages.len();
             continue;
         }
+        // An existing tag, or the tag an alias with this name stands for.
         let existing: Option<i64> = tx
-            .query_row("SELECT id FROM tags WHERE name = ?1", [&part.name], |r| r.get(0))
+            .query_row(
+                "SELECT id FROM tags WHERE name = ?1
+                 UNION ALL SELECT tag_id FROM tag_aliases WHERE alias = ?1 AND tag_id != ?2
+                 LIMIT 1",
+                params![part.name, tag],
+                |r| r.get(0),
+            )
             .optional()?;
         let target = match existing {
             Some(id) => id,
