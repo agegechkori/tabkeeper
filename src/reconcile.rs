@@ -733,7 +733,7 @@ pub(crate) mod tests {
     /// Replies in order and records the prompts it was given.
     pub(crate) struct FakeReviewer {
         replies: RefCell<Vec<Value>>,
-        prompts: RefCell<Vec<String>>,
+        pub(crate) prompts: RefCell<Vec<String>>,
     }
 
     impl FakeReviewer {

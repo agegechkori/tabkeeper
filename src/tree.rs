@@ -338,6 +338,19 @@ pub async fn place<R: Reviewer, E: Embedder>(
             "properties": {"tag": {"type": "integer"}, "domain": {"type": "string"}}
         }}}
     });
+    // Tags outside the tree that can't be at the top can't be domains; the
+    // model is told, so it doesn't send tags where they can never go.
+    let mut blocked: Vec<String> = model
+        .declined
+        .iter()
+        .filter_map(|key| key.strip_prefix("place:")?.strip_suffix('>'))
+        .map(str::to_string)
+        .chain(model.locked.iter().cloned())
+        .filter(|name| model.blocked_at_top(name))
+        .collect();
+    blocked.sort();
+    blocked.dedup();
+    let unplaced_names: HashSet<&str> = unplaced.iter().map(|t| t.name.as_str()).collect();
     for batch in unplaced.chunks(DOMAIN_BATCH.min(config.batch_size)) {
         // Domains in the tree, and those chosen in earlier batches.
         let mut domains: Vec<String> = model
@@ -349,13 +362,17 @@ pub async fn place<R: Reviewer, E: Embedder>(
         domains.sort();
         domains.dedup();
         let mut user = format!(
-            "Existing domains: {}\n\nTags:\n",
+            "Existing domains: {}\n",
             if domains.is_empty() {
                 "(none yet)".to_string()
             } else {
                 domains.join(", ")
             }
         );
+        if !blocked.is_empty() {
+            user.push_str(&format!("Not available as domains: {}\n", blocked.join(", ")));
+        }
+        user.push_str("\nTags:\n");
         for (i, tag) in batch.iter().enumerate() {
             user.push_str(&format!("{}. {}\n", i + 1, describe_tag(db, tag)?));
         }
@@ -376,15 +393,21 @@ pub async fn place<R: Reviewer, E: Embedder>(
                 continue;
             };
             let domain = model.canonical.get(&domain).cloned().unwrap_or(domain);
+            if model.blocked_at_top(&domain) {
+                continue;
+            }
             // A domain that is a category further down counts by its top.
             let top = model
                 .parents
                 .get(&domain)
                 .and_then(|p| p.first())
                 .unwrap_or(&domain);
-            if strict
-                .as_ref()
-                .is_some_and(|allowed| !allowed.contains(top.as_str()))
+            // A domain that is a tag placed in this review is checked once
+            // its own place is known.
+            if !unplaced_names.contains(domain.as_str())
+                && strict
+                    .as_ref()
+                    .is_some_and(|allowed| !allowed.contains(top.as_str()))
             {
                 continue;
             }
@@ -1053,6 +1076,66 @@ mod tests {
         .await
         .unwrap();
         assert!(placement.proposed.is_empty(), "{:?}", placement.proposed);
+    }
+
+    #[tokio::test]
+    async fn strict_domains_through_a_tag_placed_in_the_same_review() {
+        use crate::reconcile::tests::{FakeReviewer, NameEmbedder, archive};
+        let db = archive(&[(&["programming"], [1.0, 0.0, 0.0]), (&["rust"], [1.0, 0.1, 0.0])]);
+        let taxonomy = Taxonomy {
+            strict: true,
+            categories: vec![Category::Name("technology".into())],
+        };
+        let reviewer = FakeReviewer::new(vec![json!({"domains": [
+            {"tag": 1, "domain": "technology"},
+            {"tag": 2, "domain": "programming"}
+        ]})]);
+        let placement = place(
+            &db,
+            &reviewer,
+            None::<&NameEmbedder>,
+            &ReconcileConfig::default(),
+            3,
+            Some(&taxonomy),
+            |_| {},
+        )
+        .await
+        .unwrap();
+        let descriptions: Vec<&str> = placement
+            .proposed
+            .iter()
+            .map(|p| p.description.as_str())
+            .collect();
+        assert_eq!(
+            descriptions,
+            [
+                "place  technology ← programming (new: technology)",
+                "place  technology/programming ← rust"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_domains_are_named_and_not_used() {
+        use crate::reconcile::tests::{FakeReviewer, NameEmbedder, archive};
+        let db = archive(&[(&["history"], [1.0, 0.0, 0.0]), (&["ww2"], [1.0, 0.1, 0.0])]);
+        db.set_tag_decision("place:history>", "declined", "user").unwrap();
+        let reviewer = FakeReviewer::new(vec![json!({"domains": [
+            {"tag": 1, "domain": "history"},
+            {"tag": 2, "domain": "history"}
+        ]})]);
+        place(
+            &db,
+            &reviewer,
+            None::<&NameEmbedder>,
+            &ReconcileConfig::default(),
+            3,
+            None,
+            |_| {},
+        )
+        .await
+        .unwrap();
+        assert!(reviewer.prompts.borrow()[0].contains("Not available as domains: history"));
     }
 
     #[tokio::test]
