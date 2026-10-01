@@ -33,6 +33,8 @@ pub struct Report {
     pub model: ModelReport,
     pub tabkeeper: ProcessUsage,
     pub tags: TagCounts,
+    /// The tag review at the end of the run, if it ran.
+    pub review: Option<ReviewReport>,
     pub warnings: Vec<String>,
     /// Every failed or unreachable page in the archive, with its error.
     pub failed_pages: Vec<FailedPage>,
@@ -133,6 +135,61 @@ pub struct FailedPage {
 }
 
 /// What `build` needs to know about the run besides the database.
+/// What the tag review proposed and what was applied.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReviewReport {
+    pub model: String,
+    pub usage: StageUsage,
+    pub merge_candidates: usize,
+    pub split_candidates: usize,
+    pub proposed: usize,
+    pub merges: usize,
+    pub renames: usize,
+    pub splits: usize,
+    pub declined: usize,
+    /// Proposed changes left unapplied because nobody could be asked.
+    pub not_asked: usize,
+    /// The revision `tabkeeper undo` reverts.
+    pub revision: Option<i64>,
+    /// Why the review didn't run or failed.
+    pub error: Option<String>,
+}
+
+impl ReviewReport {
+    pub fn applied(&self) -> usize {
+        self.merges + self.renames + self.splits
+    }
+
+    /// One line for the end of a run or `revise-tags`.
+    pub fn line(&self) -> String {
+        if let Some(error) = &self.error {
+            return format!("the tag review failed ({error}); run `tabkeeper revise-tags` to try again");
+        }
+        if self.proposed == 0 {
+            return "no changes needed".into();
+        }
+        let mut parts = vec![format!(
+            "{} of {} proposed changes applied ({} merges · {} renames · {} splits)",
+            self.applied(),
+            self.proposed,
+            self.merges,
+            self.renames,
+            self.splits
+        )];
+        if self.declined > 0 {
+            parts.push(format!("{} declined", self.declined));
+        }
+        if self.not_asked > 0 {
+            parts.push(format!(
+                "{} waiting: run `tabkeeper revise-tags` in a terminal, or add --yes",
+                self.not_asked
+            ));
+        }
+        parts.join(" · ")
+    }
+}
+
 pub struct RunContext<'a> {
     pub started_at: &'a str,
     pub started: std::time::Instant,
@@ -140,6 +197,7 @@ pub struct RunContext<'a> {
     pub summary: &'a RunSummary,
     pub summaries: StageUsage,
     pub embeddings: Option<(StageUsage, usize)>,
+    pub review: Option<ReviewReport>,
     pub config: &'a Config,
 }
 
@@ -248,6 +306,7 @@ pub async fn build(db: &Db, ctx: &RunContext<'_>) -> Result<Report> {
             untagged_pages: db.untagged_pages()?,
             top,
         },
+        review: ctx.review.clone(),
         warnings: Vec::new(),
         failed_pages: db
             .failed_pages()?
@@ -608,6 +667,18 @@ pub fn text(report: &Report) -> String {
         None => "unknown: set price_input_per_mtok and price_output_per_mtok in [llm]".to_string(),
     };
     writeln!(out, "  Cost        {cost}").unwrap();
+    if let Some(r) = report.review.as_ref().filter(|r| r.usage.requests > 0) {
+        writeln!(
+            out,
+            "  Tag review  {} · {} requests · {} input / {} output tokens · {}",
+            r.model,
+            num(r.usage.requests as usize),
+            tokens(r.usage.input_tokens),
+            tokens(r.usage.output_tokens),
+            duration(r.usage.request_secs)
+        )
+        .unwrap();
+    }
     if m.pages_cut > 0 {
         writeln!(
             out,
@@ -640,6 +711,9 @@ pub fn text(report: &Report) -> String {
     let shared: Vec<(String, usize)> = t.top.iter().filter(|(_, n)| *n > 1).cloned().collect();
     if !shared.is_empty() {
         writeln!(out, "Most used  {}", list(&shared, TOP_TAGS)).unwrap();
+    }
+    if let Some(review) = &report.review {
+        writeln!(out, "Review     {}", review.line()).unwrap();
     }
     if !report.warnings.is_empty() {
         out.push_str("\nWarnings\n");
@@ -778,6 +852,7 @@ mod tests {
             summary: &summary,
             summaries: usage.clone(),
             embeddings: Some((embeddings.clone(), 0)),
+            review: None,
             config,
         };
         let mut priced = config.clone();

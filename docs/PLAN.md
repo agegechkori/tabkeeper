@@ -261,7 +261,7 @@ tabkeeper sources                    # browsers/profiles found, tab counts
 tabkeeper run [--dry-run] [--batch] [--lang en|<code>|original] [--taxonomy f] [--allow/--deny r] [--max-cost n] [--json]
 tabkeeper import <file>
 tabkeeper revise-tags [--yes]
-tabkeeper undo <run-id>
+tabkeeper undo                       # reverts the last applied tag review
 tabkeeper render
 tabkeeper report [--json]
 tabkeeper config
@@ -278,8 +278,11 @@ tokio, reqwest, clap, serde, serde_json, rusqlite (bundled), lz4_flex, dom_smoot
 2. **Flat tagging and scale**, in three pull requests:
    - 2a ([PR #3](https://github.com/agegechkori/tabkeeper/pull/3)): per-page flat tags, with embeddings choosing which existing tags the model sees
    - 2b ([PR #4](https://github.com/agegechkori/tabkeeper/pull/4)): concurrency, retries and rate limits, progress bar, unreachable-page stubs, failure causes, domain filter
-   - 2c: token usage per request, then dry-run cost estimate, budget caps, and the final report (everything except per-browser counts and the reconciliation numbers)
-3. **Tag reconciliation:** end-of-run pass (merge, split, and the tree in hierarchical mode), validation, approval list, revision log, undo, `tags.style`, taxonomy file. First, compare it with phase 1's direct hierarchical tagging on the same 50–100 URLs: tree depth, tag reuse, whether `rust` is split correctly, speed.
+   - 2c ([PR #6](https://github.com/agegechkori/tabkeeper/pull/6)): token usage per request, then dry-run cost estimate, budget caps, and the final report (everything except per-browser counts and the reconciliation numbers)
+3. **Tag reconciliation**, in three pull requests:
+   - 3a: the review for flat tags. Merge candidates come from plural forms and from embeddings of the tag names alone (tag descriptions made tags from the same page look alike); split candidates are tags whose pages form two dissimilar groups. The model decides in batches, the changes are listed for approval, applied in one transaction and logged with an undo record (`revisions`), and declined changes are remembered (`tag_decisions`). Instead of the alias and override tables planned above, a revision retargets `page_tags.resolved_tag_id` (the raw tags stay untouched) and stores what it changed.
+   - 3b: the tree in hierarchical mode, `tags.style`, the taxonomy file.
+   - 3c: compare with phase 1's direct hierarchical tagging on the same 50–100 URLs: tree depth, tag reuse, whether `rust` is split correctly, speed.
 4. **Browser sources:** Firefox; the Chromium family via SNSS; Safari and macOS via AppleScript; profile discovery on all three operating systems.
 5. **Providers:** Anthropic and Gemini adapters, URL-only mode, `--batch`.
 6. **Distribution:** CI builds for macOS, Linux and Windows; GitHub Releases; `cargo install`.

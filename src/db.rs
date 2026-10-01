@@ -5,7 +5,32 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::tags::TagRow;
 
-const SCHEMA_VERSION: i32 = 5;
+mod review;
+pub use review::{SplitPart, TagChange, TagInfo};
+
+const SCHEMA_VERSION: i32 = 6;
+
+/// Added in version 6: the tag review.
+const REVIEW_TABLES: &str = "
+-- Applied tag reviews: the changes, and what applying them did, to undo it.
+CREATE TABLE revisions (
+    id         INTEGER PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    status     TEXT NOT NULL CHECK (status IN ('applied', 'undone')),
+    changes    TEXT NOT NULL,
+    undo       TEXT NOT NULL
+);
+
+-- Review answers that should stick: pairs the model found different, tags it
+-- found to have one meaning, and changes the user declined. key is e.g.
+-- 'merge:a|b' or 'split:rust'.
+CREATE TABLE tag_decisions (
+    key        TEXT PRIMARY KEY,
+    decision   TEXT NOT NULL,
+    source     TEXT NOT NULL CHECK (source IN ('llm', 'user')),
+    created_at TEXT NOT NULL
+);
+";
 
 /// Added in version 5: the page's own title, as in the browser tab or its
 /// HTML <title>, shown next to the model's title.
@@ -196,7 +221,7 @@ impl Db {
         let mut version: i32 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
         if version == 0 {
             conn.execute_batch(&format!(
-                "BEGIN; {PAGES_TABLE} {PAGE_TITLE_COLUMN} {SCHEMA} {RUNS_TABLE} COMMIT;"
+                "BEGIN; {PAGES_TABLE} {PAGE_TITLE_COLUMN} {SCHEMA} {RUNS_TABLE} {REVIEW_TABLES} COMMIT;"
             ))?;
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             version = SCHEMA_VERSION;
@@ -220,6 +245,12 @@ impl Db {
                 "BEGIN; {PAGE_TITLE_COLUMN} PRAGMA user_version = 5; COMMIT;"
             ))?;
             version = 5;
+        }
+        if version == 5 {
+            conn.execute_batch(&format!(
+                "BEGIN; {REVIEW_TABLES} PRAGMA user_version = 6; COMMIT;"
+            ))?;
+            version = 6;
         }
         if version != SCHEMA_VERSION {
             bail!(

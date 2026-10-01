@@ -39,10 +39,23 @@ This writes to `tabkeeper-out/` (change it with `--out`):
 Several pages are processed at once (`[run]` in the config). Runs can be interrupted and restarted: finished pages are kept, and URLs already processed are skipped. If the model server stops responding, the run stops after a few retries and leaves the remaining pages for the next run. Other commands:
 
 - `tabkeeper report`: print the report of the latest run again (`--json` for scripts)
+- `tabkeeper revise-tags [--yes]`: review the tags (see below); `tabkeeper undo` reverts the last review
 - `tabkeeper render`: rewrite the notes from the database
 - `tabkeeper config`: show where the config file goes, with an example ([config.example.toml](config.example.toml))
 
 Each run ends with a report: how many tabs were done, unreachable or failed (by cause), languages and domains, the model's token use, speed and cost, Ollama's memory and GPU use, the tags, and warnings about problems it noticed, such as a thinking model or pages cut short.
+
+### Tag review
+
+At the end of each import, tabkeeper reviews the tags: it merges tags that mean the same (`board-game` / `board-games`, `ml` / `machine-learning`) and splits a tag used for different meanings into one tag per meaning (`rust` for the language, `rust-corrosion` for the chemistry). Code finds the candidates, using the tag names and the pages' embeddings, and the model decides. You then see the proposed changes as a numbered list:
+
+```
+   1. merge  board-games → board-game (4 + 2 pages)
+   2. split  rust → rust (3 pages), rust-corrosion (1 page)
+Apply them? [Y]es, [n]o, or the numbers to skip (e.g. 2,5):
+```
+
+Changes you decline, and pairs the model kept apart, are remembered and not proposed again. `--yes` applies everything without asking; without a terminal nothing is applied. `tabkeeper revise-tags` runs the review on its own, and `tabkeeper undo` reverts the last applied review. The review can use its own model (`[reconcile]` in the config).
 
 Before a big run, `--dry-run` shows what would be processed and estimates tokens, cost and time (from your last run, once there is one) without fetching or saving anything. `--max-tokens N` and `--max-cost DOLLARS` stop starting new pages once a limit would be reached; the rest stay pending for the next run. For cloud models, set `price_input_per_mtok` and `price_output_per_mtok` in `[llm]` to see costs.
 

@@ -9,12 +9,14 @@ mod import;
 mod llm;
 mod pipeline;
 mod progress;
+mod reconcile;
 mod render;
 mod report;
 mod tags;
 mod urls;
 mod usage;
 
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -87,7 +89,19 @@ enum Command {
         /// Maximum tags per page, overriding tags.max_per_page.
         #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
         max_tags: Option<u32>,
+        /// Apply the tag review's changes at the end of the run without asking.
+        #[arg(long)]
+        yes: bool,
     },
+    /// Review the tags: merge duplicates, split ambiguous tags. You approve
+    /// the changes; `tabkeeper undo` reverts them.
+    ReviseTags {
+        /// Apply the changes without asking.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Undo the latest tag review that changed tags.
+    Undo,
     /// Rewrite all notes, _tags.md and _index.md from the database.
     Render,
     /// Print the report of the latest run.
@@ -128,6 +142,7 @@ async fn run(cli: Cli) -> Result<()> {
             json,
             concurrency,
             max_tags,
+            yes,
         } => {
             if let Some(model) = model {
                 config.llm.model = model;
@@ -239,6 +254,15 @@ async fn run(cli: Cli) -> Result<()> {
             // Render and report whatever was finished, even if the run stopped early.
             render::render_all(&db, &cli.out, config.notes.title)?;
             let mut summary = result?;
+            let review = if config.reconcile.at_end_of_run
+                && !matches!(summary.stop, Some(pipeline::Stop::Error(_)))
+            {
+                let review = review_tags(&mut db, &config, yes, &say).await;
+                render::render_all(&db, &cli.out, config.notes.title)?;
+                Some(review)
+            } else {
+                None
+            };
             let embed_usage = match (&embedder, &embeddings) {
                 (Some(embedder), Some(e)) => Some((embed::Embedder::usage(embedder), e.errors)),
                 // The setup failed: report what it used, and count the failure.
@@ -252,6 +276,7 @@ async fn run(cli: Cli) -> Result<()> {
                 summary: &summary,
                 summaries: llm::Llm::usage(&llm),
                 embeddings: embed_usage,
+                review,
                 config: &config,
             };
             let report = report::build(&db, &ctx).await?;
@@ -272,6 +297,25 @@ async fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::Render => finish(&open_db(&cli.out)?, &cli.out, &config)?,
+        Command::ReviseTags { yes } => {
+            let mut db = open_db(&cli.out)?;
+            let review = review_tags(&mut db, &config, yes, &|text: &str| println!("{text}")).await;
+            finish(&db, &cli.out, &config)?;
+            println!("Tag review: {}.", review.line());
+            if let Some(revision) = review.revision {
+                println!("To revert it: tabkeeper undo (revision {revision}).");
+            }
+        }
+        Command::Undo => {
+            let mut db = open_db(&cli.out)?;
+            match db.undo_last_revision()? {
+                Some((revision, changes)) => {
+                    finish(&db, &cli.out, &config)?;
+                    println!("Undid tag review revision {revision} ({changes} changes).");
+                }
+                None => println!("No tag review to undo."),
+            }
+        }
         Command::Report { json } => {
             let db = open_db(&cli.out)?;
             match db.latest_run_report()? {
@@ -304,6 +348,129 @@ async fn run(cli: Cli) -> Result<()> {
     Ok(())
 }
 
+/// Runs the tag review and asks which changes to apply. A failure is reported,
+/// not returned: the run's pages are saved either way.
+async fn review_tags(db: &mut Db, config: &Config, yes: bool, say: &dyn Fn(&str)) -> report::ReviewReport {
+    let llm_config = config.reconcile.llm_config(&config.llm);
+    let mut outcome = report::ReviewReport {
+        model: llm_config.model.clone(),
+        ..Default::default()
+    };
+    let reviewer = match llm::OpenAiCompatible::new(&llm_config) {
+        Ok(reviewer) => reviewer,
+        Err(err) => {
+            outcome.error = Some(format!("{err:#}"));
+            return outcome;
+        }
+    };
+    // Without embeddings, only plural/singular pairs are checked. Vectors
+    // missing from earlier runs are filled in first: splits need page vectors.
+    let mut embedder = if config.embeddings.enabled {
+        embed::OpenAiEmbedder::new(&config.embeddings, &config.llm).ok()
+    } else {
+        None
+    };
+    if let Some(e) = &embedder {
+        if let Err(err) = pipeline::Embeddings::prepare(db, e, config.embeddings.page_chars).await {
+            say(&format!(
+                "Warning: embeddings are unavailable ({err:#}); the review only checks plural/singular pairs."
+            ));
+            embedder = None;
+        }
+    }
+    let result = reconcile::review(db, &reviewer, embedder.as_ref(), &config.reconcile, say).await;
+    outcome.usage = llm::Reviewer::usage(&reviewer);
+    let review = match result {
+        Ok(review) => review,
+        Err(err) => {
+            outcome.error = Some(format!("{err:#}"));
+            return outcome;
+        }
+    };
+    outcome.merge_candidates = review.merge_candidates;
+    outcome.split_candidates = review.split_candidates;
+    outcome.proposed = review.proposed.len();
+    if review.proposed.is_empty() {
+        return outcome;
+    }
+
+    say("\nThe tag review proposes these changes:");
+    for (i, p) in review.proposed.iter().enumerate() {
+        say(&format!("  {:>2}. {}", i + 1, p.description));
+    }
+    let chosen: Vec<bool> = if yes {
+        vec![true; review.proposed.len()]
+    } else if !std::io::stdin().is_terminal() {
+        outcome.not_asked = review.proposed.len();
+        return outcome;
+    } else {
+        ask_which(review.proposed.len())
+    };
+
+    let mut apply = Vec::new();
+    for (p, keep) in review.proposed.iter().zip(&chosen) {
+        if *keep {
+            match &p.change {
+                db::TagChange::Merge { .. } => outcome.merges += 1,
+                db::TagChange::Rename { .. } => outcome.renames += 1,
+                db::TagChange::Split { .. } => outcome.splits += 1,
+            }
+            apply.push(p.change.clone());
+        } else {
+            outcome.declined += 1;
+            if let Err(err) = db.set_tag_decision(&p.decision_key, "declined", "user") {
+                say(&format!("Warning: couldn't remember a declined change: {err:#}"));
+            }
+        }
+    }
+    if !apply.is_empty() {
+        match db.apply_tag_changes(&apply) {
+            Ok(revision) => outcome.revision = Some(revision),
+            Err(err) => {
+                outcome.error = Some(format!("applying the changes: {err:#}"));
+                outcome.merges = 0;
+                outcome.renames = 0;
+                outcome.splits = 0;
+            }
+        }
+    }
+    outcome
+}
+
+/// Asks which of `n` numbered changes to apply: all (the default), none, or
+/// all except the listed numbers. Asked on stderr, so --json output stays clean.
+fn ask_which(n: usize) -> Vec<bool> {
+    loop {
+        eprint!("Apply them? [Y]es, [n]o, or the numbers to skip (e.g. 2,5): ");
+        let mut answer = String::new();
+        if std::io::stdin().read_line(&mut answer).is_err() {
+            return vec![false; n];
+        }
+        match parse_choice(&answer, n) {
+            Some(chosen) => return chosen,
+            None => eprintln!("Please answer y, n, or numbers between 1 and {n}."),
+        }
+    }
+}
+
+fn parse_choice(answer: &str, n: usize) -> Option<Vec<bool>> {
+    match answer.trim().to_lowercase().as_str() {
+        "" | "y" | "yes" | "a" | "all" => Some(vec![true; n]),
+        "n" | "no" | "none" => Some(vec![false; n]),
+        numbers => {
+            let mut chosen = vec![true; n];
+            for part in numbers
+                .split(|c: char| c == ',' || c.is_whitespace())
+                .filter(|p| !p.is_empty())
+            {
+                let i: usize = part.parse().ok()?;
+                *chosen.get_mut(i.checked_sub(1)?)? = false;
+            }
+            Some(chosen)
+        }
+    }
+}
+
 fn open_db(out: &Path) -> Result<Db> {
     std::fs::create_dir_all(out).with_context(|| format!("creating {}", out.display()))?;
     Db::open(&out.join("tabkeeper.db"))
@@ -331,4 +498,19 @@ fn finish(db: &Db, out: &Path, config: &Config) -> Result<()> {
         counts.pending
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_choice;
+
+    #[test]
+    fn approval_answers() {
+        assert_eq!(parse_choice("\n", 3), Some(vec![true, true, true]));
+        assert_eq!(parse_choice("n", 3), Some(vec![false, false, false]));
+        assert_eq!(parse_choice("2, 3", 3), Some(vec![true, false, false]));
+        assert_eq!(parse_choice("4", 3), None);
+        assert_eq!(parse_choice("0", 3), None);
+        assert_eq!(parse_choice("maybe", 3), None);
+    }
 }

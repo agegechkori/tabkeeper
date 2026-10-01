@@ -82,6 +82,28 @@ rules = [
   # "prefix:http://localhost",
 ]
 
+[reconcile]
+# The tag review: merges tags that mean the same (board-game / board-games,
+# ml / machine-learning) and splits tags used for different meanings (rust
+# for the language and for corrosion). Code proposes candidates, the model
+# decides, and you approve the changes. Runs at the end of every import, or
+# with `tabkeeper revise-tags`.
+at_end_of_run = true
+# The review is only a few requests per run, so a stronger model, or a
+# thinking model allowed to think, is affordable here. Defaults to [llm].
+# model = "qwen3:8b"
+# [reconcile.extra_body] replaces [llm.extra_body] for the review; an empty
+# table lets a thinking model think.
+# Tags whose names are at least this similar (cosine similarity of their
+# embeddings) are checked for being the same tag.
+similarity = 0.80
+# Tags on at least this many pages are checked for covering different
+# meanings, when their pages fall into two groups at most this similar.
+split_min_pages = 3
+split_similarity = 0.75
+# Tag pairs per review request.
+batch_size = 20
+
 [notes]
 # The note's title: "both" (the page's own title, then the model's in
 # parentheses), "page" (the page's own title, as in the browser tab) or

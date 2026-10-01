@@ -15,6 +15,60 @@ pub struct Config {
     pub filter: FilterConfig,
     pub run: RunConfig,
     pub notes: NotesConfig,
+    pub reconcile: ReconcileConfig,
+}
+
+/// The tag review that merges duplicate tags and splits ambiguous ones.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReconcileConfig {
+    /// Review the tags at the end of every `import` run.
+    pub at_end_of_run: bool,
+    /// Model for the review; defaults to `llm.model`. A stronger model, or
+    /// thinking left on, pays off here: the review is a few requests per run.
+    pub model: Option<String>,
+    /// Replaces `llm.extra_body` for the review, e.g. `{}` to let a thinking
+    /// model think.
+    pub extra_body: Option<serde_json::Map<String, serde_json::Value>>,
+    /// Tags whose embeddings are at least this similar are checked for being
+    /// the same tag (cosine similarity, 0 to 1).
+    pub similarity: f32,
+    /// Tags on at least this many pages are checked for covering different
+    /// meanings.
+    pub split_min_pages: usize,
+    /// Pages of one tag whose embeddings fall into two groups at most this
+    /// similar to each other are checked for a split.
+    pub split_similarity: f32,
+    /// Tag pairs per review request.
+    pub batch_size: usize,
+}
+
+impl Default for ReconcileConfig {
+    fn default() -> Self {
+        Self {
+            at_end_of_run: true,
+            model: None,
+            extra_body: None,
+            similarity: 0.80,
+            split_min_pages: 3,
+            split_similarity: 0.75,
+            batch_size: 20,
+        }
+    }
+}
+
+impl ReconcileConfig {
+    /// The `[llm]` settings with the review's model and options.
+    pub fn llm_config(&self, llm: &LlmConfig) -> LlmConfig {
+        let mut config = llm.clone();
+        if let Some(model) = &self.model {
+            config.model = model.clone();
+        }
+        if let Some(extra_body) = &self.extra_body {
+            config.extra_body = extra_body.clone();
+        }
+        config
+    }
 }
 
 /// What a note's title shows.
@@ -244,6 +298,9 @@ impl Config {
             || config.embeddings.timeout_secs == 0
         {
             bail!("timeout_secs must be at least 1 in [llm], [fetch] and [embeddings]");
+        }
+        if config.reconcile.batch_size == 0 || config.reconcile.split_min_pages < 2 {
+            bail!("reconcile.batch_size must be at least 1 and reconcile.split_min_pages at least 2");
         }
         if config.run.concurrency == 0 || config.run.per_domain == 0 {
             bail!("run.concurrency and run.per_domain must be at least 1");
