@@ -457,8 +457,11 @@ pub async fn place<R: Reviewer, E: Embedder>(
             continue;
         }
         // A domain that can't be in the tree leaves its tags for a later
-        // review, instead of putting them all at the top.
-        if model.blocked_at_top(domain) {
+        // review, instead of putting them all at the top. So does a tag that
+        // is a domain of other tags but didn't get its own place above.
+        let unplaced_domain_tag =
+            domain_of.contains_key(domain.as_str()) && !model.parents.contains_key(domain);
+        if model.blocked_at_top(domain) || unplaced_domain_tag {
             continue;
         }
         // The domain may be a category further down the tree: tags go
@@ -973,6 +976,35 @@ mod tests {
             {"tag": 1, "domain": "history"},
             {"tag": 2, "domain": "history"}
         ]})]);
+        let placement = place(
+            &db,
+            &reviewer,
+            None::<&NameEmbedder>,
+            &ReconcileConfig::default(),
+            3,
+            None,
+            |_| {},
+        )
+        .await
+        .unwrap();
+        assert!(placement.proposed.is_empty(), "{:?}", placement.proposed);
+    }
+
+    #[tokio::test]
+    async fn a_domain_tag_whose_place_was_declined_keeps_its_tags_out() {
+        use crate::reconcile::tests::{FakeReviewer, NameEmbedder, archive};
+        let db = archive(&[(&["programming"], [1.0, 0.0, 0.0]), (&["rust"], [1.0, 0.1, 0.0])]);
+        db.set_tag_decision("place:programming>technology", "declined", "user")
+            .unwrap();
+        let reviewer = FakeReviewer::new(vec![
+            json!({"domains": [
+                {"tag": 1, "domain": "technology"},
+                {"tag": 2, "domain": "programming"}
+            ]}),
+            // technology is asked about programming again, which goes where
+            // it was declined.
+            json!({"placements": [{"tag": 1, "path": []}]}),
+        ]);
         let placement = place(
             &db,
             &reviewer,
