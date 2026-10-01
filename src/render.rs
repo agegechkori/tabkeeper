@@ -261,7 +261,11 @@ fn index_markdown(
             .get(&page.id)
             .into_iter()
             .flatten()
-            .min_by(|a, b| b.total.cmp(&a.total).then(a.path.cmp(&b.path)));
+            // Flat, a tag counts its own pages, not its subtree's.
+            .min_by(|a, b| match tag_style {
+                TagStyle::Hierarchical => b.total.cmp(&a.total).then(a.path.cmp(&b.path)),
+                TagStyle::Flat => b.direct.cmp(&a.direct).then(a.name.cmp(&b.name)),
+            });
         match main_tag {
             Some(tag) => {
                 let section = match tag_style {

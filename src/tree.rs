@@ -147,6 +147,9 @@ struct TreeModel {
     parents: HashMap<String, Vec<String>>,
     /// Names of every tag and alias, to the tag's name.
     canonical: HashMap<String, String>,
+    /// Placements decided before (declined): a path doesn't put a tag
+    /// there as a category either.
+    declined: HashSet<String>,
 }
 
 impl TreeModel {
@@ -175,7 +178,12 @@ impl TreeModel {
                 canonical.entry(alias).or_insert_with(|| tag.name.clone());
             }
         }
-        Ok(Self { parents, canonical })
+        let declined = db.tag_decision_keys("place:")?.into_iter().collect();
+        Ok(Self {
+            parents,
+            canonical,
+            declined,
+        })
     }
 
     /// Category paths, for the model: every top-level tag and every tag
@@ -226,7 +234,10 @@ impl TreeModel {
             };
             let name = self.canonical.get(&name).cloned().unwrap_or(name);
             let elsewhere = self.parents.get(&name).is_some_and(|p| p[..] != parent[..]);
-            if name == tag || parent.contains(&name) || elsewhere {
+            // A tag not in the tree yet would be put here as a category.
+            let declined_here =
+                !self.parents.contains_key(&name) && self.declined.contains(&place_key(&name, &parent));
+            if name == tag || parent.contains(&name) || elsewhere || declined_here {
                 break;
             }
             parent.push(name);
@@ -374,14 +385,38 @@ pub async fn place<R: Reviewer, E: Embedder>(
     });
     let mut chosen: Vec<(&TagInfo, Vec<String>)> = Vec::new();
     // A tag that is a domain of other tags but was itself put in a domain
-    // goes there first, so its tags follow it wherever the domains come.
+    // goes there first, its domain before it if that is such a tag too, so
+    // its tags follow it whatever order the domains come in.
+    let mut domain_of: BTreeMap<&str, (&str, &TagInfo)> = BTreeMap::new();
     for (domain, tags) in &by_domain {
         for tag in tags
             .iter()
             .filter(|t| &t.name != domain && by_domain.contains_key(&t.name))
         {
+            domain_of
+                .entry(tag.name.as_str())
+                .or_insert((domain.as_str(), *tag));
+        }
+    }
+    let mut done: HashSet<&str> = HashSet::new();
+    for start in domain_of.keys().copied().collect::<Vec<_>>() {
+        // The chain up to a domain that isn't such a tag, or a cycle.
+        let mut chain = vec![start];
+        while let Some((up, _)) = domain_of.get(chain[chain.len() - 1]) {
+            if chain.contains(up) || done.contains(up) {
+                break;
+            }
+            chain.push(up);
+        }
+        for name in chain.into_iter().rev() {
+            if !done.insert(name) {
+                continue;
+            }
+            let Some((domain, tag)) = domain_of.get(name).copied() else {
+                continue;
+            };
             let mut base = model.parents.get(domain).cloned().unwrap_or_default();
-            base.push(domain.clone());
+            base.push(domain.to_string());
             choose(db, &mut model, &mut chosen, tag, &base, levels, strict.as_ref())?;
         }
     }
@@ -631,6 +666,7 @@ mod tests {
                 .map(|(n, p)| (n.to_string(), p.iter().map(|s| s.to_string()).collect()))
                 .collect(),
             canonical: HashMap::from([("golang".to_string(), "go".to_string())]),
+            declined: HashSet::from([place_key("history", &[])]),
         }
     }
 
@@ -666,6 +702,8 @@ mod tests {
             m.check("gin", &path(&["technology", "golang"]), 2, None),
             Some(path(&["technology", "go"]))
         );
+        // So does a category whose placement there was declined.
+        assert_eq!(m.check("ww2", &path(&["history"]), 2, None), Some(vec![]));
         // So does a name that can't be a tag.
         assert_eq!(
             m.check("rust", &path(&["technology", "2024", "x"]), 2, None),
@@ -839,6 +877,44 @@ mod tests {
             [
                 "place  technology ← programming (new: technology)",
                 "place  technology/programming ← rust"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn nested_domains_are_placed_from_the_top() {
+        use crate::reconcile::tests::{FakeReviewer, NameEmbedder, archive};
+        let db = archive(&[
+            (&["languages"], [1.0, 0.0, 0.0]),
+            (&["programming"], [1.0, 0.1, 0.0]),
+        ]);
+        // languages is in programming, which is in technology; "languages"
+        // comes first alphabetically, but programming must not end up at the top.
+        let reviewer = FakeReviewer::new(vec![json!({"domains": [
+            {"tag": 1, "domain": "programming"},
+            {"tag": 2, "domain": "technology"}
+        ]})]);
+        let placement = place(
+            &db,
+            &reviewer,
+            None::<&NameEmbedder>,
+            &ReconcileConfig::default(),
+            3,
+            None,
+            |_| {},
+        )
+        .await
+        .unwrap();
+        let descriptions: Vec<&str> = placement
+            .proposed
+            .iter()
+            .map(|p| p.description.as_str())
+            .collect();
+        assert_eq!(
+            descriptions,
+            [
+                "place  technology ← programming (new: technology)",
+                "place  technology/programming ← languages"
             ]
         );
     }

@@ -149,6 +149,15 @@ impl Db {
             .optional()?)
     }
 
+    /// Keys of the decisions that start with `prefix`.
+    pub fn tag_decision_keys(&self, prefix: &str) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT key FROM tag_decisions WHERE substr(key, 1, length(?1)) = ?1")?;
+        let rows = stmt.query_map([prefix], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     pub fn tag_decision(&self, key: &str) -> Result<Option<String>> {
         Ok(self
             .conn
