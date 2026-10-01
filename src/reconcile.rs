@@ -35,6 +35,8 @@ pub struct Review {
     pub proposed: Vec<Proposed>,
     pub merge_candidates: usize,
     pub split_candidates: usize,
+    /// Review requests that failed; the review goes on without them.
+    pub failed_requests: Vec<String>,
 }
 
 /// Finds candidates, asks the model, and returns the changes it supports.
@@ -81,10 +83,17 @@ pub async fn review<R: Reviewer, E: Embedder>(
 
     let mut merges = Vec::new();
     for batch in pairs.chunks(config.batch_size) {
-        merges.extend(review_merges(db, reviewer, batch).await?);
+        // A failed request loses its batch, not the whole review.
+        match review_merges(db, reviewer, batch).await {
+            Ok(decided) => merges.extend(decided),
+            Err(err) => review.failed_requests.push(format!("{err:#}")),
+        }
     }
     let name_owner = |name: &str| db.tag_named(name).ok().flatten();
-    review.proposed.extend(merge_changes(&tags, &merges, &name_owner));
+    let declined = |key: &str| db.tag_decision(key).ok().flatten().is_some();
+    review
+        .proposed
+        .extend(merge_changes(&tags, &merges, &name_owner, &declined));
 
     // A tag that a merge or rename changes isn't also split: the split's pages
     // and names were taken before the merge. A split part naming a tag that is
@@ -108,8 +117,13 @@ pub async fn review<R: Reviewer, E: Embedder>(
         if part_names.contains(&candidate.tag.name) {
             continue;
         }
-        let Some(proposed) = review_split(db, reviewer, candidate, &by_name).await? else {
-            continue;
+        let proposed = match review_split(db, reviewer, candidate, &by_name).await {
+            Ok(Some(proposed)) => proposed,
+            Ok(None) => continue,
+            Err(err) => {
+                review.failed_requests.push(format!("{err:#}"));
+                continue;
+            }
         };
         let TagChange::Split { into, .. } = &proposed.change else {
             continue;
@@ -144,10 +158,15 @@ fn pages(n: usize) -> String {
 fn merge_keys(
     from: &TagInfo,
     into: &TagInfo,
+    keep: &str,
     merges: &[(i64, i64, String)],
     by_id: &HashMap<i64, &TagInfo>,
 ) -> Vec<String> {
     let mut keys = vec![pair_key(&from.name, &into.name)];
+    // If `into` is renamed to `keep`, the pair is found under that name later.
+    if keep != into.name {
+        keys.push(pair_key(&from.name, keep));
+    }
     for (a, b, _) in merges {
         if (*a == from.id || *b == from.id)
             && let (Some(a), Some(b)) = (by_id.get(a), by_id.get(b))
@@ -418,6 +437,7 @@ fn merge_changes(
     tags: &[TagInfo],
     merges: &[(i64, i64, String)],
     name_owner: &dyn Fn(&str) -> Option<i64>,
+    declined: &dyn Fn(&str) -> bool,
 ) -> Vec<Proposed> {
     let by_id: HashMap<i64, &TagInfo> = tags.iter().map(|t| (t.id, t)).collect();
     let by_name: HashMap<&str, &TagInfo> = tags.iter().map(|t| (t.name.as_str(), t)).collect();
@@ -488,10 +508,12 @@ fn merge_changes(
             .map(|(name, _)| name.to_string())
             .unwrap_or_else(biggest_name);
         // A new name already used by a tag outside the group, or given to
-        // another group, would clash.
+        // another group, would clash; a rename the user declined stays
+        // declined.
         if !members.iter().any(|t| t.name == keep)
             && (renamed_to.contains(&keep)
-                || name_owner(&keep).is_some_and(|id| !members.iter().any(|t| t.id == id)))
+                || name_owner(&keep).is_some_and(|id| !members.iter().any(|t| t.id == id))
+                || declined(&format!("rename:{}>{keep}", biggest_name())))
         {
             keep = biggest_name();
         }
@@ -521,7 +543,7 @@ fn merge_changes(
                     "merge  {} → {keep} ({} + {} pages)",
                     from.name, from.pages, into.pages
                 ),
-                decision_keys: merge_keys(from, into, merges, &by_id),
+                decision_keys: merge_keys(from, into, &keep, merges, &by_id),
             });
         }
     }
@@ -848,7 +870,7 @@ mod tests {
             (1, 2, "machine-learning".to_string()),
             (3, 1, "machine-learning".to_string()),
         ];
-        let changes: Vec<TagChange> = merge_changes(&tags, &merges, &|_| None)
+        let changes: Vec<TagChange> = merge_changes(&tags, &merges, &|_| None, &|_| false)
             .into_iter()
             .map(|p| p.change)
             .collect();
@@ -860,7 +882,7 @@ mod tests {
     #[test]
     fn a_better_name_renames_the_most_used_tag() {
         let tags = [info(1, "js", 4), info(2, "java-script", 1)];
-        let proposed = merge_changes(&tags, &[(1, 2, "javascript".to_string())], &|_| None);
+        let proposed = merge_changes(&tags, &[(1, 2, "javascript".to_string())], &|_| None, &|_| false);
         let changes: Vec<TagChange> = proposed.iter().map(|p| p.change.clone()).collect();
         assert_eq!(
             changes,
@@ -884,7 +906,7 @@ mod tests {
             info(4, "es", 1),
         ];
         let merges = [(1, 2, "javascript".to_string()), (3, 4, "javascript".to_string())];
-        let renames: Vec<String> = merge_changes(&tags, &merges, &|_| None)
+        let renames: Vec<String> = merge_changes(&tags, &merges, &|_| None, &|_| false)
             .into_iter()
             .filter_map(|p| match p.change {
                 TagChange::Rename { name, .. } => Some(name),
@@ -900,10 +922,11 @@ mod tests {
         locked.locked = true;
         let tags = [info(1, "js", 4), info(2, "java-script", 1), locked];
         let owner = |name: &str| (name == "javascript").then_some(3);
-        let changes: Vec<TagChange> = merge_changes(&tags, &[(1, 2, "javascript".to_string())], &owner)
-            .into_iter()
-            .map(|p| p.change)
-            .collect();
+        let changes: Vec<TagChange> =
+            merge_changes(&tags, &[(1, 2, "javascript".to_string())], &owner, &|_| false)
+                .into_iter()
+                .map(|p| p.change)
+                .collect();
         assert_eq!(changes, [TagChange::Merge { from: 2, into: 1 }]);
     }
 
@@ -914,7 +937,7 @@ mod tests {
             info(2, "java-script", 1),
             info(3, "javascript", 2),
         ];
-        let proposed = merge_changes(&tags, &[(1, 2, "javascript".to_string())], &|_| None);
+        let proposed = merge_changes(&tags, &[(1, 2, "javascript".to_string())], &|_| None, &|_| false);
         let keys: Vec<&str> = proposed
             .iter()
             .flat_map(|p| p.decision_keys.iter().map(String::as_str))
@@ -923,14 +946,25 @@ mod tests {
     }
 
     #[test]
+    fn a_declined_rename_isnt_proposed_again() {
+        let tags = [info(1, "js", 4), info(2, "java-script", 1)];
+        let declined = |key: &str| key == "rename:js>javascript";
+        let proposed = merge_changes(&tags, &[(1, 2, "javascript".to_string())], &|_| None, &declined);
+        let changes: Vec<TagChange> = proposed.iter().map(|p| p.change.clone()).collect();
+        assert_eq!(changes, [TagChange::Merge { from: 2, into: 1 }]);
+        assert_eq!(proposed[0].description, "merge  java-script → js (1 + 4 pages)");
+    }
+
+    #[test]
     fn a_name_used_elsewhere_is_not_taken() {
         let tags = [info(1, "js", 4), info(2, "java-script", 1)];
         // An unused tag, or another tag's alias, is already called javascript.
         let owner = |name: &str| (name == "javascript").then_some(9);
-        let changes: Vec<TagChange> = merge_changes(&tags, &[(1, 2, "javascript".to_string())], &owner)
-            .into_iter()
-            .map(|p| p.change)
-            .collect();
+        let changes: Vec<TagChange> =
+            merge_changes(&tags, &[(1, 2, "javascript".to_string())], &owner, &|_| false)
+                .into_iter()
+                .map(|p| p.change)
+                .collect();
         assert_eq!(changes, [TagChange::Merge { from: 2, into: 1 }]);
     }
 

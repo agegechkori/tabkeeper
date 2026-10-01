@@ -352,6 +352,19 @@ fn split(tx: &Connection, tag: i64, parts: &[SplitPart], steps: &mut Vec<Step>) 
         let target = match existing {
             Some(id) => id,
             None => {
+                // An alias of the split tag with this name would stand for
+                // the old tag; the name now belongs to the new one.
+                let own_alias: Option<(String, i64, String, bool, String)> = tx
+                    .query_row(
+                        "SELECT alias, tag_id, source, locked, created_at FROM tag_aliases WHERE alias = ?1",
+                        [&part.name],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                    )
+                    .optional()?;
+                if let Some(alias) = own_alias {
+                    tx.execute("DELETE FROM tag_aliases WHERE alias = ?1", [&part.name])?;
+                    steps.push(Step::AliasesDeleted { aliases: vec![alias] });
+                }
                 tx.execute(
                     "INSERT INTO tags (name, description, created_at) VALUES (?1, ?2, ?3)",
                     params![part.name, part.description, now()],
@@ -691,6 +704,31 @@ mod tests {
             names(&db),
             [("machine-learning".to_string(), 1), ("ml".to_string(), 2)]
         );
+    }
+
+    #[test]
+    fn a_split_part_named_like_the_tags_own_alias_takes_the_name() {
+        let (mut db, pages) = archive(&[&["go"], &["go"]]);
+        let go = id(&db, "go");
+        db.add_alias("golang", go, "rule").unwrap();
+        let part = |name: &str, page: i64| SplitPart {
+            name: name.into(),
+            description: String::new(),
+            pages: vec![page],
+        };
+        db.apply_tag_changes(&[TagChange::Split {
+            tag: go,
+            into: vec![part("go", pages[0]), part("golang", pages[1])],
+        }])
+        .unwrap();
+        let golang = db.find_tag("golang").unwrap().unwrap();
+        assert!(
+            golang.0 != go && !golang.1,
+            "golang is its own tag, not an alias: {golang:?}"
+        );
+        db.undo_last_revision().unwrap();
+        assert_eq!(db.find_tag("golang").unwrap(), Some((go, true)));
+        assert_eq!(names(&db), [("go".to_string(), 2)]);
     }
 
     #[test]

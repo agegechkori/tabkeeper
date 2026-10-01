@@ -156,6 +156,8 @@ pub struct ReviewReport {
     pub revision: Option<i64>,
     /// Approved changes that couldn't be applied, with the reason.
     pub failed: Vec<String>,
+    /// Review requests that failed; their tags are checked again next time.
+    pub failed_requests: usize,
     /// Why the review didn't run or failed.
     pub error: Option<String>,
 }
@@ -183,6 +185,12 @@ impl ReviewReport {
         )];
         if self.declined > 0 {
             parts.push(format!("{} declined", self.declined));
+        }
+        if self.failed_requests > 0 {
+            parts.push(format!(
+                "{} review requests failed, to be retried next time",
+                self.failed_requests
+            ));
         }
         if !self.failed.is_empty() {
             parts.push(format!(

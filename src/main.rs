@@ -402,6 +402,17 @@ async fn review_tags(db: &mut Db, config: &Config, yes: bool, say: &dyn Fn(&str)
     outcome.merge_candidates = review.merge_candidates;
     outcome.split_candidates = review.split_candidates;
     outcome.proposed = review.proposed.len();
+    outcome.failed_requests = review.failed_requests.len();
+    if let Some(first) = review.failed_requests.first() {
+        if review.proposed.is_empty() {
+            outcome.error = Some(first.clone());
+            return outcome;
+        }
+        say(&format!(
+            "Warning: {} of the review's requests failed (first: {first}); those tags are checked again next time.",
+            review.failed_requests.len()
+        ));
+    }
     if review.proposed.is_empty() {
         return outcome;
     }
