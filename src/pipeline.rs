@@ -10,7 +10,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use crate::config::{Config, TagConfig};
 use crate::db::{Db, EmbeddingKind, PageResult, PendingPage, page_embedding_text, tag_embedding_text};
 use crate::embed::{BATCH_SIZE, Embedder, TagIndex};
-use crate::extract::{extract, truncate_chars};
+use crate::extract::{extract, html_title, truncate_chars};
 use crate::fetch::Fetcher;
 use crate::filter::Filter;
 use crate::llm::{LangMode, Llm, PageRejected, PageSummary, SummaryRequest};
@@ -466,6 +466,15 @@ impl<F: Fetcher, L: Llm, E: Embedder> Run<'_, '_, F, L, E> {
         };
 
         let extracted = extract(&fetched.html, &fetched.final_url, self.config.llm.max_input_chars);
+        // The page's own title, as the tab shows it: the one saved with the
+        // link if there is one, else the HTML <title>.
+        let page_title = page
+            .browser_title
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+            .or_else(|| html_title(&fetched.html));
         if extracted.truncated {
             self.pages_cut.set(self.pages_cut.get() + 1);
         }
@@ -534,6 +543,9 @@ impl<F: Fetcher, L: Llm, E: Embedder> Run<'_, '_, F, L, E> {
                 tags: &page_tags,
             };
             db.save_result(page.id, &result).context("saving result")?;
+            if let Some(page_title) = &page_title {
+                db.set_page_title(page.id, page_title)?;
+            }
             created
         };
         self.store_vectors(page.id, title, text, created).await?;
@@ -583,9 +595,18 @@ impl<F: Fetcher, L: Llm, E: Embedder> Run<'_, '_, F, L, E> {
             tags: &tags,
         };
         match stub {
-            Stub::Unreachable => db.save_unreachable(page.id, &result, kind, message),
-            Stub::Failed => db.save_failed(page.id, &result, kind, message),
+            Stub::Unreachable => db.save_unreachable(page.id, &result, kind, message)?,
+            Stub::Failed => db.save_failed(page.id, &result, kind, message)?,
         }
+        if let Some(saved) = page
+            .browser_title
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+        {
+            db.set_page_title(page.id, saved)?;
+        }
+        Ok(())
     }
 
     /// The existing tags to show the model: the most similar to the page, or
@@ -1131,12 +1152,12 @@ mod tests {
         };
         db.save_unreachable(page, &stub, "timeout", "timed out").unwrap();
         let dir = tempfile::tempdir().unwrap();
-        crate::render::render_all(&db, dir.path()).unwrap();
+        crate::render::render_all(&db, dir.path(), crate::config::TitleStyle::Both).unwrap();
 
         // This time it loads, but it's a PDF.
         db.retry_failed().unwrap();
         run(&mut db, &FakeLlm::new(vec![])).await.unwrap();
-        crate::render::render_all(&db, dir.path()).unwrap();
+        crate::render::render_all(&db, dir.path(), crate::config::TitleStyle::Both).unwrap();
         let note = std::fs::read_to_string(dir.path().join("notes/paper.md")).unwrap();
         assert!(
             note.contains("could not be summarized (unsupported content type"),
@@ -1147,6 +1168,39 @@ mod tests {
             "the old status tag is gone: {note}"
         );
         assert_eq!(db.failure_kinds().unwrap(), [("unsupported_type".to_string(), 1)]);
+    }
+
+    #[tokio::test]
+    async fn keeps_the_page_title_from_the_link_or_the_html() {
+        let db = Db::open_in_memory().unwrap();
+        db.add_page("https://a.com/", "https://a.com/", None, "import")
+            .unwrap();
+        db.add_page(
+            "https://b.com/",
+            "https://b.com/",
+            Some("Saved Tab Title"),
+            "import",
+        )
+        .unwrap();
+        let mut db = db;
+        let llm = FakeLlm::new(vec![
+            Ok(summary("Model A", &["a"], &[])),
+            Ok(summary("Model B", &["b"], &[])),
+        ]);
+        run(&mut db, &llm).await.unwrap();
+        let titles: Vec<(String, Option<String>)> = db
+            .note_pages()
+            .unwrap()
+            .into_iter()
+            .map(|p| (p.title, p.page_title))
+            .collect();
+        assert_eq!(
+            titles,
+            [
+                ("Model A".to_string(), Some("Page https://a.com/".to_string())),
+                ("Model B".to_string(), Some("Saved Tab Title".to_string())),
+            ]
+        );
     }
 
     #[tokio::test]

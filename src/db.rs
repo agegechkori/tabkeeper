@@ -5,7 +5,11 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::tags::TagRow;
 
-const SCHEMA_VERSION: i32 = 4;
+const SCHEMA_VERSION: i32 = 5;
+
+/// Added in version 5: the page's own title, as in the browser tab or its
+/// HTML <title>, shown next to the model's title.
+const PAGE_TITLE_COLUMN: &str = "ALTER TABLE pages ADD COLUMN page_title TEXT;";
 
 const PAGES_TABLE: &str = "
 CREATE TABLE pages (
@@ -101,7 +105,10 @@ pub struct DonePage {
     pub id: i64,
     pub url: String,
     pub source: String,
+    /// The model's title, or for a stub note the page's own title or address.
     pub title: String,
+    /// The page's own title: the one saved with the link, or its HTML <title>.
+    pub page_title: Option<String>,
     pub summary: String,
     pub lang: Option<String>,
     pub note_file: Option<String>,
@@ -185,7 +192,9 @@ impl Db {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         let mut version: i32 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
         if version == 0 {
-            conn.execute_batch(&format!("BEGIN; {PAGES_TABLE} {SCHEMA} {RUNS_TABLE} COMMIT;"))?;
+            conn.execute_batch(&format!(
+                "BEGIN; {PAGES_TABLE} {PAGE_TITLE_COLUMN} {SCHEMA} {RUNS_TABLE} COMMIT;"
+            ))?;
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             version = SCHEMA_VERSION;
         }
@@ -202,6 +211,12 @@ impl Db {
         if version == 3 {
             conn.execute_batch(&format!("BEGIN; {RUNS_TABLE} PRAGMA user_version = 4; COMMIT;"))?;
             version = 4;
+        }
+        if version == 4 {
+            conn.execute_batch(&format!(
+                "BEGIN; {PAGE_TITLE_COLUMN} PRAGMA user_version = 5; COMMIT;"
+            ))?;
+            version = 5;
         }
         if version != SCHEMA_VERSION {
             bail!(
@@ -416,7 +431,7 @@ impl Db {
     pub fn note_pages(&self) -> Result<Vec<DonePage>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, url, source, ifnull(title, url), ifnull(summary, ''), lang, note_file,
-                    ifnull(processed_at, added_at)
+                    ifnull(processed_at, added_at), ifnull(page_title, browser_title)
              FROM pages WHERE status != 'pending' ORDER BY id",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -429,6 +444,7 @@ impl Db {
                 lang: r.get(5)?,
                 note_file: r.get(6)?,
                 processed_at: r.get(7)?,
+                page_title: r.get(8)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -539,6 +555,14 @@ impl Db {
             Ok((key, usize::try_from(n)?))
         })
         .collect()
+    }
+
+    pub fn set_page_title(&self, page_id: i64, title: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE pages SET page_title = ?2 WHERE id = ?1",
+            params![page_id, title],
+        )?;
+        Ok(())
     }
 
     pub fn set_note_file(&self, page_id: i64, file: &str) -> Result<()> {

@@ -40,6 +40,57 @@ pub fn extract(html: &str, url: &str, max_chars: usize) -> Extracted {
     }
 }
 
+/// The page's `<title>`, as a browser tab shows it.
+pub fn html_title(html: &str) -> Option<String> {
+    // ASCII lowercasing keeps byte positions, so they index `html` too.
+    let lower = html.to_ascii_lowercase();
+    let start = lower.find("<title")?;
+    let content = start + lower[start..].find('>')? + 1;
+    let end = content + lower[content..].find("</title")?;
+    let title = clean_line(&decode_entities(&html[content..end]));
+    (!title.is_empty()).then_some(title)
+}
+
+/// Decodes the HTML character references common in titles.
+fn decode_entities(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        rest = &rest[amp..];
+        let decoded = rest.find(';').filter(|&semi| semi <= 10).and_then(|semi| {
+            let name = &rest[1..semi];
+            let c = match name {
+                "amp" => Some('&'),
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                "quot" => Some('"'),
+                "apos" => Some('\''),
+                "nbsp" => Some(' '),
+                _ => name
+                    .strip_prefix("#x")
+                    .or_else(|| name.strip_prefix("#X"))
+                    .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+                    .or_else(|| name.strip_prefix('#').and_then(|dec| dec.parse().ok()))
+                    .and_then(char::from_u32),
+            }?;
+            Some((c, semi + 1))
+        });
+        match decoded {
+            Some((c, len)) => {
+                out.push(c);
+                rest = &rest[len..];
+            }
+            None => {
+                out.push('&');
+                rest = &rest[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 fn clean_line(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -93,6 +144,20 @@ mod tests {
         assert!(!e.text.contains("Copyright"), "text: {}", e.text);
         assert!(!e.truncated);
         assert!(extract(ARTICLE, "https://blog.example.com/ownership", 50).truncated);
+    }
+
+    #[test]
+    fn reads_the_html_title() {
+        assert_eq!(
+            html_title(ARTICLE).as_deref(),
+            Some("Rust ownership explained | Blog")
+        );
+        assert_eq!(
+            html_title("<HTML><Title lang=en>\n  Tom &amp; Jerry &#8211; &quot;Cartoons&quot; &#x2014; ok &bogus;\n</TITLE>").as_deref(),
+            Some("Tom & Jerry – \"Cartoons\" — ok &bogus;")
+        );
+        assert_eq!(html_title("<title>  </title>"), None);
+        assert_eq!(html_title("<p>no title</p>"), None);
     }
 
     #[test]

@@ -81,6 +81,12 @@ enum Command {
         /// Print the final report as JSON instead of text.
         #[arg(long)]
         json: bool,
+        /// Tabs processed at the same time, overriding run.concurrency.
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+        concurrency: Option<u32>,
+        /// Maximum tags per page, overriding tags.max_per_page.
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+        max_tags: Option<u32>,
     },
     /// Rewrite all notes, _tags.md and _index.md from the database.
     Render,
@@ -120,9 +126,17 @@ async fn run(cli: Cli) -> Result<()> {
             max_tokens,
             max_cost,
             json,
+            concurrency,
+            max_tags,
         } => {
             if let Some(model) = model {
                 config.llm.model = model;
+            }
+            if let Some(n) = concurrency {
+                config.run.concurrency = n as usize;
+            }
+            if let Some(n) = max_tags {
+                config.tags.max_per_page = n as usize;
             }
             let filter = filter::Filter::new(&config.filter, &allow, &deny)?;
             let text =
@@ -223,7 +237,7 @@ async fn run(cli: Cli) -> Result<()> {
                 pipeline::process_pending(&mut db, &fetcher, &llm, embeddings.as_mut(), &options).await;
 
             // Render and report whatever was finished, even if the run stopped early.
-            render::render_all(&db, &cli.out)?;
+            render::render_all(&db, &cli.out, config.notes.title)?;
             let mut summary = result?;
             let embed_usage = match (&embedder, &embeddings) {
                 (Some(embedder), Some(e)) => Some((embed::Embedder::usage(embedder), e.errors)),
@@ -257,7 +271,7 @@ async fn run(cli: Cli) -> Result<()> {
                 return Err(err);
             }
         }
-        Command::Render => finish(&open_db(&cli.out)?, &cli.out)?,
+        Command::Render => finish(&open_db(&cli.out)?, &cli.out, &config)?,
         Command::Report { json } => {
             let db = open_db(&cli.out)?;
             match db.latest_run_report()? {
@@ -296,8 +310,8 @@ fn open_db(out: &Path) -> Result<Db> {
 }
 
 /// Renders the notes and prints what's in the archive.
-fn finish(db: &Db, out: &Path) -> Result<()> {
-    let rendered = render::render_all(db, out)?;
+fn finish(db: &Db, out: &Path, config: &Config) -> Result<()> {
+    let rendered = render::render_all(db, out, config.notes.title)?;
     let counts = db.status_counts()?;
     let causes = db.failure_kinds()?;
     if !causes.is_empty() {

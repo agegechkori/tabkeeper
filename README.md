@@ -30,7 +30,7 @@ reasoning_effort = "none"
 
 This writes to `tabkeeper-out/` (change it with `--out`):
 
-- `notes/*.md`: one note per page, with a title, the URL, a short summary and 3–5 tags such as `#rust-programming #memory-safety`. Pages without a summary still get a short stub note saying why, so no tab is lost: `#status/unreachable` when the page can't be loaded (404, dead domain, timeout, blocked), `#status/failed` when it loads but can't be summarized (a PDF, or the model's reply was unusable).
+- `notes/*.md`: one note per page, with a title, the URL, a short summary and 3–5 tags such as `#rust-programming #memory-safety`. The title is the page's own title (as in the browser tab) followed by the model's in parentheses, e.g. `Saffron - Wikipedia (Saffron: Spice from Saffron Crocus)`; `[notes] title` in the config picks one or the other instead. Pages without a summary still get a short stub note saying why, so no tab is lost: `#status/unreachable` when the page can't be loaded (404, dead domain, timeout, blocked), `#status/failed` when it loads but can't be summarized (a PDF, or the model's reply was unusable).
 - `_tags.md`: all tags with page counts
 - `_index.md`: all notes, each listed under its most used tag
 - `_report.md`: the report of the latest run, including every page that failed or couldn't be loaded, and why
@@ -46,7 +46,7 @@ Each run ends with a report: how many tabs were done, unreachable or failed (by 
 
 Before a big run, `--dry-run` shows what would be processed and estimates tokens, cost and time (from your last run, once there is one) without fetching or saving anything. `--max-tokens N` and `--max-cost DOLLARS` stop starting new pages once a limit would be reached; the rest stay pending for the next run. For cloud models, set `price_input_per_mtok` and `price_output_per_mtok` in `[llm]` to see costs.
 
-Useful `import` options: `--lang de` or `--lang original` for summaries in another language (tags stay English), `--limit N` to process only N pages, `--retry-failed` to try failed and unreachable pages again, and `--deny RULE` / `--allow RULE` to skip or limit URLs for one run, e.g. `--deny domain:mail.google.com`. Rules are `domain:`, `glob:`, `regex:` or `prefix:`; permanent ones go in `[filter]` in the config.
+Useful `import` options: `--lang de` or `--lang original` for summaries in another language (tags stay English), `--limit N` to process only N pages, `--concurrency N` for how many tabs are processed at once, `--max-tags N` for the most tags a page gets, `--retry-failed` to try failed and unreachable pages again, and `--deny RULE` / `--allow RULE` to skip or limit URLs for one run, e.g. `--deny domain:mail.google.com`. Rules are `domain:`, `glob:`, `regex:` or `prefix:`; permanent ones go in `[filter]` in the config.
 
 ## License
 
