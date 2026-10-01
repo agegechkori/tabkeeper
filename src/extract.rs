@@ -46,15 +46,29 @@ pub fn html_title(html: &str) -> Option<String> {
     let lower = html.to_ascii_lowercase();
     // Only the document's own title, in <head>: inline SVG icons in the body
     // have <title>s too ("Menu", "Close").
-    let head_end = lower
-        .find("</head")
-        .or_else(|| lower.find("<body"))
+    let head_end = [find_tag(&lower, "</head"), find_tag(&lower, "<body")]
+        .into_iter()
+        .flatten()
+        .min()
         .unwrap_or(lower.len());
     let start = lower[..head_end].find("<title")?;
     let content = start + lower[start..].find('>')? + 1;
     let end = content + lower[content..].find("</title")?;
     let title = clean_line(&decode_entities(&html[content..end]));
     (!title.is_empty()).then_some(title)
+}
+
+/// Where a tag such as `</head` starts, as a whole tag name: not `</header`.
+fn find_tag(lower: &str, tag: &str) -> Option<usize> {
+    let mut from = 0;
+    while let Some(at) = lower[from..].find(tag).map(|i| from + i) {
+        let next = lower[at + tag.len()..].chars().next();
+        if next.is_none_or(|c| c == '>' || c == '/' || c.is_whitespace()) {
+            return Some(at);
+        }
+        from = at + tag.len();
+    }
+    None
 }
 
 /// Decodes the HTML character references common in titles.
@@ -168,6 +182,12 @@ mod tests {
         assert_eq!(html_title(icon_first), None, "an icon's title is not the page's");
         let both = "<head><title>Real Title</title></head><body><svg><title>Menu</title></svg></body>";
         assert_eq!(html_title(both).as_deref(), Some("Real Title"));
+        // No </head> (HTML5 allows that): </header> must not be mistaken for it.
+        let no_head_end =
+            "<head><meta charset=utf-8><body><header><svg><title>Menu</title></svg></header></body>";
+        assert_eq!(html_title(no_head_end), None);
+        let header_first = "<head><title>Real</title><header>x</header></head>";
+        assert_eq!(html_title(header_first).as_deref(), Some("Real"));
         assert_eq!(html_title("<p>no title</p>"), None);
     }
 

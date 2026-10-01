@@ -1223,6 +1223,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_retry_replaces_the_page_title_from_the_earlier_attempt() {
+        let mut db = db_with(&["https://broken.com/x"]);
+        let id = db.pending_pages().unwrap()[0].id;
+        // An earlier attempt loaded the page and stored its title...
+        db.save_failed(
+            id,
+            &PageResult {
+                title: "Foo",
+                summary: "S.",
+                lang: None,
+                tags: &[],
+            },
+            "rejected",
+            "x",
+        )
+        .unwrap();
+        db.set_page_title(id, "Foo").unwrap();
+        // ...but on retry the page is gone: the stub's title is the address.
+        db.retry_failed().unwrap();
+        run(&mut db, &FakeLlm::new(vec![])).await.unwrap();
+        let page = &db.note_pages().unwrap()[0];
+        assert_eq!(
+            (page.title.as_str(), page.page_title.as_deref()),
+            ("broken.com/x", None)
+        );
+    }
+
+    #[tokio::test]
     async fn browser_title_is_used_for_stub_notes() {
         let db = Db::open_in_memory().unwrap();
         db.add_page(

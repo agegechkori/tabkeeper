@@ -328,7 +328,7 @@ impl Db {
         let tx = self.conn.transaction()?;
         tx.execute(
             "UPDATE pages SET status = ?2, error_kind = ?3, error = ?4, title = ?5, summary = ?6, lang = ?7,
-                              processed_at = ?8
+                              processed_at = ?8, page_title = NULL
              WHERE id = ?1",
             params![
                 page_id,
