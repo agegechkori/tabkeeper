@@ -177,7 +177,9 @@ fn meta_charset(head: &[u8]) -> Option<&'static encoding_rs::Encoding> {
         .chars()
         .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':' | '.'))
         .collect();
-    encoding_rs::Encoding::for_label(label.as_bytes())
+    // A page whose bytes were read as ASCII to find this tag can't really be
+    // UTF-16; the HTML standard treats such a declaration as UTF-8.
+    encoding_rs::Encoding::for_label(label.as_bytes()).map(|e| e.output_encoding())
 }
 
 /// 1 s, 2 s, 4 s, …
@@ -328,6 +330,11 @@ mod tests {
         );
 
         assert_eq!(decode_html("héllo".as_bytes(), None), "héllo", "UTF-8 by default");
+        assert_eq!(
+            decode_html("<meta charset=\"utf-16\">héllo".as_bytes(), None),
+            "<meta charset=\"utf-16\">héllo",
+            "a UTF-16 declaration in <meta> means UTF-8"
+        );
         assert_eq!(
             decode_html(b"\xffbad", Some("utf-8")),
             "\u{fffd}bad",

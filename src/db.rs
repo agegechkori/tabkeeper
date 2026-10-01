@@ -197,18 +197,6 @@ impl Db {
         )?)
     }
 
-    /// Makes these pages pending again, e.g. after pages were failed for what
-    /// turned out to be a problem with the model rather than with them.
-    pub fn reset_to_pending(&self, page_ids: &[i64]) -> Result<()> {
-        for id in page_ids {
-            self.conn.execute(
-                "UPDATE pages SET status = 'pending', error = NULL, error_kind = NULL WHERE id = ?1",
-                [id],
-            )?;
-        }
-        Ok(())
-    }
-
     pub fn pending_pages(&self) -> Result<Vec<PendingPage>> {
         let mut stmt = self
             .conn
