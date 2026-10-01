@@ -44,7 +44,13 @@ pub fn extract(html: &str, url: &str, max_chars: usize) -> Extracted {
 pub fn html_title(html: &str) -> Option<String> {
     // ASCII lowercasing keeps byte positions, so they index `html` too.
     let lower = html.to_ascii_lowercase();
-    let start = lower.find("<title")?;
+    // Only the document's own title, in <head>: inline SVG icons in the body
+    // have <title>s too ("Menu", "Close").
+    let head_end = lower
+        .find("</head")
+        .or_else(|| lower.find("<body"))
+        .unwrap_or(lower.len());
+    let start = lower[..head_end].find("<title")?;
     let content = start + lower[start..].find('>')? + 1;
     let end = content + lower[content..].find("</title")?;
     let title = clean_line(&decode_entities(&html[content..end]));
@@ -157,6 +163,11 @@ mod tests {
             Some("Tom & Jerry – \"Cartoons\" — ok &bogus;")
         );
         assert_eq!(html_title("<title>  </title>"), None);
+        let icon_first =
+            "<html><head><meta charset=utf-8></head><body><svg><title>Menu</title></svg></body></html>";
+        assert_eq!(html_title(icon_first), None, "an icon's title is not the page's");
+        let both = "<head><title>Real Title</title></head><body><svg><title>Menu</title></svg></body>";
+        assert_eq!(html_title(both).as_deref(), Some("Real Title"));
         assert_eq!(html_title("<p>no title</p>"), None);
     }
 
