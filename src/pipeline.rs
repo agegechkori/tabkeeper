@@ -180,6 +180,9 @@ pub struct RunOptions<'a> {
     pub budget: Budget,
     /// Print progress to stderr, keeping stdout for a JSON report.
     pub progress_to_stderr: bool,
+    /// Tokens and cost spent before the run by something it doesn't track,
+    /// e.g. an embeddings setup that failed partway; counted toward the budget.
+    pub spent_elsewhere: (u64, f64),
 }
 
 #[cfg(test)]
@@ -211,6 +214,7 @@ pub async fn process_pending<F: Fetcher, L: Llm, E: Embedder>(
         limit,
         budget,
         progress_to_stderr,
+        spent_elsewhere,
     } = *options;
     let mut stats = Stats::default();
     let mut pending = db.pending_pages()?;
@@ -242,6 +246,7 @@ pub async fn process_pending<F: Fetcher, L: Llm, E: Embedder>(
         pages_cut: Cell::new(0),
         model_pages: Cell::new(0),
         spent_before: Cell::new((0, 0.0)),
+        spent_elsewhere,
     };
     run.spent_before.set(run.spent());
     let stats = RefCell::new(stats);
@@ -359,6 +364,7 @@ struct Run<'r, 'e, F, L, E: Embedder> {
     /// Tokens and cost already spent when the pages started, e.g. on filling
     /// in missing vectors; not part of what a page costs.
     spent_before: Cell<(u64, f64)>,
+    spent_elsewhere: (u64, f64),
 }
 
 /// After this many pages in a row fail at the model, the problem is most
@@ -423,7 +429,11 @@ impl<F: Fetcher, L: Llm, E: Embedder> Run<'_, '_, F, L, E> {
             .prices()
             .cost(summaries.input_tokens, summaries.output_tokens)
             + embeddings.input_tokens as f64 * self.config.embeddings.price_per_mtok / 1e6;
-        (summaries.total_tokens() + embeddings.total_tokens(), cost)
+        let (other_tokens, other_cost) = self.spent_elsewhere;
+        (
+            summaries.total_tokens() + embeddings.total_tokens() + other_tokens,
+            cost + other_cost,
+        )
     }
 
     async fn process(&self, page: &PendingPage) -> Outcome {
@@ -968,6 +978,7 @@ mod tests {
                 limit: None,
                 budget: Budget::default(),
                 progress_to_stderr: false,
+                spent_elsewhere: (0, 0.0),
             },
         )
         .await
@@ -988,6 +999,7 @@ mod tests {
                 limit: None,
                 budget: Budget::default(),
                 progress_to_stderr: false,
+                spent_elsewhere: (0, 0.0),
             },
         )
         .await
@@ -1181,6 +1193,7 @@ mod tests {
                 limit: None,
                 budget: Budget::default(),
                 progress_to_stderr: false,
+                spent_elsewhere: (0, 0.0),
             },
         )
         .await
@@ -1228,6 +1241,7 @@ mod tests {
                 limit: None,
                 budget: Budget::default(),
                 progress_to_stderr: false,
+                spent_elsewhere: (0, 0.0),
             },
         )
         .await
@@ -1349,6 +1363,7 @@ mod tests {
                 limit: None,
                 budget: Budget::default(),
                 progress_to_stderr: false,
+                spent_elsewhere: (0, 0.0),
             },
         )
         .await
@@ -1389,6 +1404,7 @@ mod tests {
                 limit: None,
                 budget: Budget::default(),
                 progress_to_stderr: false,
+                spent_elsewhere: (0, 0.0),
             },
         )
         .await
@@ -1465,6 +1481,7 @@ mod tests {
                 limit: None,
                 budget: Budget::default(),
                 progress_to_stderr: false,
+                spent_elsewhere: (0, 0.0),
             },
         )
         .await
@@ -1561,6 +1578,7 @@ mod tests {
             limit: None,
             budget,
             progress_to_stderr: false,
+            spent_elsewhere: (0, 0.0),
         };
         let summary = process_pending(
             &mut db,
@@ -1608,6 +1626,7 @@ mod tests {
                 max_cost: None,
             },
             progress_to_stderr: false,
+            spent_elsewhere: (0, 0.0),
         };
         let summary = process_pending(
             &mut db,
@@ -1653,6 +1672,7 @@ mod tests {
                 max_cost: None,
             },
             progress_to_stderr: false,
+            spent_elsewhere: (0, 0.0),
         };
         let summary = process_pending(
             &mut db,
@@ -1665,6 +1685,46 @@ mod tests {
         .unwrap();
         // Pages cost 100 each, not 2,100: same as without the earlier 2,000.
         assert_eq!(summary.stats.done, 4);
+    }
+
+    #[tokio::test]
+    async fn tokens_spent_elsewhere_count_toward_the_budget() {
+        let urls: Vec<String> = (0..5).map(|i| format!("https://site{i}.com/")).collect();
+        let mut db = db_with(&urls.iter().map(String::as_str).collect::<Vec<_>>());
+        let llm = FakeLlm::new(
+            (0..5)
+                .map(|i| Ok(summary(&format!("P{i}"), &["t"], &[])))
+                .collect(),
+        );
+        let options = RunOptions {
+            config: &Config::default(),
+            lang: &LangMode::English,
+            filter: &Filter::default(),
+            limit: None,
+            budget: Budget {
+                max_tokens: Some(1_150),
+                max_cost: None,
+            },
+            progress_to_stderr: false,
+            // E.g. a failed embeddings setup.
+            spent_elsewhere: (1_000, 0.0),
+        };
+        let summary = process_pending(
+            &mut db,
+            &FakeFetcher,
+            &llm,
+            None::<&mut Embeddings<FakeEmbedder>>,
+            &options,
+        )
+        .await
+        .unwrap();
+        // 1,000 + 100 per page: the second page reaches 1,200 of 1,150.
+        assert_eq!(summary.stats.done, 2);
+        assert!(
+            matches!(&summary.stop, Some(Stop::Budget(reason)) if reason.contains("1200 of 1150")),
+            "{:?}",
+            summary.stop
+        );
     }
 
     #[tokio::test]
@@ -1688,6 +1748,7 @@ mod tests {
                 max_cost: Some(1.5),
             },
             progress_to_stderr: false,
+            spent_elsewhere: (0, 0.0),
         };
         let summary = process_pending(
             &mut db,

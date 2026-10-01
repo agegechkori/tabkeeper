@@ -127,7 +127,7 @@ pub fn dry_run(
 ) -> Result<()> {
     let db_path = out.join("tabkeeper.db");
     let db = if db_path.exists() {
-        Some(Db::open(&db_path)?)
+        Some(Db::open_read_only(&db_path)?)
     } else {
         None
     };

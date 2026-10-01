@@ -84,6 +84,9 @@ CREATE TABLE runs (
 
 pub struct Db {
     conn: Connection,
+    /// Schema version: always the current one, except for a database opened
+    /// read-only, which is never upgraded.
+    version: i32,
 }
 
 #[derive(Debug, Clone)]
@@ -156,6 +159,22 @@ impl Db {
         Self::init(conn)
     }
 
+    /// Opens an existing database for reading only, without upgrading it, for
+    /// --dry-run. Page queries work on every supported version; past runs
+    /// are only there from version 4.
+    pub fn open_read_only(path: &Path) -> Result<Self> {
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .with_context(|| format!("opening {}", path.display()))?;
+        let version: i32 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if !(2..=SCHEMA_VERSION).contains(&version) {
+            bail!(
+                "{} has database schema version {version}, which this tabkeeper can't read",
+                path.display()
+            );
+        }
+        Ok(Self { conn, version })
+    }
+
     #[cfg(test)]
     pub fn open_in_memory() -> Result<Self> {
         Self::init(Connection::open_in_memory()?)
@@ -189,7 +208,10 @@ impl Db {
                 "database schema version {version} is newer than this tabkeeper supports ({SCHEMA_VERSION})"
             );
         }
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            version: SCHEMA_VERSION,
+        })
     }
 
     /// Adds a page to process. Returns false if the URL is already known.
@@ -498,6 +520,9 @@ impl Db {
 
     /// The report of the latest run, as JSON.
     pub fn latest_run_report(&self) -> Result<Option<String>> {
+        if self.version < 4 {
+            return Ok(None);
+        }
         Ok(self
             .conn
             .query_row("SELECT report FROM runs ORDER BY id DESC LIMIT 1", [], |r| {
@@ -819,6 +844,39 @@ mod tests {
             }
         );
         assert_eq!(db.failure_kinds().unwrap(), [("not_found".to_string(), 1)]);
+    }
+
+    #[test]
+    fn read_only_open_reads_older_versions_without_upgrading_them() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        {
+            let conn = Connection::open(file.path()).unwrap();
+            conn.execute_batch(SCHEMA_V2_PAGES).unwrap();
+            conn.execute_batch(SCHEMA).unwrap();
+            conn.execute_batch(
+                "INSERT INTO pages (url, original_url, source, status, added_at)
+                 VALUES ('https://a.com/', 'https://a.com/', 'import', 'pending', 'x');
+                 PRAGMA user_version = 2;",
+            )
+            .unwrap();
+        }
+        let db = Db::open_read_only(file.path()).unwrap();
+        assert_eq!(
+            db.page_status("https://a.com/").unwrap().as_deref(),
+            Some("pending")
+        );
+        assert_eq!(db.urls_with_status(&["pending"]).unwrap(), ["https://a.com/"]);
+        assert_eq!(
+            db.latest_run_report().unwrap(),
+            None,
+            "no runs table before version 4"
+        );
+        drop(db);
+        let conn = Connection::open(file.path()).unwrap();
+        let version: i32 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 2, "the database was not upgraded");
     }
 
     #[test]

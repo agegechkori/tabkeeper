@@ -201,6 +201,12 @@ async fn run(cli: Cli) -> Result<()> {
             }
 
             let budget = pipeline::Budget { max_tokens, max_cost };
+            // An embeddings setup that failed partway still spent tokens: count
+            // them toward the budget, since the run only tracks working embeddings.
+            let failed_setup = match (&embedder, &embeddings) {
+                (Some(embedder), None) => embed::Embedder::usage(embedder),
+                _ => usage::StageUsage::default(),
+            };
             let options = pipeline::RunOptions {
                 config: &config,
                 lang: &lang,
@@ -208,6 +214,10 @@ async fn run(cli: Cli) -> Result<()> {
                 limit,
                 budget,
                 progress_to_stderr: json,
+                spent_elsewhere: (
+                    failed_setup.total_tokens(),
+                    failed_setup.input_tokens as f64 * config.embeddings.price_per_mtok / 1e6,
+                ),
             };
             let result =
                 pipeline::process_pending(&mut db, &fetcher, &llm, embeddings.as_mut(), &options).await;
@@ -217,6 +227,8 @@ async fn run(cli: Cli) -> Result<()> {
             let mut summary = result?;
             let embed_usage = match (&embedder, &embeddings) {
                 (Some(embedder), Some(e)) => Some((embed::Embedder::usage(embedder), e.errors)),
+                // The setup failed: report what it used, and count the failure.
+                (Some(_), None) if failed_setup.requests > 0 => Some((failed_setup.clone(), 1)),
                 _ => None,
             };
             let ctx = report::RunContext {
