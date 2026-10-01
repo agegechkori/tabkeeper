@@ -1,6 +1,7 @@
 mod config;
 mod db;
 mod embed;
+mod estimate;
 mod extract;
 mod fetch;
 mod filter;
@@ -9,8 +10,10 @@ mod llm;
 mod pipeline;
 mod progress;
 mod render;
+mod report;
 mod tags;
 mod urls;
+mod usage;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -63,11 +66,30 @@ enum Command {
         /// Skip URLs matching this rule, e.g. domain:mail.google.com. Can be repeated.
         #[arg(long, value_name = "RULE")]
         deny: Vec<String>,
+        /// Show what would be processed and an estimate of tokens, cost and
+        /// time, without fetching, calling a model or saving anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Stop starting new pages once this many tokens (input plus output)
+        /// have been used.
+        #[arg(long, value_name = "TOKENS")]
+        max_tokens: Option<u64>,
+        /// Stop starting new pages once this many US dollars have been spent,
+        /// using the prices in the config.
+        #[arg(long, value_name = "DOLLARS")]
+        max_cost: Option<f64>,
+        /// Print the final report as JSON instead of text.
+        #[arg(long)]
+        json: bool,
     },
     /// Rewrite all notes, _tags.md and _index.md from the database.
     Render,
-    /// Print the tag tree with page counts.
-    Report,
+    /// Print the report of the latest run.
+    Report {
+        /// Print it as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Show which config file is used, and an example config.
     Config,
 }
@@ -94,6 +116,10 @@ async fn run(cli: Cli) -> Result<()> {
             retry_failed,
             allow,
             deny,
+            dry_run,
+            max_tokens,
+            max_cost,
+            json,
         } => {
             if let Some(model) = model {
                 config.llm.model = model;
@@ -101,32 +127,57 @@ async fn run(cli: Cli) -> Result<()> {
             let filter = filter::Filter::new(&config.filter, &allow, &deny)?;
             let text =
                 std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
+            if dry_run {
+                return estimate::dry_run(&cli.out, &text, &filter, &config, retry_failed, limit);
+            }
+            if max_cost.is_some() && !usage::is_local(&config.llm.base_url) && !config.llm.prices().is_set() {
+                anyhow::bail!(
+                    "--max-cost needs prices: set price_input_per_mtok and price_output_per_mtok in [llm]"
+                );
+            }
+
+            // With --json, stdout is only for the report; everything else goes to stderr.
+            let say = |text: &str| {
+                if json {
+                    eprintln!("{text}")
+                } else {
+                    println!("{text}")
+                }
+            };
+            let started_at = db::now();
+            let started = std::time::Instant::now();
             let mut db = open_db(&cli.out)?;
             let stats = import::import_url_list(&db, &text, &filter)?;
-            println!(
-                "Imported {} new URLs ({} already known, {} skipped by the filter, {} non-web skipped).",
-                stats.added, stats.known, stats.filtered, stats.not_web
-            );
+            say(&format!(
+                "Imported {} new URLs ({} already known, {} duplicates, {} skipped by the filter, {} non-web).",
+                stats.added, stats.known, stats.duplicates, stats.filtered, stats.not_web
+            ));
             for bad in &stats.invalid {
-                println!("Skipped invalid URL: {bad}");
+                say(&format!("Skipped invalid URL: {bad}"));
             }
             if retry_failed {
-                println!("Retrying {} failed and unreachable pages.", db.retry_failed()?);
+                say(&format!(
+                    "Retrying {} failed and unreachable pages.",
+                    db.retry_failed()?
+                ));
             }
 
             let fetcher = fetch::HttpFetcher::new(&config.fetch)?;
             let llm = llm::OpenAiCompatible::new(&config.llm)?;
-            println!("Using model {} at {}.", config.llm.model, config.llm.base_url);
+            say(&format!(
+                "Using model {} at {}.",
+                config.llm.model, config.llm.base_url
+            ));
 
             // Embeddings are optional: any problem setting them up is a warning,
             // and the model is shown the most used tags instead.
             let unavailable = |err: anyhow::Error| {
-                println!(
+                say(&format!(
                     "Warning: embeddings are unavailable ({err:#}).\n\
                      The model will be shown the most used tags instead of the most relevant ones. \
                      If the embedding model is missing on Ollama, run: ollama pull {}",
                     config.embeddings.model
-                )
+                ))
             };
             let embedder = if config.embeddings.enabled {
                 embed::OpenAiEmbedder::new(&config.embeddings, &config.llm)
@@ -139,48 +190,90 @@ async fn run(cli: Cli) -> Result<()> {
             if let Some(embedder) = &embedder {
                 match pipeline::Embeddings::prepare(&db, embedder, config.embeddings.page_chars).await {
                     Ok(e) => {
-                        println!(
+                        say(&format!(
                             "Using embedding model {} to pick relevant tags.",
                             config.embeddings.model
-                        );
+                        ));
                         embeddings = Some(e);
                     }
                     Err(err) => unavailable(err),
                 }
             }
 
+            let budget = pipeline::Budget { max_tokens, max_cost };
+            // An embeddings setup that failed partway still spent tokens: count
+            // them toward the budget, since the run only tracks working embeddings.
+            let failed_setup = match (&embedder, &embeddings) {
+                (Some(embedder), None) => embed::Embedder::usage(embedder),
+                _ => usage::StageUsage::default(),
+            };
             let options = pipeline::RunOptions {
                 config: &config,
                 lang: &lang,
                 filter: &filter,
                 limit,
+                budget,
+                progress_to_stderr: json,
+                spent_elsewhere: (
+                    failed_setup.total_tokens(),
+                    failed_setup.input_tokens as f64 * config.embeddings.price_per_mtok / 1e6,
+                ),
             };
             let result =
                 pipeline::process_pending(&mut db, &fetcher, &llm, embeddings.as_mut(), &options).await;
-            // Render whatever was finished, even if the run stopped early.
-            finish(&db, &cli.out)?;
-            if let Some(errors) = embeddings.as_ref().map(|e| e.errors).filter(|n| *n > 0) {
-                println!("{errors} embedding requests failed; the next run fills in the missing vectors.");
-            }
-            let stats = result?;
-            println!(
-                "This run: {} done, {} unreachable, {} failed (both get stub notes).",
-                stats.done, stats.unreachable, stats.failed
-            );
-            if stats.filtered > 0 {
+
+            // Render and report whatever was finished, even if the run stopped early.
+            render::render_all(&db, &cli.out)?;
+            let mut summary = result?;
+            let embed_usage = match (&embedder, &embeddings) {
+                (Some(embedder), Some(e)) => Some((embed::Embedder::usage(embedder), e.errors)),
+                // The setup failed: report what it used, and count the failure.
+                (Some(_), None) if failed_setup.requests > 0 => Some((failed_setup.clone(), 1)),
+                _ => None,
+            };
+            let ctx = report::RunContext {
+                started_at: &started_at,
+                started,
+                import: Some(&stats),
+                summary: &summary,
+                summaries: llm::Llm::usage(&llm),
+                embeddings: embed_usage,
+                config: &config,
+            };
+            let report = report::build(&db, &ctx).await?;
+            db.save_run(&started_at, &report.finished_at, &serde_json::to_string(&report)?)?;
+            let report_path = cli.out.join("_report.md");
+            std::fs::write(&report_path, report::markdown(&report))?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("\n{}", report::text(&report));
                 println!(
-                    "{} pending pages were skipped by the filter and stay pending.",
-                    stats.filtered
+                    "\nNotes, _index.md and the full report (with every failed page) are in {}.",
+                    cli.out.display()
                 );
+            }
+            if let Some(pipeline::Stop::Error(err)) = summary.stop.take() {
+                return Err(err);
             }
         }
         Command::Render => finish(&open_db(&cli.out)?, &cli.out)?,
-        Command::Report => {
+        Command::Report { json } => {
             let db = open_db(&cli.out)?;
-            print!(
-                "{}",
-                render::report(&tags::count_tree(&db.tags()?, &db.tag_links()?))
-            );
+            match db.latest_run_report()? {
+                Some(saved) if json => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::from_str::<serde_json::Value>(&saved)?)?
+                ),
+                Some(saved) => print!("{}", report::text(&serde_json::from_str(&saved)?)),
+                None => {
+                    println!("No runs recorded yet. Tags so far:\n");
+                    print!(
+                        "{}",
+                        render::report(&tags::count_tree(&db.tags()?, &db.tag_links()?))
+                    );
+                }
+            }
         }
         Command::Config => {
             match (&config_path, config::default_path()) {
@@ -202,13 +295,9 @@ fn open_db(out: &Path) -> Result<Db> {
     Db::open(&out.join("tabkeeper.db"))
 }
 
-/// Renders the notes and prints the tag report and page status.
+/// Renders the notes and prints what's in the archive.
 fn finish(db: &Db, out: &Path) -> Result<()> {
     let rendered = render::render_all(db, out)?;
-    print!(
-        "\n{}",
-        render::report(&tags::count_tree(&db.tags()?, &db.tag_links()?))
-    );
     let counts = db.status_counts()?;
     let causes = db.failure_kinds()?;
     if !causes.is_empty() {

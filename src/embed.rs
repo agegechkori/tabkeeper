@@ -4,6 +4,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 
 use crate::config::{EmbeddingsConfig, LlmConfig};
+use crate::usage::{StageUsage, UsageCounter};
 
 /// Texts sent to the server per embeddings request.
 pub const BATCH_SIZE: usize = 64;
@@ -14,6 +15,11 @@ pub trait Embedder {
     fn model(&self) -> &str;
     /// One unit-length vector per input text, in order.
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
+
+    /// Requests and tokens so far.
+    fn usage(&self) -> StageUsage {
+        StageUsage::default()
+    }
 }
 
 /// Client for the `/embeddings` endpoint of OpenAI-compatible servers
@@ -23,6 +29,7 @@ pub struct OpenAiEmbedder {
     url: String,
     model: String,
     api_key: Option<String>,
+    usage: UsageCounter,
 }
 
 impl OpenAiEmbedder {
@@ -42,6 +49,7 @@ impl OpenAiEmbedder {
             url: format!("{}/embeddings", base_url.trim_end_matches('/')),
             model: config.model.clone(),
             api_key,
+            usage: UsageCounter::default(),
         })
     }
 }
@@ -52,6 +60,8 @@ impl Embedder for OpenAiEmbedder {
     }
 
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        self.usage.update(|u| u.requests += 1);
+        let started = std::time::Instant::now();
         let mut request = self
             .client
             .post(&self.url)
@@ -71,7 +81,18 @@ impl Embedder for OpenAiEmbedder {
                 crate::extract::truncate_chars(text.trim(), 300)
             );
         }
-        parse_embeddings(&text, texts.len())
+        let vectors = parse_embeddings(&text, texts.len())?;
+        if let Ok(value) = serde_json::from_str::<Value>(&text) {
+            self.usage.update(|u| {
+                u.record_response(&value, started.elapsed());
+                u.texts_embedded += texts.len() as u64;
+            });
+        }
+        Ok(vectors)
+    }
+
+    fn usage(&self) -> StageUsage {
+        self.usage.snapshot()
     }
 }
 

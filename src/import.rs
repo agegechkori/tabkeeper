@@ -2,9 +2,16 @@ use crate::db::Db;
 use crate::filter::Filter;
 use crate::urls::{Rejected, normalize};
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct ImportStats {
+    /// URLs in the list.
+    pub listed: usize,
     pub added: usize,
+    /// Repeats within the list, including the same page with different
+    /// tracking parameters or fragments.
+    pub duplicates: usize,
+    /// Already in the archive from an earlier run or import.
     pub known: usize,
     pub filtered: usize,
     pub not_web: usize,
@@ -27,8 +34,11 @@ pub fn parse_url_list(text: &str) -> Vec<(&str, Option<&str>)> {
 /// Adds the list's web URLs to the database, except those the filter excludes.
 pub fn import_url_list(db: &Db, text: &str, filter: &Filter) -> anyhow::Result<ImportStats> {
     let mut stats = ImportStats::default();
+    let mut seen = std::collections::HashSet::new();
     for (raw, title) in parse_url_list(text) {
+        stats.listed += 1;
         match normalize(raw) {
+            Ok(url) if !seen.insert(url.clone()) => stats.duplicates += 1,
             Ok(url) if !filter.allows(&url) => stats.filtered += 1,
             Ok(url) => {
                 if db.add_page(&url, raw, title, "import")? {
@@ -70,13 +80,27 @@ mod tests {
         assert_eq!(
             stats,
             ImportStats {
+                listed: 5,
                 added: 1,
-                known: 1,
+                duplicates: 1,
+                known: 0,
                 filtered: 1,
                 not_web: 1,
                 invalid: vec!["nonsense".into()]
             }
         );
         assert_eq!(db.pending_pages().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn urls_already_in_the_archive_are_known() {
+        let db = Db::open_in_memory().unwrap();
+        let filter = Filter::default();
+        import_url_list(&db, "https://a.com/\n", &filter).unwrap();
+        let stats = import_url_list(&db, "https://a.com/#x\nhttps://b.com/\n", &filter).unwrap();
+        assert_eq!(
+            (stats.listed, stats.added, stats.known, stats.duplicates),
+            (2, 1, 1, 0)
+        );
     }
 }

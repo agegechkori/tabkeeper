@@ -66,6 +66,8 @@ pub struct EmbeddingsConfig {
     /// How much of a page's text is embedded to pick the tags shown to the model.
     pub page_chars: usize,
     pub timeout_secs: u64,
+    /// US dollars per million tokens.
+    pub price_per_mtok: f64,
 }
 
 impl Default for EmbeddingsConfig {
@@ -77,6 +79,7 @@ impl Default for EmbeddingsConfig {
             api_key_env: None,
             page_chars: 2000,
             timeout_secs: 60,
+            price_per_mtok: 0.0,
         }
     }
 }
@@ -115,6 +118,18 @@ pub struct LlmConfig {
     pub retries: u32,
     /// Limit on requests per minute, for cloud APIs; 0 means no limit.
     pub requests_per_minute: u32,
+    /// US dollars per million tokens, for cost estimates and --max-cost.
+    pub price_input_per_mtok: f64,
+    pub price_output_per_mtok: f64,
+}
+
+impl LlmConfig {
+    pub fn prices(&self) -> crate::usage::Prices {
+        crate::usage::Prices {
+            input_per_mtok: self.price_input_per_mtok,
+            output_per_mtok: self.price_output_per_mtok,
+        }
+    }
 }
 
 impl Default for LlmConfig {
@@ -131,6 +146,8 @@ impl Default for LlmConfig {
             extra_body: serde_json::Map::new(),
             retries: 3,
             requests_per_minute: 0,
+            price_input_per_mtok: 0.0,
+            price_output_per_mtok: 0.0,
         }
     }
 }

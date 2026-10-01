@@ -35,22 +35,58 @@ pub struct Stats {
     pub unreachable: usize,
     /// Pending pages the filter excludes; they stay pending.
     pub filtered: usize,
+    /// Pages whose text was cut to fit `llm.max_input_chars`.
+    pub pages_cut: usize,
+    /// Pages that were sent to the model (done, or failed at the model).
+    pub model_pages: usize,
+    /// Unreachable and failed pages of this run by cause, e.g. `not_found`.
+    pub causes: std::collections::BTreeMap<String, usize>,
+}
+
+/// Limits on what a run may spend; it stops starting pages once one is reached.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Budget {
+    /// Input plus output tokens, summaries and embeddings together.
+    pub max_tokens: Option<u64>,
+    /// US dollars, using the prices in the config.
+    pub max_cost: Option<f64>,
+}
+
+/// Why a run ended before all pending pages were processed.
+#[derive(Debug)]
+pub enum Stop {
+    /// A problem that would affect every page; the run should exit with an error.
+    Error(anyhow::Error),
+    /// A --max-tokens or --max-cost limit was reached.
+    Budget(String),
+}
+
+/// What a run did. Returned even when the run stopped early, so it can be
+/// reported.
+#[derive(Debug, Default)]
+pub struct RunSummary {
+    pub stats: Stats,
+    /// Time spent fetching pages, added up over all pages.
+    pub fetch_secs: f64,
+    /// Time spent waiting for summaries, added up over all pages.
+    pub model_secs: f64,
+    pub stop: Option<Stop>,
 }
 
 /// What happened to one page.
 enum Outcome {
     Done(String),
-    /// Saved as a stub note; the string says why.
-    Unreachable(String),
+    /// Saved as a stub note: the cause, and what happened.
+    Unreachable(&'static str, String),
     /// Saved as a stub note and recorded as failed; the page is skipped until
     /// `--retry-failed`.
-    Failed(String),
+    Failed(&'static str, String),
     /// Every page would fail (e.g. the LLM server is down): stop the run. The
     /// page stays pending.
     Fatal(anyhow::Error),
     /// Saved as failed, and the run should stop: too many pages in a row
     /// failed at the model.
-    FailedAndStop(String, anyhow::Error),
+    FailedAndStop(&'static str, String, anyhow::Error),
 }
 
 /// Embeddings for a run: the client plus every tag's vector in memory.
@@ -141,6 +177,23 @@ pub struct RunOptions<'a> {
     pub filter: &'a Filter,
     /// Process at most this many pages.
     pub limit: Option<usize>,
+    pub budget: Budget,
+    /// Print progress to stderr, keeping stdout for a JSON report.
+    pub progress_to_stderr: bool,
+    /// Tokens and cost spent before the run by something it doesn't track,
+    /// e.g. an embeddings setup that failed partway; counted toward the budget.
+    pub spent_elsewhere: (u64, f64),
+}
+
+#[cfg(test)]
+impl RunSummary {
+    /// The counts, or the error if the run stopped on one (a budget stop isn't an error).
+    pub fn into_result(self) -> Result<Stats> {
+        match self.stop {
+            Some(Stop::Error(err)) => Err(err),
+            _ => Ok(self.stats),
+        }
+    }
 }
 
 /// Processes pending pages, several at a time. Each page is saved as soon as
@@ -153,12 +206,15 @@ pub async fn process_pending<F: Fetcher, L: Llm, E: Embedder>(
     llm: &L,
     embeddings: Option<&mut Embeddings<'_, E>>,
     options: &RunOptions<'_>,
-) -> Result<Stats> {
+) -> Result<RunSummary> {
     let RunOptions {
         config,
         lang,
         filter,
         limit,
+        budget,
+        progress_to_stderr,
+        spent_elsewhere,
     } = *options;
     let mut stats = Stats::default();
     let mut pending = db.pending_pages()?;
@@ -171,7 +227,7 @@ pub async fn process_pending<F: Fetcher, L: Llm, E: Embedder>(
         pending.truncate(n);
     }
 
-    let progress = Progress::new(pending.len());
+    let progress = Progress::new(pending.len(), progress_to_stderr);
     let run = Run {
         db: RefCell::new(db),
         fetcher,
@@ -185,9 +241,18 @@ pub async fn process_pending<F: Fetcher, L: Llm, E: Embedder>(
         },
         progress: &progress,
         model_failures: Cell::new(0),
+        fetch_secs: Cell::new(0.0),
+        model_secs: Cell::new(0.0),
+        pages_cut: Cell::new(0),
+        model_pages: Cell::new(0),
+        spent_before: Cell::new((0, 0.0)),
+        spent_elsewhere,
     };
+    run.spent_before.set(run.spent());
     let stats = RefCell::new(stats);
     let fatal: RefCell<Option<(String, anyhow::Error)>> = RefCell::new(None);
+    let budget_stop: RefCell<Option<String>> = RefCell::new(None);
+    let in_flight = Cell::new(0usize);
     let stopped = Cell::new(false);
     let run = &run;
 
@@ -197,26 +262,48 @@ pub async fn process_pending<F: Fetcher, L: Llm, E: Embedder>(
     let (sequential, concurrent) = pending.split_at(first);
     for (pages, concurrency) in [(sequential, 1), (concurrent, config.run.concurrency)] {
         stream::iter(pages)
-            .take_while(|_| ready(!stopped.get()))
-            .map(|page| async move { (page, run.process(page).await) })
+            .take_while(|_| {
+                // Checked before each page starts, so a budget isn't overshot by
+                // everything that was already started.
+                if !stopped.get() && budget_stop.borrow().is_none() {
+                    let finished = {
+                        let s = stats.borrow();
+                        s.done + s.unreachable + s.failed
+                    };
+                    if let Some(reason) = run.over_budget(&budget, in_flight.get(), finished) {
+                        progress.line(&format!("Stopping: {reason}. Pages already started will finish."));
+                        stopped.set(true);
+                        *budget_stop.borrow_mut() = Some(reason);
+                    }
+                }
+                ready(!stopped.get())
+            })
+            .map(|page| {
+                in_flight.set(in_flight.get() + 1);
+                async move { (page, run.process(page).await) }
+            })
             .buffer_unordered(concurrency)
             .for_each(|(page, outcome)| {
+                in_flight.set(in_flight.get() - 1);
                 let mut stats = stats.borrow_mut();
                 let line = match outcome {
                     Outcome::Done(title) => {
                         stats.done += 1;
                         format!("done         {} -> {title}", page.url)
                     }
-                    Outcome::Unreachable(why) => {
+                    Outcome::Unreachable(kind, why) => {
                         stats.unreachable += 1;
+                        *stats.causes.entry(kind.to_string()).or_default() += 1;
                         format!("unreachable  {}: {why}", page.url)
                     }
-                    Outcome::Failed(why) => {
+                    Outcome::Failed(kind, why) => {
                         stats.failed += 1;
+                        *stats.causes.entry(kind.to_string()).or_default() += 1;
                         format!("failed       {}: {why}", page.url)
                     }
-                    Outcome::FailedAndStop(why, stop) => {
+                    Outcome::FailedAndStop(kind, why, stop) => {
                         stats.failed += 1;
+                        *stats.causes.entry(kind.to_string()).or_default() += 1;
                         stopped.set(true);
                         fatal.borrow_mut().get_or_insert((page.url.clone(), stop));
                         format!("failed       {}: {why}", page.url)
@@ -238,14 +325,23 @@ pub async fn process_pending<F: Fetcher, L: Llm, E: Embedder>(
     }
     progress.finish();
 
-    let stats = stats.into_inner();
-    if let Some((url, err)) = fatal.into_inner() {
-        return Err(err.context(format!(
+    let mut stats = stats.into_inner();
+    stats.pages_cut = run.pages_cut.get();
+    stats.model_pages = run.model_pages.get();
+    let stop = match (fatal.into_inner(), budget_stop.into_inner()) {
+        (Some((url, err)), _) => Some(Stop::Error(err.context(format!(
             "stopped at {url} ({} done, {} unreachable, {} failed so far; run again to continue)",
             stats.done, stats.unreachable, stats.failed
-        )));
-    }
-    Ok(stats)
+        )))),
+        (None, Some(reason)) => Some(Stop::Budget(reason)),
+        (None, None) => None,
+    };
+    Ok(RunSummary {
+        stats,
+        fetch_secs: run.fetch_secs.get(),
+        model_secs: run.model_secs.get(),
+        stop,
+    })
 }
 
 /// Shared state of a run. Pages run concurrently on one task, so the database
@@ -261,6 +357,14 @@ struct Run<'r, 'e, F, L, E: Embedder> {
     progress: &'r Progress,
     /// Pages in a row that failed at the model.
     model_failures: Cell<usize>,
+    fetch_secs: Cell<f64>,
+    model_secs: Cell<f64>,
+    pages_cut: Cell<usize>,
+    model_pages: Cell<usize>,
+    /// Tokens and cost already spent when the pages started, e.g. on filling
+    /// in missing vectors; not part of what a page costs.
+    spent_before: Cell<(u64, f64)>,
+    spent_elsewhere: (u64, f64),
 }
 
 /// After this many pages in a row fail at the model, the problem is most
@@ -270,6 +374,68 @@ struct Run<'r, 'e, F, L, E: Embedder> {
 const MODEL_FAILURE_STREAK: usize = 5;
 
 impl<F: Fetcher, L: Llm, E: Embedder> Run<'_, '_, F, L, E> {
+    /// Whether starting another page could cross a budget limit: the tokens
+    /// and cost so far, plus what the `in_flight` pages will likely add at
+    /// the average of the `finished` ones.
+    fn over_budget(&self, budget: &Budget, in_flight: usize, finished: usize) -> Option<String> {
+        let (tokens, cost) = self.spent();
+        let (tokens_before, cost_before) = self.spent_before.get();
+        // What the running pages will likely add, at the average of the
+        // finished ones, not counting what was spent before pages started.
+        let still_running = |used: f64| match finished {
+            0 => 0.0,
+            n => used / n as f64 * in_flight as f64,
+        };
+        let (tokens_by_pages, cost_by_pages) = ((tokens - tokens_before) as f64, cost - cost_before);
+        if let Some(max) = budget.max_tokens {
+            if tokens >= max {
+                return Some(format!("the token limit was reached ({tokens} of {max})"));
+            }
+            let coming = still_running(tokens_by_pages);
+            if tokens as f64 + coming >= max as f64 {
+                return Some(format!(
+                    "the token limit would be reached by the pages already running ({tokens} used, about {coming:.0} \
+                     more coming, limit {max})"
+                ));
+            }
+        }
+        if let Some(max) = budget.max_cost {
+            if cost >= max {
+                return Some(format!("the cost limit was reached (${cost:.2} of ${max:.2})"));
+            }
+            let coming = still_running(cost_by_pages);
+            if cost + coming >= max {
+                return Some(format!(
+                    "the cost limit would be reached by the pages already running (${cost:.2} spent, about \
+                     ${coming:.2} more coming, limit ${max:.2})"
+                ));
+            }
+        }
+        None
+    }
+
+    /// Tokens and cost of the run so far, summaries and embeddings together.
+    fn spent(&self) -> (u64, f64) {
+        let summaries = self.llm.usage();
+        let embeddings = self
+            .embeddings
+            .borrow()
+            .as_deref()
+            .map(|e| e.embedder.usage())
+            .unwrap_or_default();
+        let cost = self
+            .config
+            .llm
+            .prices()
+            .cost(summaries.input_tokens, summaries.output_tokens)
+            + embeddings.input_tokens as f64 * self.config.embeddings.price_per_mtok / 1e6;
+        let (other_tokens, other_cost) = self.spent_elsewhere;
+        (
+            summaries.total_tokens() + embeddings.total_tokens() + other_tokens,
+            cost + other_cost,
+        )
+    }
+
     async fn process(&self, page: &PendingPage) -> Outcome {
         match self.try_process(page).await {
             Ok(outcome) => outcome,
@@ -281,21 +447,28 @@ impl<F: Fetcher, L: Llm, E: Embedder> Run<'_, '_, F, L, E> {
     async fn try_process(&self, page: &PendingPage) -> Result<Outcome> {
         let fetched = {
             let _permit = self.domains.acquire(&page.url).await;
-            self.fetcher.fetch(&page.url).await
+            let started = std::time::Instant::now();
+            let fetched = self.fetcher.fetch(&page.url).await;
+            self.fetch_secs
+                .set(self.fetch_secs.get() + started.elapsed().as_secs_f64());
+            fetched
         };
         let fetched = match fetched {
             Ok(fetched) => fetched,
             Err(err) if err.kind.is_unreachable() => {
                 self.save_stub(page, Stub::Unreachable, err.kind.as_str(), &err.message)?;
-                return Ok(Outcome::Unreachable(err.message));
+                return Ok(Outcome::Unreachable(err.kind.as_str(), err.message));
             }
             Err(err) => {
                 self.save_stub(page, Stub::Failed, err.kind.as_str(), &err.message)?;
-                return Ok(Outcome::Failed(err.message));
+                return Ok(Outcome::Failed(err.kind.as_str(), err.message));
             }
         };
 
         let extracted = extract(&fetched.html, &fetched.final_url, self.config.llm.max_input_chars);
+        if extracted.truncated {
+            self.pages_cut.set(self.pages_cut.get() + 1);
+        }
         let title = [Some(extracted.title.as_str()), page.browser_title.as_deref()]
             .into_iter()
             .flatten()
@@ -315,7 +488,12 @@ impl<F: Fetcher, L: Llm, E: Embedder> Run<'_, '_, F, L, E> {
             vocabulary: &vocabulary,
             tags: &self.config.tags,
         };
-        let summary = match self.llm.summarize(&request).await {
+        self.model_pages.set(self.model_pages.get() + 1);
+        let started = std::time::Instant::now();
+        let result = self.llm.summarize(&request).await;
+        self.model_secs
+            .set(self.model_secs.get() + started.elapsed().as_secs_f64());
+        let summary = match result {
             Ok(summary) => {
                 self.model_failures.set(0);
                 summary
@@ -335,9 +513,9 @@ impl<F: Fetcher, L: Llm, E: Embedder> Run<'_, '_, F, L, E> {
                          e.g. a parameter the server doesn't accept, or a model that has stopped responding. \
                          Fix it and run again with --retry-failed to retry the failed pages"
                     );
-                    return Ok(Outcome::FailedAndStop(message, stop));
+                    return Ok(Outcome::FailedAndStop(rejected.kind, message, stop));
                 }
-                return Ok(Outcome::Failed(message));
+                return Ok(Outcome::Failed(rejected.kind, message));
             }
         };
 
@@ -608,6 +786,8 @@ mod tests {
 
     use anyhow::bail;
 
+    use std::collections::BTreeMap;
+
     use super::*;
     use crate::fetch::{FetchError, FetchErrorKind, FetchedPage};
     use crate::llm::NewTag;
@@ -670,6 +850,17 @@ mod tests {
                 Ok(s) => Ok(s),
                 Err("reject") => Err(PageRejected::rejected("too long".into()).into()),
                 Err(other) => bail!("{other}"),
+            }
+        }
+
+        /// 80 input and 20 output tokens per request.
+        fn usage(&self) -> crate::usage::StageUsage {
+            let requests = self.seen_vocab.borrow().len() as u64;
+            crate::usage::StageUsage {
+                requests,
+                input_tokens: 80 * requests,
+                output_tokens: 20 * requests,
+                ..Default::default()
             }
         }
     }
@@ -785,9 +976,13 @@ mod tests {
                 lang: &LangMode::English,
                 filter: &Filter::default(),
                 limit: None,
+                budget: Budget::default(),
+                progress_to_stderr: false,
+                spent_elsewhere: (0, 0.0),
             },
         )
         .await
+        .and_then(RunSummary::into_result)
     }
 
     async fn run_with_embeddings(db: &mut Db, llm: &FakeLlm, config: &Config) -> Result<Stats> {
@@ -802,9 +997,13 @@ mod tests {
                 lang: &LangMode::English,
                 filter: &Filter::default(),
                 limit: None,
+                budget: Budget::default(),
+                progress_to_stderr: false,
+                spent_elsewhere: (0, 0.0),
             },
         )
         .await
+        .and_then(RunSummary::into_result)
     }
 
     fn page_tag_names(db: &Db) -> Vec<String> {
@@ -840,6 +1039,8 @@ mod tests {
             Stats {
                 done: 2,
                 unreachable: 1,
+                causes: BTreeMap::from([("not_found".into(), 1)]),
+                model_pages: 2,
                 ..Stats::default()
             }
         );
@@ -887,6 +1088,8 @@ mod tests {
             stats,
             Stats {
                 failed: 2,
+                causes: BTreeMap::from([("rejected".into(), 1), ("unsupported_type".into(), 1)]),
+                model_pages: 1,
                 ..Stats::default()
             }
         );
@@ -988,15 +1191,21 @@ mod tests {
                 lang: &LangMode::English,
                 filter: &filter,
                 limit: None,
+                budget: Budget::default(),
+                progress_to_stderr: false,
+                spent_elsewhere: (0, 0.0),
             },
         )
         .await
+        .unwrap()
+        .into_result()
         .unwrap();
         assert_eq!(
             stats,
             Stats {
                 done: 1,
                 filtered: 1,
+                model_pages: 1,
                 ..Stats::default()
             }
         );
@@ -1030,14 +1239,20 @@ mod tests {
                 lang: &LangMode::English,
                 filter: &Filter::default(),
                 limit: None,
+                budget: Budget::default(),
+                progress_to_stderr: false,
+                spent_elsewhere: (0, 0.0),
             },
         )
         .await
+        .unwrap()
+        .into_result()
         .unwrap();
         assert_eq!(
             stats,
             Stats {
                 done: 12,
+                model_pages: 12,
                 ..Stats::default()
             }
         );
@@ -1146,14 +1361,20 @@ mod tests {
                 lang: &LangMode::English,
                 filter: &Filter::default(),
                 limit: None,
+                budget: Budget::default(),
+                progress_to_stderr: false,
+                spent_elsewhere: (0, 0.0),
             },
         )
         .await
+        .unwrap()
+        .into_result()
         .unwrap();
         assert_eq!(
             stats,
             Stats {
                 done: 2,
+                model_pages: 2,
                 ..Stats::default()
             }
         );
@@ -1181,14 +1402,20 @@ mod tests {
                 lang: &LangMode::English,
                 filter: &Filter::default(),
                 limit: None,
+                budget: Budget::default(),
+                progress_to_stderr: false,
+                spent_elsewhere: (0, 0.0),
             },
         )
         .await
+        .unwrap()
+        .into_result()
         .unwrap();
         assert_eq!(
             stats,
             Stats {
                 done: 2,
+                model_pages: 2,
                 ..Stats::default()
             }
         );
@@ -1252,9 +1479,14 @@ mod tests {
                 lang: &LangMode::English,
                 filter: &Filter::default(),
                 limit: None,
+                budget: Budget::default(),
+                progress_to_stderr: false,
+                spent_elsewhere: (0, 0.0),
             },
         )
         .await
+        .unwrap()
+        .into_result()
         .unwrap();
         assert_eq!(embeddings.errors, 1);
         // With room for one tag, the second rust page was shown rust-programming,
@@ -1298,6 +1530,7 @@ mod tests {
             run(&mut db, &llm).await.unwrap(),
             Stats {
                 done: 2,
+                model_pages: 2,
                 ..Stats::default()
             }
         );
@@ -1318,8 +1551,219 @@ mod tests {
             Stats {
                 done: 1,
                 failed: 8,
+                causes: BTreeMap::from([("rejected".into(), 8)]),
+                model_pages: 9,
                 ..Stats::default()
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_budget_stops_starting_pages() {
+        let urls: Vec<String> = (0..6).map(|i| format!("https://site{i}.com/")).collect();
+        let mut db = db_with(&urls.iter().map(String::as_str).collect::<Vec<_>>());
+        let llm = FakeLlm::new(
+            (0..6)
+                .map(|i| Ok(summary(&format!("P{i}"), &["t"], &[])))
+                .collect(),
+        );
+        let budget = Budget {
+            max_tokens: Some(250),
+            max_cost: None,
+        };
+        let options = RunOptions {
+            config: &Config::default(),
+            lang: &LangMode::English,
+            filter: &Filter::default(),
+            limit: None,
+            budget,
+            progress_to_stderr: false,
+            spent_elsewhere: (0, 0.0),
+        };
+        let summary = process_pending(
+            &mut db,
+            &FakeFetcher,
+            &llm,
+            None::<&mut Embeddings<FakeEmbedder>>,
+            &options,
+        )
+        .await
+        .unwrap();
+        // 100 tokens per page: the third page reaches 300 of 250.
+        assert_eq!(summary.stats.done, 3);
+        assert!(
+            matches!(&summary.stop, Some(Stop::Budget(reason)) if reason.contains("300 of 250")),
+            "{:?}",
+            summary.stop
+        );
+        assert_eq!(
+            db.status_counts().unwrap().pending,
+            3,
+            "the rest is left for the next run"
+        );
+        assert!(summary.into_result().is_ok(), "a budget stop is not an error");
+    }
+
+    #[tokio::test]
+    async fn a_budget_counts_the_pages_already_running() {
+        let urls: Vec<String> = (0..8).map(|i| format!("https://site{i}.com/")).collect();
+        let mut db = db_with(&urls.iter().map(String::as_str).collect::<Vec<_>>());
+        let llm = FakeLlm::new(
+            (0..8)
+                .map(|i| Ok(summary(&format!("P{i}"), &["t"], &[])))
+                .collect(),
+        );
+        let mut config = Config::default();
+        config.run.sequential_start = 1;
+        config.run.concurrency = 4;
+        let options = RunOptions {
+            config: &config,
+            lang: &LangMode::English,
+            filter: &Filter::default(),
+            limit: None,
+            budget: Budget {
+                max_tokens: Some(350),
+                max_cost: None,
+            },
+            progress_to_stderr: false,
+            spent_elsewhere: (0, 0.0),
+        };
+        let summary = process_pending(
+            &mut db,
+            &FakeFetcher,
+            &llm,
+            None::<&mut Embeddings<FakeEmbedder>>,
+            &options,
+        )
+        .await
+        .unwrap();
+        // After the first page (100 tokens), pages start while 100 used plus
+        // 100 for each page running stays under 350: three more, not seven.
+        assert_eq!(summary.stats.done, 4);
+        assert!(
+            matches!(&summary.stop, Some(Stop::Budget(reason)) if reason.contains("pages already running")),
+            "{:?}",
+            summary.stop
+        );
+        assert_eq!(db.status_counts().unwrap().pending, 4);
+    }
+
+    #[tokio::test]
+    async fn tokens_spent_before_pages_start_dont_inflate_the_projection() {
+        let urls: Vec<String> = (0..8).map(|i| format!("https://site{i}.com/")).collect();
+        let mut db = db_with(&urls.iter().map(String::as_str).collect::<Vec<_>>());
+        let llm = FakeLlm::new(
+            (0..8)
+                .map(|i| Ok(summary(&format!("P{i}"), &["t"], &[])))
+                .collect(),
+        );
+        // 2,000 tokens already used before the first page, like filling in vectors.
+        llm.seen_vocab.borrow_mut().extend((0..20).map(|_| String::new()));
+        let mut config = Config::default();
+        config.run.sequential_start = 1;
+        config.run.concurrency = 4;
+        let options = RunOptions {
+            config: &config,
+            lang: &LangMode::English,
+            filter: &Filter::default(),
+            limit: None,
+            budget: Budget {
+                max_tokens: Some(2_350),
+                max_cost: None,
+            },
+            progress_to_stderr: false,
+            spent_elsewhere: (0, 0.0),
+        };
+        let summary = process_pending(
+            &mut db,
+            &FakeFetcher,
+            &llm,
+            None::<&mut Embeddings<FakeEmbedder>>,
+            &options,
+        )
+        .await
+        .unwrap();
+        // Pages cost 100 each, not 2,100: same as without the earlier 2,000.
+        assert_eq!(summary.stats.done, 4);
+    }
+
+    #[tokio::test]
+    async fn tokens_spent_elsewhere_count_toward_the_budget() {
+        let urls: Vec<String> = (0..5).map(|i| format!("https://site{i}.com/")).collect();
+        let mut db = db_with(&urls.iter().map(String::as_str).collect::<Vec<_>>());
+        let llm = FakeLlm::new(
+            (0..5)
+                .map(|i| Ok(summary(&format!("P{i}"), &["t"], &[])))
+                .collect(),
+        );
+        let options = RunOptions {
+            config: &Config::default(),
+            lang: &LangMode::English,
+            filter: &Filter::default(),
+            limit: None,
+            budget: Budget {
+                max_tokens: Some(1_150),
+                max_cost: None,
+            },
+            progress_to_stderr: false,
+            // E.g. a failed embeddings setup.
+            spent_elsewhere: (1_000, 0.0),
+        };
+        let summary = process_pending(
+            &mut db,
+            &FakeFetcher,
+            &llm,
+            None::<&mut Embeddings<FakeEmbedder>>,
+            &options,
+        )
+        .await
+        .unwrap();
+        // 1,000 + 100 per page: the second page reaches 1,200 of 1,150.
+        assert_eq!(summary.stats.done, 2);
+        assert!(
+            matches!(&summary.stop, Some(Stop::Budget(reason)) if reason.contains("1200 of 1150")),
+            "{:?}",
+            summary.stop
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cost_budget_uses_the_configured_prices() {
+        let mut db = db_with(&["https://a.com/", "https://b.com/", "https://c.com/"]);
+        let llm = FakeLlm::new(
+            (0..3)
+                .map(|i| Ok(summary(&format!("P{i}"), &["t"], &[])))
+                .collect(),
+        );
+        let mut config = Config::default();
+        // $10,000 per million input tokens: 80 tokens cost $0.80.
+        config.llm.price_input_per_mtok = 10_000.0;
+        let options = RunOptions {
+            config: &config,
+            lang: &LangMode::English,
+            filter: &Filter::default(),
+            limit: None,
+            budget: Budget {
+                max_tokens: None,
+                max_cost: Some(1.5),
+            },
+            progress_to_stderr: false,
+            spent_elsewhere: (0, 0.0),
+        };
+        let summary = process_pending(
+            &mut db,
+            &FakeFetcher,
+            &llm,
+            None::<&mut Embeddings<FakeEmbedder>>,
+            &options,
+        )
+        .await
+        .unwrap();
+        assert_eq!(summary.stats.done, 2);
+        assert!(
+            matches!(&summary.stop, Some(Stop::Budget(reason)) if reason.contains("$1.60 of $1.50")),
+            "{:?}",
+            summary.stop
         );
     }
 
