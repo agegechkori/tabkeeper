@@ -5,7 +5,11 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::tags::TagRow;
 
-const SCHEMA_VERSION: i32 = 4;
+const SCHEMA_VERSION: i32 = 5;
+
+/// Added in version 5: the page's own title, as in the browser tab or its
+/// HTML <title>, shown next to the model's title.
+const PAGE_TITLE_COLUMN: &str = "ALTER TABLE pages ADD COLUMN page_title TEXT;";
 
 const PAGES_TABLE: &str = "
 CREATE TABLE pages (
@@ -101,7 +105,10 @@ pub struct DonePage {
     pub id: i64,
     pub url: String,
     pub source: String,
+    /// The model's title, or for a stub note the page's own title or address.
     pub title: String,
+    /// The page's own title: the one saved with the link, or its HTML <title>.
+    pub page_title: Option<String>,
     pub summary: String,
     pub lang: Option<String>,
     pub note_file: Option<String>,
@@ -114,6 +121,9 @@ pub struct PageResult<'a> {
     pub lang: Option<&'a str>,
     /// (raw tag as returned by the model, resolved tag id)
     pub tags: &'a [(String, i64)],
+    /// The page's own title, if this attempt found one; saved in the same
+    /// update, so a page is never left done without it.
+    pub page_title: Option<&'a str>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -185,7 +195,9 @@ impl Db {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         let mut version: i32 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
         if version == 0 {
-            conn.execute_batch(&format!("BEGIN; {PAGES_TABLE} {SCHEMA} {RUNS_TABLE} COMMIT;"))?;
+            conn.execute_batch(&format!(
+                "BEGIN; {PAGES_TABLE} {PAGE_TITLE_COLUMN} {SCHEMA} {RUNS_TABLE} COMMIT;"
+            ))?;
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             version = SCHEMA_VERSION;
         }
@@ -202,6 +214,12 @@ impl Db {
         if version == 3 {
             conn.execute_batch(&format!("BEGIN; {RUNS_TABLE} PRAGMA user_version = 4; COMMIT;"))?;
             version = 4;
+        }
+        if version == 4 {
+            conn.execute_batch(&format!(
+                "BEGIN; {PAGE_TITLE_COLUMN} PRAGMA user_version = 5; COMMIT;"
+            ))?;
+            version = 5;
         }
         if version != SCHEMA_VERSION {
             bail!(
@@ -313,7 +331,7 @@ impl Db {
         let tx = self.conn.transaction()?;
         tx.execute(
             "UPDATE pages SET status = ?2, error_kind = ?3, error = ?4, title = ?5, summary = ?6, lang = ?7,
-                              processed_at = ?8
+                              processed_at = ?8, page_title = ?9
              WHERE id = ?1",
             params![
                 page_id,
@@ -323,7 +341,8 @@ impl Db {
                 result.title,
                 result.summary,
                 result.lang,
-                now()
+                now(),
+                result.page_title
             ],
         )?;
         tx.execute("DELETE FROM page_tags WHERE page_id = ?1", [page_id])?;
@@ -416,7 +435,7 @@ impl Db {
     pub fn note_pages(&self) -> Result<Vec<DonePage>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, url, source, ifnull(title, url), ifnull(summary, ''), lang, note_file,
-                    ifnull(processed_at, added_at)
+                    ifnull(processed_at, added_at), ifnull(page_title, browser_title)
              FROM pages WHERE status != 'pending' ORDER BY id",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -429,6 +448,7 @@ impl Db {
                 lang: r.get(5)?,
                 note_file: r.get(6)?,
                 processed_at: r.get(7)?,
+                page_title: r.get(8)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -539,6 +559,15 @@ impl Db {
             Ok((key, usize::try_from(n)?))
         })
         .collect()
+    }
+
+    #[cfg(test)]
+    pub fn set_page_title(&self, page_id: i64, title: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE pages SET page_title = ?2 WHERE id = ?1",
+            params![page_id, title],
+        )?;
+        Ok(())
     }
 
     pub fn set_note_file(&self, page_id: i64, file: &str) -> Result<()> {
@@ -694,6 +723,7 @@ mod tests {
                 summary: "S",
                 lang: Some("en"),
                 tags: &first,
+                page_title: None,
             },
         )
         .unwrap();
@@ -705,6 +735,7 @@ mod tests {
                 summary: "S",
                 lang: None,
                 tags: &second,
+                page_title: None,
             },
         )
         .unwrap();
@@ -757,6 +788,7 @@ mod tests {
                 summary: "S.",
                 lang: None,
                 tags: &[],
+                page_title: None,
             },
         )
         .unwrap();
@@ -832,6 +864,7 @@ mod tests {
             summary: "Unreachable.",
             lang: None,
             tags: &[],
+            page_title: None,
         };
         db.save_unreachable(8, &stub, "not_found", "HTTP 404").unwrap();
         assert_eq!(

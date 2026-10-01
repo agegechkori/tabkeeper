@@ -40,6 +40,77 @@ pub fn extract(html: &str, url: &str, max_chars: usize) -> Extracted {
     }
 }
 
+/// The page's `<title>`, as a browser tab shows it.
+pub fn html_title(html: &str) -> Option<String> {
+    // ASCII lowercasing keeps byte positions, so they index `html` too.
+    let lower = html.to_ascii_lowercase();
+    // Only the document's own title, in <head>: inline SVG icons in the body
+    // have <title>s too ("Menu", "Close").
+    let head_end = [find_tag(&lower, "</head"), find_tag(&lower, "<body")]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(lower.len());
+    let start = lower[..head_end].find("<title")?;
+    let content = start + lower[start..].find('>')? + 1;
+    let end = content + lower[content..].find("</title")?;
+    let title = clean_line(&decode_entities(&html[content..end]));
+    (!title.is_empty()).then_some(title)
+}
+
+/// Where a tag such as `</head` starts, as a whole tag name: not `</header`.
+fn find_tag(lower: &str, tag: &str) -> Option<usize> {
+    let mut from = 0;
+    while let Some(at) = lower[from..].find(tag).map(|i| from + i) {
+        let next = lower[at + tag.len()..].chars().next();
+        if next.is_none_or(|c| c == '>' || c == '/' || c.is_whitespace()) {
+            return Some(at);
+        }
+        from = at + tag.len();
+    }
+    None
+}
+
+/// Decodes the HTML character references common in titles.
+fn decode_entities(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        rest = &rest[amp..];
+        let decoded = rest.find(';').filter(|&semi| semi <= 10).and_then(|semi| {
+            let name = &rest[1..semi];
+            let c = match name {
+                "amp" => Some('&'),
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                "quot" => Some('"'),
+                "apos" => Some('\''),
+                "nbsp" => Some(' '),
+                _ => name
+                    .strip_prefix("#x")
+                    .or_else(|| name.strip_prefix("#X"))
+                    .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+                    .or_else(|| name.strip_prefix('#').and_then(|dec| dec.parse().ok()))
+                    .and_then(char::from_u32),
+            }?;
+            Some((c, semi + 1))
+        });
+        match decoded {
+            Some((c, len)) => {
+                out.push(c);
+                rest = &rest[len..];
+            }
+            None => {
+                out.push('&');
+                rest = &rest[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 fn clean_line(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -93,6 +164,31 @@ mod tests {
         assert!(!e.text.contains("Copyright"), "text: {}", e.text);
         assert!(!e.truncated);
         assert!(extract(ARTICLE, "https://blog.example.com/ownership", 50).truncated);
+    }
+
+    #[test]
+    fn reads_the_html_title() {
+        assert_eq!(
+            html_title(ARTICLE).as_deref(),
+            Some("Rust ownership explained | Blog")
+        );
+        assert_eq!(
+            html_title("<HTML><Title lang=en>\n  Tom &amp; Jerry &#8211; &quot;Cartoons&quot; &#x2014; ok &bogus;\n</TITLE>").as_deref(),
+            Some("Tom & Jerry – \"Cartoons\" — ok &bogus;")
+        );
+        assert_eq!(html_title("<title>  </title>"), None);
+        let icon_first =
+            "<html><head><meta charset=utf-8></head><body><svg><title>Menu</title></svg></body></html>";
+        assert_eq!(html_title(icon_first), None, "an icon's title is not the page's");
+        let both = "<head><title>Real Title</title></head><body><svg><title>Menu</title></svg></body>";
+        assert_eq!(html_title(both).as_deref(), Some("Real Title"));
+        // No </head> (HTML5 allows that): </header> must not be mistaken for it.
+        let no_head_end =
+            "<head><meta charset=utf-8><body><header><svg><title>Menu</title></svg></header></body>";
+        assert_eq!(html_title(no_head_end), None);
+        let header_first = "<head><title>Real</title><header>x</header></head>";
+        assert_eq!(html_title(header_first).as_deref(), Some("Real"));
+        assert_eq!(html_title("<p>no title</p>"), None);
     }
 
     #[test]

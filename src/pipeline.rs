@@ -10,7 +10,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use crate::config::{Config, TagConfig};
 use crate::db::{Db, EmbeddingKind, PageResult, PendingPage, page_embedding_text, tag_embedding_text};
 use crate::embed::{BATCH_SIZE, Embedder, TagIndex};
-use crate::extract::{extract, truncate_chars};
+use crate::extract::{extract, html_title, truncate_chars};
 use crate::fetch::Fetcher;
 use crate::filter::Filter;
 use crate::llm::{LangMode, Llm, PageRejected, PageSummary, SummaryRequest};
@@ -456,16 +456,26 @@ impl<F: Fetcher, L: Llm, E: Embedder> Run<'_, '_, F, L, E> {
         let fetched = match fetched {
             Ok(fetched) => fetched,
             Err(err) if err.kind.is_unreachable() => {
-                self.save_stub(page, Stub::Unreachable, err.kind.as_str(), &err.message)?;
+                self.save_stub(page, Stub::Unreachable, err.kind.as_str(), &err.message, None)?;
                 return Ok(Outcome::Unreachable(err.kind.as_str(), err.message));
             }
             Err(err) => {
-                self.save_stub(page, Stub::Failed, err.kind.as_str(), &err.message)?;
+                self.save_stub(page, Stub::Failed, err.kind.as_str(), &err.message, None)?;
                 return Ok(Outcome::Failed(err.kind.as_str(), err.message));
             }
         };
 
         let extracted = extract(&fetched.html, &fetched.final_url, self.config.llm.max_input_chars);
+        // The page's own title, as the tab shows it: the one saved with the
+        // link if there is one, else the HTML <title>.
+        let html_page_title = html_title(&fetched.html);
+        let page_title = page
+            .browser_title
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+            .or_else(|| html_page_title.clone());
         if extracted.truncated {
             self.pages_cut.set(self.pages_cut.get() + 1);
         }
@@ -503,7 +513,13 @@ impl<F: Fetcher, L: Llm, E: Embedder> Run<'_, '_, F, L, E> {
                     return Err(err.context("LLM request failed"));
                 };
                 let message = format!("{err:#}");
-                self.save_stub(page, Stub::Failed, rejected.kind, &message)?;
+                self.save_stub(
+                    page,
+                    Stub::Failed,
+                    rejected.kind,
+                    &message,
+                    html_page_title.as_deref(),
+                )?;
                 let streak = self.model_failures.get() + 1;
                 self.model_failures.set(streak);
                 if streak >= MODEL_FAILURE_STREAK {
@@ -532,6 +548,7 @@ impl<F: Fetcher, L: Llm, E: Embedder> Run<'_, '_, F, L, E> {
                 summary: text,
                 lang: (!language.is_empty()).then_some(language.as_str()),
                 tags: &page_tags,
+                page_title: page_title.as_deref(),
             };
             db.save_result(page.id, &result).context("saving result")?;
             created
@@ -543,7 +560,15 @@ impl<F: Fetcher, L: Llm, E: Embedder> Run<'_, '_, F, L, E> {
     /// Saves a stub note for a page without a summary, so every tab still
     /// shows up in the archive: a title, a sentence saying why, and a
     /// reserved status tag.
-    fn save_stub(&self, page: &PendingPage, stub: Stub, kind: &str, message: &str) -> Result<()> {
+    /// `html_title` is the page's own `<title>`, when the page loaded.
+    fn save_stub(
+        &self,
+        page: &PendingPage,
+        stub: Stub,
+        kind: &str,
+        message: &str,
+        html_title: Option<&str>,
+    ) -> Result<()> {
         let (tag_name, tag_description, not_what) = match stub {
             Stub::Unreachable => (UNREACHABLE_TAG, "Pages that could not be loaded", "loaded"),
             Stub::Failed => (
@@ -552,14 +577,15 @@ impl<F: Fetcher, L: Llm, E: Embedder> Run<'_, '_, F, L, E> {
                 "summarized",
             ),
         };
-        let (title, title_note) = match page
+        let saved = page
             .browser_title
             .as_deref()
             .map(str::trim)
-            .filter(|t| !t.is_empty())
-        {
-            Some(title) => (title.to_string(), "The title is the one saved with the link."),
-            None => (
+            .filter(|t| !t.is_empty());
+        let (title, title_note) = match (saved, html_title) {
+            (Some(saved), _) => (saved.to_string(), "The title is the one saved with the link."),
+            (None, Some(own)) => (own.to_string(), "The title is the page's own."),
+            (None, None) => (
                 page.url
                     .split_once("://")
                     .map_or(page.url.as_str(), |(_, rest)| rest)
@@ -581,11 +607,13 @@ impl<F: Fetcher, L: Llm, E: Embedder> Run<'_, '_, F, L, E> {
             summary: &summary,
             lang: None,
             tags: &tags,
+            page_title: saved.or(html_title),
         };
         match stub {
-            Stub::Unreachable => db.save_unreachable(page.id, &result, kind, message),
-            Stub::Failed => db.save_failed(page.id, &result, kind, message),
+            Stub::Unreachable => db.save_unreachable(page.id, &result, kind, message)?,
+            Stub::Failed => db.save_failed(page.id, &result, kind, message)?,
         }
+        Ok(())
     }
 
     /// The existing tags to show the model: the most similar to the page, or
@@ -1114,6 +1142,14 @@ mod tests {
             "{}",
             pages[1].summary
         );
+        // The page loaded, so its stub has the page's own title, not the address.
+        assert_eq!(pages[1].title, "Page https://b.com/");
+        assert_eq!(pages[1].page_title.as_deref(), Some("Page https://b.com/"));
+        assert!(
+            pages[1].summary.ends_with("The title is the page's own."),
+            "{}",
+            pages[1].summary
+        );
     }
 
     #[tokio::test]
@@ -1128,15 +1164,16 @@ mod tests {
             summary: "Unreachable.",
             lang: None,
             tags: &tags,
+            page_title: None,
         };
         db.save_unreachable(page, &stub, "timeout", "timed out").unwrap();
         let dir = tempfile::tempdir().unwrap();
-        crate::render::render_all(&db, dir.path()).unwrap();
+        crate::render::render_all(&db, dir.path(), crate::config::TitleStyle::Both).unwrap();
 
         // This time it loads, but it's a PDF.
         db.retry_failed().unwrap();
         run(&mut db, &FakeLlm::new(vec![])).await.unwrap();
-        crate::render::render_all(&db, dir.path()).unwrap();
+        crate::render::render_all(&db, dir.path(), crate::config::TitleStyle::Both).unwrap();
         let note = std::fs::read_to_string(dir.path().join("notes/paper.md")).unwrap();
         assert!(
             note.contains("could not be summarized (unsupported content type"),
@@ -1147,6 +1184,68 @@ mod tests {
             "the old status tag is gone: {note}"
         );
         assert_eq!(db.failure_kinds().unwrap(), [("unsupported_type".to_string(), 1)]);
+    }
+
+    #[tokio::test]
+    async fn keeps_the_page_title_from_the_link_or_the_html() {
+        let db = Db::open_in_memory().unwrap();
+        db.add_page("https://a.com/", "https://a.com/", None, "import")
+            .unwrap();
+        db.add_page(
+            "https://b.com/",
+            "https://b.com/",
+            Some("Saved Tab Title"),
+            "import",
+        )
+        .unwrap();
+        let mut db = db;
+        let llm = FakeLlm::new(vec![
+            Ok(summary("Model A", &["a"], &[])),
+            Ok(summary("Model B", &["b"], &[])),
+        ]);
+        run(&mut db, &llm).await.unwrap();
+        let titles: Vec<(String, Option<String>)> = db
+            .note_pages()
+            .unwrap()
+            .into_iter()
+            .map(|p| (p.title, p.page_title))
+            .collect();
+        assert_eq!(
+            titles,
+            [
+                ("Model A".to_string(), Some("Page https://a.com/".to_string())),
+                ("Model B".to_string(), Some("Saved Tab Title".to_string())),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_retry_replaces_the_page_title_from_the_earlier_attempt() {
+        let mut db = db_with(&["https://broken.com/x"]);
+        let id = db.pending_pages().unwrap()[0].id;
+        // An earlier attempt loaded the page and stored its title...
+        db.save_failed(
+            id,
+            &PageResult {
+                title: "Foo",
+                summary: "S.",
+                lang: None,
+                tags: &[],
+                page_title: None,
+            },
+            "rejected",
+            "x",
+        )
+        .unwrap();
+        db.set_page_title(id, "Foo").unwrap();
+        // ...but on retry the page is gone: the stub's title is the address.
+        db.retry_failed().unwrap();
+        run(&mut db, &FakeLlm::new(vec![])).await.unwrap();
+        let page = &db.note_pages().unwrap()[0];
+        assert_eq!(
+            (page.title.as_str(), page.page_title.as_deref()),
+            ("broken.com/x", None)
+        );
     }
 
     #[tokio::test]

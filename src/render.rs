@@ -4,6 +4,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
+use crate::config::TitleStyle;
 use crate::db::{Db, DonePage};
 use crate::tags::{CountedTag, count_tree};
 
@@ -17,7 +18,7 @@ pub struct RenderStats {
 
 /// Writes one note per processed page plus `_tags.md` and `_index.md`.
 /// Files in the notes folder that tabkeeper doesn't know about are left alone.
-pub fn render_all(db: &Db, out_dir: &Path) -> Result<RenderStats> {
+pub fn render_all(db: &Db, out_dir: &Path, style: TitleStyle) -> Result<RenderStats> {
     let notes_dir = out_dir.join(NOTES_DIR);
     std::fs::create_dir_all(&notes_dir).with_context(|| format!("creating {}", notes_dir.display()))?;
 
@@ -46,12 +47,15 @@ pub fn render_all(db: &Db, out_dir: &Path) -> Result<RenderStats> {
             .map(|t| t.path.as_str())
             .collect();
         let path = notes_dir.join(file);
-        std::fs::write(&path, note(page, &page_tags))
+        std::fs::write(&path, note(page, &page_tags, style))
             .with_context(|| format!("writing {}", path.display()))?;
     }
 
     std::fs::write(out_dir.join("_tags.md"), tags_markdown(&counted))?;
-    std::fs::write(out_dir.join("_index.md"), index_markdown(&pages, &tags_by_page))?;
+    std::fs::write(
+        out_dir.join("_index.md"),
+        index_markdown(&pages, &tags_by_page, style),
+    )?;
     Ok(RenderStats { notes: pages.len() })
 }
 
@@ -64,7 +68,8 @@ fn assign_note_files(db: &Db, pages: &mut [DonePage], notes_dir: &Path) -> Resul
     // database) is never overwritten.
     let mut taken: HashSet<String> = db.note_files()?.into_iter().collect();
     for page in pages.iter_mut().filter(|p| p.note_file.is_none()) {
-        let base = slug(&page.title);
+        // The page's own title is shorter and what you'd recognize.
+        let base = slug(own_title(page).unwrap_or(&page.title));
         let mut name = format!("{base}.md");
         let mut n = 2;
         while taken.contains(&name) || notes_dir.join(&name).exists() {
@@ -107,10 +112,62 @@ fn one_line(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-pub fn note(page: &DonePage, tags: &[&str]) -> String {
+/// Words only, lowercased, for comparing titles.
+fn title_words(title: &str) -> Vec<String> {
+    title
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
+        .collect()
+}
+
+/// Whether `needle`'s words appear in `haystack`, in order and next to each
+/// other: "rust" is in "the rust book", not in "trust and safety".
+fn contains_words(haystack: &[String], needle: &[String]) -> bool {
+    !needle.is_empty() && haystack.windows(needle.len()).any(|window| window == needle)
+}
+
+/// The page's own title, if it has any letters or digits: a tab titled "—"
+/// or with only an emoji says nothing about the page.
+fn own_title(page: &DonePage) -> Option<&str> {
+    page.page_title
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| t.chars().any(char::is_alphanumeric))
+}
+
+/// The page's own title, when it says something the model's title doesn't.
+fn distinct_page_title(page: &DonePage) -> Option<&str> {
+    let own = own_title(page)?;
+    let (a, b) = (title_words(own), title_words(&page.title));
+    (!contains_words(&a, &b) && !contains_words(&b, &a)).then_some(own)
+}
+
+/// The note's title for the configured style.
+pub fn display_title(page: &DonePage, style: TitleStyle) -> String {
+    let own = own_title(page);
+    let title = match style {
+        TitleStyle::Summary => page.title.clone(),
+        TitleStyle::Page => own.unwrap_or(&page.title).to_string(),
+        TitleStyle::Both => match (own, distinct_page_title(page)) {
+            (_, Some(own)) => format!("{own} ({})", page.title.trim()),
+            // The same words: the page's own title says it all.
+            (Some(own), None) => own.to_string(),
+            (None, None) => page.title.clone(),
+        },
+    };
+    one_line(&title)
+}
+
+pub fn note(page: &DonePage, tags: &[&str], style: TitleStyle) -> String {
+    let title = display_title(page, style);
     let mut out = String::from("---\n");
     writeln!(out, "url: {}", yaml_str(&page.url)).unwrap();
-    writeln!(out, "title: {}", yaml_str(&one_line(&page.title))).unwrap();
+    writeln!(out, "title: {}", yaml_str(&title)).unwrap();
+    if let Some(own) = distinct_page_title(page) {
+        writeln!(out, "page_title: {}", yaml_str(&one_line(own))).unwrap();
+        writeln!(out, "summary_title: {}", yaml_str(&one_line(&page.title))).unwrap();
+    }
     writeln!(out, "source: {}", page.source).unwrap();
     writeln!(out, "captured: {}", page.processed_at).unwrap();
     if let Some(lang) = &page.lang {
@@ -126,7 +183,7 @@ pub fn note(page: &DonePage, tags: &[&str]) -> String {
         }
     }
     out.push_str("---\n\n");
-    writeln!(out, "# {}\n", one_line(&page.title)).unwrap();
+    writeln!(out, "# {title}\n").unwrap();
     writeln!(out, "**URL:** <{}>\n", page.url).unwrap();
     writeln!(out, "{}", page.summary.trim()).unwrap();
     if !tags.is_empty() {
@@ -162,7 +219,11 @@ fn markdown_link_text(s: &str) -> String {
 
 /// Lists every page once, under its most used tag, so sections are big
 /// topics rather than one section per tag.
-fn index_markdown(pages: &[DonePage], tags_by_page: &HashMap<i64, Vec<&CountedTag>>) -> String {
+fn index_markdown(
+    pages: &[DonePage],
+    tags_by_page: &HashMap<i64, Vec<&CountedTag>>,
+    style: TitleStyle,
+) -> String {
     let mut groups: BTreeMap<&str, Vec<&DonePage>> = BTreeMap::new();
     let mut untagged = Vec::new();
     for page in pages {
@@ -179,14 +240,14 @@ fn index_markdown(pages: &[DonePage], tags_by_page: &HashMap<i64, Vec<&CountedTa
 
     let mut out = format!("# Index\n\n{} pages.\n", pages.len());
     let mut section = |name: &str, list: &mut Vec<&DonePage>| {
-        list.sort_by_key(|p| p.title.to_lowercase());
+        list.sort_by_key(|p| display_title(p, style).to_lowercase());
         write!(out, "\n## {name}\n\n").unwrap();
         for page in list.iter() {
             let file = page.note_file.as_deref().unwrap_or_default();
             writeln!(
                 out,
                 "- [{}]({NOTES_DIR}/{})",
-                markdown_link_text(&page.title),
+                markdown_link_text(&display_title(page, style)),
                 file.replace(' ', "%20")
             )
             .unwrap();
@@ -234,6 +295,7 @@ mod tests {
             lang: Some("en".into()),
             note_file: None,
             processed_at: "2026-09-30T12:00:00Z".into(),
+            page_title: None,
         }
     }
 
@@ -250,7 +312,11 @@ mod tests {
 
     #[test]
     fn note_format() {
-        let n = note(&page("Say \"hi\""), &["tech/ai/llm", "tech/hardware"]);
+        let n = note(
+            &page("Say \"hi\""),
+            &["tech/ai/llm", "tech/hardware"],
+            TitleStyle::Both,
+        );
         assert_eq!(
             n,
             "---\nurl: \"https://example.com/a\"\ntitle: \"Say \\\"hi\\\"\"\nsource: import\ncaptured: 2026-09-30T12:00:00Z\nlang: \"en\"\ntags:\n  - \"tech/ai/llm\"\n  - \"tech/hardware\"\n---\n\n# Say \"hi\"\n\n**URL:** <https://example.com/a>\n\nTwo sentences. About things.\n\n#tech/ai/llm #tech/hardware\n"
@@ -279,13 +345,17 @@ mod tests {
                     summary: "S.",
                     lang: None,
                     tags,
+                    page_title: None,
                 },
             )
             .unwrap();
         }
 
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(render_all(&db, dir.path()).unwrap(), RenderStats { notes: 3 });
+        assert_eq!(
+            render_all(&db, dir.path(), crate::config::TitleStyle::Both).unwrap(),
+            RenderStats { notes: 3 }
+        );
         let files: Vec<Option<String>> = db
             .note_pages()
             .unwrap()
@@ -323,7 +393,7 @@ mod tests {
         );
 
         // A second render keeps the same file names.
-        render_all(&db, dir.path()).unwrap();
+        render_all(&db, dir.path(), crate::config::TitleStyle::Both).unwrap();
         let again: Vec<Option<String>> = db
             .note_pages()
             .unwrap()
@@ -344,10 +414,11 @@ mod tests {
             summary: "Unreachable.",
             lang: None,
             tags: &[],
+            page_title: None,
         };
         db.save_unreachable(a, &stub, "timeout", "timed out").unwrap();
         let dir = tempfile::tempdir().unwrap();
-        render_all(&db, dir.path()).unwrap();
+        render_all(&db, dir.path(), crate::config::TitleStyle::Both).unwrap();
 
         // Page a goes back to pending and the run stops before retrying it;
         // a new page with the same title must not take a's file name.
@@ -362,10 +433,11 @@ mod tests {
                 summary: "S.",
                 lang: None,
                 tags: &[],
+                page_title: None,
             },
         )
         .unwrap();
-        render_all(&db, dir.path()).unwrap();
+        render_all(&db, dir.path(), crate::config::TitleStyle::Both).unwrap();
         let files: Vec<_> = db
             .note_pages()
             .unwrap()
@@ -393,6 +465,7 @@ mod tests {
                 summary: "S.",
                 lang: None,
                 tags: &[],
+                page_title: None,
             },
         )
         .unwrap();
@@ -401,15 +474,137 @@ mod tests {
         let mine = dir.path().join("notes/rust-ownership.md");
         std::fs::write(&mine, "my own note").unwrap();
 
-        render_all(&db, dir.path()).unwrap();
+        render_all(&db, dir.path(), crate::config::TitleStyle::Both).unwrap();
         assert_eq!(std::fs::read_to_string(&mine).unwrap(), "my own note");
         assert!(dir.path().join("notes/rust-ownership-2.md").exists());
     }
 
     #[test]
     fn tags_that_look_like_yaml_values_stay_strings() {
-        let n = note(&page("T"), &["null", "true"]);
+        let n = note(&page("T"), &["null", "true"], TitleStyle::Both);
         assert!(n.contains("tags:\n  - \"null\"\n  - \"true\"\n"), "{n}");
+    }
+
+    fn titled(own: Option<&str>, model: &str) -> DonePage {
+        DonePage {
+            page_title: own.map(str::to_string),
+            ..page(model)
+        }
+    }
+
+    #[test]
+    fn title_styles() {
+        let p = titled(Some("Kyoto - Wikipedia"), "Kyoto: Former Japanese Capital");
+        assert_eq!(
+            display_title(&p, TitleStyle::Both),
+            "Kyoto - Wikipedia (Kyoto: Former Japanese Capital)"
+        );
+        assert_eq!(display_title(&p, TitleStyle::Page), "Kyoto - Wikipedia");
+        assert_eq!(
+            display_title(&p, TitleStyle::Summary),
+            "Kyoto: Former Japanese Capital"
+        );
+        // The same words: only the page's own title.
+        let same = titled(Some("Rust Programming Language"), "Rust programming language");
+        assert_eq!(
+            display_title(&same, TitleStyle::Both),
+            "Rust Programming Language"
+        );
+        let contained = titled(Some("Sourdough"), "Sourdough bread");
+        assert_eq!(display_title(&contained, TitleStyle::Both), "Sourdough");
+        // Whole words only: "ai" is not in "detailed", "rust" not in "trust".
+        let inside_a_word = titled(Some("AI"), "A detailed guide to tax filing");
+        assert_eq!(
+            display_title(&inside_a_word, TitleStyle::Both),
+            "AI (A detailed guide to tax filing)"
+        );
+        let trust = titled(Some("Trust & Safety"), "Rust");
+        assert_eq!(display_title(&trust, TitleStyle::Both), "Trust & Safety (Rust)");
+        // A title without letters or digits is no title.
+        for empty in ["—", "|", "...", "🙂"] {
+            let p = titled(Some(empty), "The model's title");
+            assert_eq!(
+                display_title(&p, TitleStyle::Both),
+                "The model's title",
+                "{empty}"
+            );
+            assert_eq!(
+                display_title(&p, TitleStyle::Page),
+                "The model's title",
+                "{empty}"
+            );
+        }
+        // No page title (older notes): the model's title.
+        let none = titled(None, "Model title");
+        assert_eq!(display_title(&none, TitleStyle::Both), "Model title");
+        assert_eq!(display_title(&none, TitleStyle::Page), "Model title");
+    }
+
+    #[test]
+    fn front_matter_keeps_both_titles() {
+        let n = note(
+            &titled(Some("Kyoto - Wikipedia"), "Kyoto City"),
+            &[],
+            TitleStyle::Both,
+        );
+        assert!(
+            n.contains("title: \"Kyoto - Wikipedia (Kyoto City)\"\npage_title: \"Kyoto - Wikipedia\"\nsummary_title: \"Kyoto City\"\n"),
+            "{n}"
+        );
+        assert!(n.contains("\n# Kyoto - Wikipedia (Kyoto City)\n"), "{n}");
+        let n = note(&titled(Some("Kyoto"), "Kyoto"), &[], TitleStyle::Both);
+        assert!(!n.contains("page_title"), "nothing to add when they match: {n}");
+    }
+
+    #[test]
+    fn new_note_files_are_named_after_the_page_title() {
+        let mut db = Db::open_in_memory().unwrap();
+        db.add_page("https://a.com/", "https://a.com/", None, "import")
+            .unwrap();
+        let id = db.pending_pages().unwrap()[0].id;
+        db.save_result(
+            id,
+            &PageResult {
+                title: "A long descriptive model title",
+                summary: "S.",
+                lang: None,
+                tags: &[],
+                page_title: None,
+            },
+        )
+        .unwrap();
+        db.set_page_title(id, "Short Tab Title").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        render_all(&db, dir.path(), TitleStyle::Both).unwrap();
+        assert!(dir.path().join("notes/short-tab-title.md").exists());
+        let index = std::fs::read_to_string(dir.path().join("_index.md")).unwrap();
+        assert!(
+            index.contains("[Short Tab Title (A long descriptive model title)](notes/short-tab-title.md)"),
+            "{index}"
+        );
+    }
+
+    #[test]
+    fn file_name_ignores_a_page_title_without_words() {
+        let mut db = Db::open_in_memory().unwrap();
+        db.add_page("https://a.com/", "https://a.com/", None, "import")
+            .unwrap();
+        let id = db.pending_pages().unwrap()[0].id;
+        db.save_result(
+            id,
+            &PageResult {
+                title: "Model title",
+                summary: "S.",
+                lang: None,
+                tags: &[],
+                page_title: None,
+            },
+        )
+        .unwrap();
+        db.set_page_title(id, "—").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        render_all(&db, dir.path(), TitleStyle::Both).unwrap();
+        assert!(dir.path().join("notes/model-title.md").exists());
     }
 
     #[test]

@@ -82,6 +82,12 @@ rules = [
   # "prefix:http://localhost",
 ]
 
+[notes]
+# The note's title: "both" (the page's own title, then the model's in
+# parentheses), "page" (the page's own title, as in the browser tab) or
+# "summary" (the model's title).
+title = "both"
+
 [run]
 # Pages processed at the same time. Local servers such as Ollama handle a
 # few requests at once; more mainly helps with fetching.

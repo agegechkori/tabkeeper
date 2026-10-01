@@ -14,6 +14,26 @@ pub struct Config {
     pub tags: TagConfig,
     pub filter: FilterConfig,
     pub run: RunConfig,
+    pub notes: NotesConfig,
+}
+
+/// What a note's title shows.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TitleStyle {
+    /// The page's own title, then the model's in parentheses.
+    #[default]
+    Both,
+    /// The page's own title, as in the browser tab.
+    Page,
+    /// The title the model wrote.
+    Summary,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NotesConfig {
+    pub title: TitleStyle,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]

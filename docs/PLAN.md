@@ -235,7 +235,9 @@ Note format (Obsidian-compatible, hierarchical style):
 ```markdown
 ---
 url: "https://example.com/article"
-title: "Fine-tuning small LLMs on consumer GPUs"
+title: "Fine-tuning LLMs on a budget | Blog (Fine-tuning small LLMs on consumer GPUs)"
+page_title: "Fine-tuning LLMs on a budget | Blog"
+summary_title: "Fine-tuning small LLMs on consumer GPUs"
 source: firefox
 captured: 2026-09-30T14:02:00Z
 lang: "en"
@@ -244,7 +246,7 @@ tags:
   - technology/hardware/gpu
 ---
 
-# Fine-tuning small LLMs on consumer GPUs
+# Fine-tuning LLMs on a budget | Blog (Fine-tuning small LLMs on consumer GPUs)
 
 **URL:** <https://example.com/article>
 
