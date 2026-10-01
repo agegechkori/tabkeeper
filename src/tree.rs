@@ -512,8 +512,20 @@ pub async fn place<R: Reviewer, E: Embedder>(
                 let Some(tag) = decision.tag.checked_sub(1).and_then(|i| batch.get(i)) else {
                     continue;
                 };
+                // A path that repeats the domain at its start means the same.
+                let mut path = decision.path;
+                let repeated = base
+                    .iter()
+                    .zip(&path)
+                    .take_while(|(b, p)| normalize_name(p).as_ref() == Some(*b))
+                    .count();
+                if repeated == base.len() {
+                    path.drain(..repeated);
+                } else if path.first().and_then(|p| normalize_name(p)).as_ref() == base.last() {
+                    path.remove(0);
+                }
                 let mut parent = base.clone();
-                parent.extend(decision.path);
+                parent.extend(path);
                 choose(db, &mut model, &mut chosen, tag, &parent, levels, strict.as_ref())?;
             }
         }
@@ -788,7 +800,7 @@ mod tests {
                 {"tag": 4, "domain": "science"},
                 {"tag": 9, "domain": "nowhere"}
             ]}),
-            json!({"placements": [{"tag": 1, "path": ["chemistry"]}]}),
+            json!({"placements": [{"tag": 1, "path": ["Science", "chemistry"]}]}),
             json!({"placements": [
                 {"tag": 1, "path": ["Programming Languages"]},
                 {"tag": 2, "path": ["programming-languages", "systems", "too-deep"]}

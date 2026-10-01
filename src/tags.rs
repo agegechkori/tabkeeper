@@ -161,8 +161,8 @@ pub fn format_vocabulary(tags: &[&CountedTag]) -> String {
     sorted
         .iter()
         .map(|t| match &t.description {
-            Some(d) => format!("{} ({}) - {}", t.name, t.total, d),
-            None => format!("{} ({})", t.name, t.total),
+            Some(d) => format!("{} ({}) - {}", t.name, t.direct, d),
+            None => format!("{} ({})", t.name, t.direct),
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -170,13 +170,15 @@ pub fn format_vocabulary(tags: &[&CountedTag]) -> String {
 
 /// Tags the model may reuse: used on at least one page, and not reserved.
 pub fn is_offerable(tag: &CountedTag) -> bool {
-    tag.total > 0 && !tag.name.starts_with(RESERVED_PREFIX)
+    // Pages of its own: a category of the tag tree counts the pages below
+    // it, but pages are tagged with the tags under it.
+    tag.direct > 0 && !tag.name.starts_with(RESERVED_PREFIX)
 }
 
 /// The `limit` most used tags; the fallback when embeddings are unavailable.
 pub fn most_used(counted: &[CountedTag], limit: usize) -> Vec<&CountedTag> {
     let mut top: Vec<&CountedTag> = counted.iter().filter(|t| is_offerable(t)).collect();
-    top.sort_by(|a, b| b.total.cmp(&a.total).then(a.name.cmp(&b.name)));
+    top.sort_by(|a, b| b.direct.cmp(&a.direct).then(a.name.cmp(&b.name)));
     top.truncate(limit);
     top
 }
@@ -253,6 +255,13 @@ mod tests {
                 ("food", 0, 1, 1)
             ]
         );
+    }
+
+    #[test]
+    fn categories_without_pages_of_their_own_are_not_offered() {
+        let tags = vec![row(1, None, "technology"), row(2, Some(1), "rust")];
+        let counted = count_tree(&tags, &[(10, 2), (11, 2)]);
+        assert_eq!(format_vocabulary(&most_used(&counted, 5)), "rust (2)");
     }
 
     #[test]
