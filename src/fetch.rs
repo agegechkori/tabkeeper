@@ -110,14 +110,13 @@ impl HttpFetcher {
             ));
         }
         let final_url = response.url().to_string();
-        let mut html = response.text().await.map_err(|e| Attempt::from_reqwest(&e))?;
-        if html.len() > MAX_HTML_BYTES {
-            let mut cut = MAX_HTML_BYTES;
-            while !html.is_char_boundary(cut) {
-                cut -= 1;
-            }
-            html.truncate(cut);
-        }
+        let mut bytes = response
+            .bytes()
+            .await
+            .map_err(|e| Attempt::from_reqwest(&e))?
+            .to_vec();
+        bytes.truncate(MAX_HTML_BYTES);
+        let html = decode_html(&bytes, header_charset(&content_type));
         Ok(FetchedPage { final_url, html })
     }
 }
@@ -142,6 +141,45 @@ impl Fetcher for HttpFetcher {
             }
         }
     }
+}
+
+/// The charset named in a Content-Type value, e.g. `text/html; charset=utf-8`.
+fn header_charset(content_type: &str) -> Option<&str> {
+    let (_, rest) = content_type.split_once("charset=")?;
+    Some(
+        rest.split(';')
+            .next()
+            .unwrap_or(rest)
+            .trim()
+            .trim_matches(['"', '\'']),
+    )
+}
+
+/// Decodes a page: a byte order mark wins, then the charset from the HTTP
+/// header, then one declared in the page's `<meta>` tags, then UTF-8.
+/// Invalid bytes become replacement characters instead of failing the page.
+pub fn decode_html(bytes: &[u8], header_charset: Option<&str>) -> String {
+    let declared = header_charset
+        .and_then(|label| encoding_rs::Encoding::for_label(label.as_bytes()))
+        .or_else(|| meta_charset(&bytes[..bytes.len().min(4096)]));
+    let (text, _, _) = declared.unwrap_or(encoding_rs::UTF_8).decode(bytes);
+    text.into_owned()
+}
+
+/// `<meta charset="…">` or `<meta http-equiv="Content-Type" content="…; charset=…">`
+/// near the start of the page.
+fn meta_charset(head: &[u8]) -> Option<&'static encoding_rs::Encoding> {
+    let head = String::from_utf8_lossy(head).to_ascii_lowercase();
+    let start = head.find("<meta")?;
+    let at = start + head[start..].find("charset=")? + "charset=".len();
+    let label: String = head[at..]
+        .trim_start_matches(['"', '\'', ' '])
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':' | '.'))
+        .collect();
+    // A page whose bytes were read as ASCII to find this tag can't really be
+    // UTF-16; the HTML standard treats such a declaration as UTF-8.
+    encoding_rs::Encoding::for_label(label.as_bytes()).map(|e| e.output_encoding())
 }
 
 /// 1 s, 2 s, 4 s, …
@@ -258,6 +296,60 @@ mod tests {
         assert!(!Attempt::from_status(StatusCode::NOT_FOUND, None).retry);
         assert!(FetchErrorKind::Timeout.is_unreachable());
         assert!(!FetchErrorKind::UnsupportedType.is_unreachable());
+    }
+
+    #[test]
+    fn decodes_using_header_then_meta_then_utf8() {
+        let (cyrillic, _, _) = encoding_rs::WINDOWS_1251.encode("Привет, мир");
+        let page = [
+            b"<html><head><meta charset=\"windows-1251\"></head><body>".as_slice(),
+            &cyrillic,
+            b"</body>",
+        ]
+        .concat();
+        assert!(
+            decode_html(&page, None).contains("Привет, мир"),
+            "meta charset is used"
+        );
+
+        let page = [
+            b"<meta http-equiv=\"Content-Type\" content=\"text/html; charset=windows-1251\">".as_slice(),
+            &cyrillic,
+        ]
+        .concat();
+        assert!(
+            decode_html(&page, None).contains("Привет, мир"),
+            "http-equiv form"
+        );
+
+        let (shift_jis, _, _) = encoding_rs::SHIFT_JIS.encode("こんにちは");
+        let page = [b"<meta charset=\"windows-1251\">".as_slice(), &shift_jis].concat();
+        assert!(
+            decode_html(&page, Some("shift_jis")).contains("こんにちは"),
+            "the header wins"
+        );
+
+        assert_eq!(decode_html("héllo".as_bytes(), None), "héllo", "UTF-8 by default");
+        assert_eq!(
+            decode_html("<meta charset=\"utf-16\">héllo".as_bytes(), None),
+            "<meta charset=\"utf-16\">héllo",
+            "a UTF-16 declaration in <meta> means UTF-8"
+        );
+        assert_eq!(
+            decode_html(b"\xffbad", Some("utf-8")),
+            "\u{fffd}bad",
+            "invalid bytes don't fail the page"
+        );
+    }
+
+    #[test]
+    fn reads_charset_from_content_type() {
+        assert_eq!(header_charset("text/html; charset=utf-8"), Some("utf-8"));
+        assert_eq!(
+            header_charset("text/html; charset=\"iso-8859-1\"; foo=bar"),
+            Some("iso-8859-1")
+        );
+        assert_eq!(header_charset("text/html"), None);
     }
 
     #[test]

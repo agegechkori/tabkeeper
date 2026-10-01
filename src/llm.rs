@@ -64,7 +64,8 @@ pub struct NewTag {
 /// (connection refused, authentication, server errors) affect every page.
 #[derive(Debug)]
 pub struct PageRejected {
-    /// Stored with the page for the final report: `invalid_reply` or `rejected`.
+    /// Stored with the page for the final report: `invalid_reply`, `rejected`
+    /// or `model_timeout`.
     pub kind: &'static str,
     pub message: String,
 }
@@ -80,6 +81,13 @@ impl PageRejected {
     pub fn rejected(message: String) -> Self {
         Self {
             kind: "rejected",
+            message,
+        }
+    }
+
+    pub fn timed_out(message: String) -> Self {
+        Self {
+            kind: "model_timeout",
             message,
         }
     }
@@ -117,6 +125,9 @@ impl OpenAiCompatible {
             None => None,
         };
         let client = reqwest::Client::builder()
+            // A separate, short connect timeout tells a server that can't be
+            // reached (stop the run) from a model that is slow on a page.
+            .connect_timeout(connect_timeout(config.timeout_secs))
             .timeout(Duration::from_secs(config.timeout_secs))
             .build()?;
         Ok(Self {
@@ -141,10 +152,14 @@ impl OpenAiCompatible {
 
     /// Sends one chat request, retrying connection errors, timeouts, HTTP 429
     /// and server errors with increasing waits. Other errors are returned at once.
+    /// Problems that may be specific to this page are `PageRejected`: a request
+    /// the server refuses (400, 413, 422), a model that keeps timing out on it,
+    /// and a reply without usable content.
     async fn complete(&self, messages: &[Value]) -> Result<String> {
         let url = format!("{}/chat/completions", self.config.base_url.trim_end_matches('/'));
         let body = request_body(&self.config, messages);
         let mut attempt = 0;
+        let mut timed_out;
         let text = loop {
             self.wait_for_slot().await;
             let mut request = self.client.post(&url).json(&body);
@@ -152,17 +167,23 @@ impl OpenAiCompatible {
                 request = request.bearer_auth(key);
             }
             let (error, wait) = match request.send().await {
-                Err(err) => (anyhow::Error::new(err).context(format!("calling {url}")), None),
+                Err(err) => {
+                    timed_out = is_model_timeout(&err);
+                    (anyhow::Error::new(err).context(format!("calling {url}")), None)
+                }
                 Ok(response) => {
+                    timed_out = false;
                     let status = response.status();
                     let wait = crate::fetch::retry_after(&response);
                     // The connection can also drop or time out while the body
                     // arrives; that is retried like a failed send.
                     match response.text().await {
-                        Err(err) => (
-                            anyhow::Error::new(err).context(format!("reading the response from {url}")),
-                            wait,
-                        ),
+                        Err(err) => {
+                            timed_out = is_model_timeout(&err);
+                            let error =
+                                anyhow::Error::new(err).context(format!("reading the response from {url}"));
+                            (error, wait)
+                        }
                         Ok(text) => {
                             if status.is_success() {
                                 break text;
@@ -182,6 +203,15 @@ impl OpenAiCompatible {
                 }
             };
             if attempt >= self.config.retries {
+                if timed_out {
+                    return Err(PageRejected::timed_out(format!(
+                        "the model didn't answer within {} s{}; the page may be too long for it, or the server \
+                         may be overloaded",
+                        self.config.timeout_secs,
+                        if attempt == 0 { String::new() } else { format!(", {} times", attempt + 1) }
+                    ))
+                    .into());
+                }
                 return Err(error.context(format!("gave up after {} attempts", attempt + 1)));
             }
             tokio::time::sleep(
@@ -191,12 +221,7 @@ impl OpenAiCompatible {
             .await;
             attempt += 1;
         };
-        let value: Value =
-            serde_json::from_str(&text).with_context(|| format!("invalid response: {}", snippet(&text)))?;
-        value["choices"][0]["message"]["content"]
-            .as_str()
-            .map(str::to_string)
-            .ok_or_else(|| anyhow!("response has no message content: {}", snippet(&text)))
+        message_content(&text)
     }
 }
 
@@ -223,6 +248,36 @@ impl Llm for OpenAiCompatible {
             }
         }
     }
+}
+
+/// How long to wait for a connection to the model server: 10 s, but always
+/// less than the whole request may take, so an unreachable server hits this
+/// timeout first and isn't mistaken for a slow model.
+fn connect_timeout(request_timeout_secs: u64) -> Duration {
+    Duration::from_secs(10).min(Duration::from_secs(request_timeout_secs) / 2)
+}
+
+/// A timeout after the connection was made: the server took the request but
+/// the model didn't finish in time, which may be this page's fault. Ollama
+/// without streaming sends nothing until the model is done, so a slow model
+/// looks the same whether or not the reply has started. A timeout while
+/// connecting means the server can't be reached at all.
+fn is_model_timeout(err: &reqwest::Error) -> bool {
+    err.is_timeout() && !err.is_connect()
+}
+
+/// The reply text of a successful chat response. A reply without content,
+/// such as a refusal, is a problem with this page, not with the server.
+fn message_content(body: &str) -> Result<String> {
+    let value: Value = serde_json::from_str(body).map_err(|_| {
+        PageRejected::invalid_reply(format!("the server's reply isn't JSON: {}", snippet(body)))
+    })?;
+    value["choices"][0]["message"]["content"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| {
+            PageRejected::invalid_reply(format!("the reply has no message content: {}", snippet(body))).into()
+        })
 }
 
 fn snippet(s: &str) -> String {
@@ -379,6 +434,27 @@ mod tests {
         // Older replies used "path" for the new tag's name.
         let old = "{\"title\":\"T\",\"summary\":\"S.\",\"language\":\"en\",\"tags\":[],\"new_tags\":[{\"path\":\"b\"}]}";
         assert_eq!(parse_summary(old).unwrap().new_tags[0].name, "b");
+    }
+
+    #[test]
+    fn connect_timeout_is_shorter_than_the_request_timeout() {
+        assert_eq!(connect_timeout(300), Duration::from_secs(10));
+        assert_eq!(connect_timeout(10), Duration::from_secs(5));
+        assert_eq!(connect_timeout(1), Duration::from_millis(500));
+    }
+
+    #[test]
+    fn replies_without_content_are_page_problems() {
+        let ok = r#"{"choices":[{"message":{"content":"{}"}}]}"#;
+        assert_eq!(message_content(ok).unwrap(), "{}");
+        for body in [
+            r#"{"choices":[{"message":{"content":null,"refusal":"no"}}]}"#,
+            "<html>proxy error</html>",
+        ] {
+            let err = message_content(body).unwrap_err();
+            let rejected = err.downcast_ref::<PageRejected>().expect("a page-level problem");
+            assert_eq!(rejected.kind, "invalid_reply");
+        }
     }
 
     #[test]

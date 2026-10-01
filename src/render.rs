@@ -22,7 +22,7 @@ pub fn render_all(db: &Db, out_dir: &Path) -> Result<RenderStats> {
     std::fs::create_dir_all(&notes_dir).with_context(|| format!("creating {}", notes_dir.display()))?;
 
     let mut pages = db.note_pages()?;
-    assign_note_files(db, &mut pages)?;
+    assign_note_files(db, &mut pages, &notes_dir)?;
 
     let links = db.tag_links()?;
     let counted = count_tree(&db.tags()?, &links);
@@ -57,15 +57,17 @@ pub fn render_all(db: &Db, out_dir: &Path) -> Result<RenderStats> {
 
 /// Gives each page without a note file a unique name based on its title.
 /// Names are stored so a note keeps its file name across renders.
-fn assign_note_files(db: &Db, pages: &mut [DonePage]) -> Result<()> {
+fn assign_note_files(db: &Db, pages: &mut [DonePage], notes_dir: &Path) -> Result<()> {
     // Every name in the database counts, not just these pages': a page sent
-    // back to pending by --retry-failed keeps its file name.
+    // back to pending by --retry-failed keeps its file name. A file already
+    // on disk that isn't ours (the user's own note, or one from a deleted
+    // database) is never overwritten.
     let mut taken: HashSet<String> = db.note_files()?.into_iter().collect();
     for page in pages.iter_mut().filter(|p| p.note_file.is_none()) {
         let base = slug(&page.title);
         let mut name = format!("{base}.md");
         let mut n = 2;
-        while taken.contains(&name) {
+        while taken.contains(&name) || notes_dir.join(&name).exists() {
             name = format!("{base}-{n}.md");
             n += 1;
         }
@@ -119,7 +121,8 @@ pub fn note(page: &DonePage, tags: &[&str]) -> String {
     } else {
         out.push_str("tags:\n");
         for tag in tags {
-            writeln!(out, "  - {tag}").unwrap();
+            // Quoted, so tags like `null` or `true` stay strings.
+            writeln!(out, "  - {}", yaml_str(tag)).unwrap();
         }
     }
     out.push_str("---\n\n");
@@ -250,7 +253,7 @@ mod tests {
         let n = note(&page("Say \"hi\""), &["tech/ai/llm", "tech/hardware"]);
         assert_eq!(
             n,
-            "---\nurl: \"https://example.com/a\"\ntitle: \"Say \\\"hi\\\"\"\nsource: import\ncaptured: 2026-09-30T12:00:00Z\nlang: \"en\"\ntags:\n  - tech/ai/llm\n  - tech/hardware\n---\n\n# Say \"hi\"\n\n**URL:** <https://example.com/a>\n\nTwo sentences. About things.\n\n#tech/ai/llm #tech/hardware\n"
+            "---\nurl: \"https://example.com/a\"\ntitle: \"Say \\\"hi\\\"\"\nsource: import\ncaptured: 2026-09-30T12:00:00Z\nlang: \"en\"\ntags:\n  - \"tech/ai/llm\"\n  - \"tech/hardware\"\n---\n\n# Say \"hi\"\n\n**URL:** <https://example.com/a>\n\nTwo sentences. About things.\n\n#tech/ai/llm #tech/hardware\n"
         );
     }
 
@@ -375,6 +378,38 @@ mod tests {
             2,
             "a keeps same-title.md for when it's done"
         );
+    }
+
+    #[test]
+    fn never_overwrites_files_it_did_not_write() {
+        let mut db = Db::open_in_memory().unwrap();
+        db.add_page("https://a.com/", "https://a.com/", None, "import")
+            .unwrap();
+        let id = db.pending_pages().unwrap()[0].id;
+        db.save_result(
+            id,
+            &PageResult {
+                title: "Rust ownership",
+                summary: "S.",
+                lang: None,
+                tags: &[],
+            },
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(NOTES_DIR)).unwrap();
+        let mine = dir.path().join("notes/rust-ownership.md");
+        std::fs::write(&mine, "my own note").unwrap();
+
+        render_all(&db, dir.path()).unwrap();
+        assert_eq!(std::fs::read_to_string(&mine).unwrap(), "my own note");
+        assert!(dir.path().join("notes/rust-ownership-2.md").exists());
+    }
+
+    #[test]
+    fn tags_that_look_like_yaml_values_stay_strings() {
+        let n = note(&page("T"), &["null", "true"]);
+        assert!(n.contains("tags:\n  - \"null\"\n  - \"true\"\n"), "{n}");
     }
 
     #[test]

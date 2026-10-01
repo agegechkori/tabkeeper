@@ -48,6 +48,9 @@ enum Outcome {
     /// Every page would fail (e.g. the LLM server is down): stop the run. The
     /// page stays pending.
     Fatal(anyhow::Error),
+    /// Saved as failed, and the run should stop: too many pages in a row
+    /// failed at the model.
+    FailedAndStop(String, anyhow::Error),
 }
 
 /// Embeddings for a run: the client plus every tag's vector in memory.
@@ -181,6 +184,7 @@ pub async fn process_pending<F: Fetcher, L: Llm, E: Embedder>(
             semaphores: RefCell::default(),
         },
         progress: &progress,
+        model_failures: Cell::new(0),
     };
     let stats = RefCell::new(stats);
     let fatal: RefCell<Option<(String, anyhow::Error)>> = RefCell::new(None);
@@ -209,6 +213,12 @@ pub async fn process_pending<F: Fetcher, L: Llm, E: Embedder>(
                     }
                     Outcome::Failed(why) => {
                         stats.failed += 1;
+                        format!("failed       {}: {why}", page.url)
+                    }
+                    Outcome::FailedAndStop(why, stop) => {
+                        stats.failed += 1;
+                        stopped.set(true);
+                        fatal.borrow_mut().get_or_insert((page.url.clone(), stop));
                         format!("failed       {}: {why}", page.url)
                     }
                     Outcome::Fatal(err) => {
@@ -249,7 +259,15 @@ struct Run<'r, 'e, F, L, E: Embedder> {
     lang: &'r LangMode,
     domains: DomainLimiter,
     progress: &'r Progress,
+    /// Pages in a row that failed at the model.
+    model_failures: Cell<usize>,
 }
+
+/// After this many pages in a row fail at the model, the problem is most
+/// likely the model or its settings rather than the pages, so the run stops.
+/// The pages keep their failed stubs, so a run can't get stuck on pages that
+/// really are bad; --retry-failed brings them back after a settings fix.
+const MODEL_FAILURE_STREAK: usize = 5;
 
 impl<F: Fetcher, L: Llm, E: Embedder> Run<'_, '_, F, L, E> {
     async fn process(&self, page: &PendingPage) -> Outcome {
@@ -298,13 +316,27 @@ impl<F: Fetcher, L: Llm, E: Embedder> Run<'_, '_, F, L, E> {
             tags: &self.config.tags,
         };
         let summary = match self.llm.summarize(&request).await {
-            Ok(summary) => summary,
+            Ok(summary) => {
+                self.model_failures.set(0);
+                summary
+            }
             Err(err) => {
                 let Some(rejected) = err.downcast_ref::<PageRejected>() else {
                     return Err(err.context("LLM request failed"));
                 };
                 let message = format!("{err:#}");
                 self.save_stub(page, Stub::Failed, rejected.kind, &message)?;
+                let streak = self.model_failures.get() + 1;
+                self.model_failures.set(streak);
+                if streak >= MODEL_FAILURE_STREAK {
+                    let stop = anyhow::anyhow!(
+                        "{streak} pages in a row failed at the model, the last one with: {message}. This \
+                         usually means a problem with the model or its settings rather than with the pages, \
+                         e.g. a parameter the server doesn't accept, or a model that has stopped responding. \
+                         Fix it and run again with --retry-failed to retry the failed pages"
+                    );
+                    return Ok(Outcome::FailedAndStop(message, stop));
+                }
                 return Ok(Outcome::Failed(message));
             }
         };
@@ -1241,6 +1273,54 @@ mod tests {
         let embeddings = Embeddings::prepare(&db, &FakeEmbedder, 2000).await.unwrap();
         assert_eq!(embeddings.index.len(), 2);
         assert!(db.pages_missing_embedding("fake").unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn five_model_failures_in_a_row_stop_the_run_without_getting_stuck() {
+        let urls: Vec<String> = (0..7).map(|i| format!("https://site{i}.com/")).collect();
+        let mut db = db_with(&urls.iter().map(String::as_str).collect::<Vec<_>>());
+        let llm = FakeLlm::new(vec![Err("reject"); 5]);
+        let err = run(&mut db, &llm).await.unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("5 pages in a row failed at the model"),
+            "{message}"
+        );
+        assert!(
+            message.contains("5 failed so far"),
+            "the count matches the database: {message}"
+        );
+        // The five keep their failed stubs, so the next run moves past them...
+        let counts = db.status_counts().unwrap();
+        assert_eq!((counts.failed, counts.pending), (5, 2));
+        let llm = FakeLlm::new(vec![Ok(summary("F", &["f"], &[])), Ok(summary("G", &["g"], &[]))]);
+        assert_eq!(
+            run(&mut db, &llm).await.unwrap(),
+            Stats {
+                done: 2,
+                ..Stats::default()
+            }
+        );
+        // ...and --retry-failed brings them back once the cause is fixed.
+        assert_eq!(db.retry_failed().unwrap(), 5);
+    }
+
+    #[tokio::test]
+    async fn a_success_resets_the_model_failure_count() {
+        let urls: Vec<String> = (0..9).map(|i| format!("https://site{i}.com/")).collect();
+        let mut db = db_with(&urls.iter().map(String::as_str).collect::<Vec<_>>());
+        let mut replies = vec![Err("reject"); 4];
+        replies.push(Ok(summary("E", &["e"], &[])));
+        replies.extend(vec![Err("reject"); 4]);
+        let stats = run(&mut db, &FakeLlm::new(replies)).await.unwrap();
+        assert_eq!(
+            stats,
+            Stats {
+                done: 1,
+                failed: 8,
+                ..Stats::default()
+            }
+        );
     }
 
     #[tokio::test]

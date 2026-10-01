@@ -202,6 +202,12 @@ impl Config {
 
     pub fn parse(text: &str) -> Result<Self> {
         let config: Self = toml::from_str(text)?;
+        if config.llm.timeout_secs == 0
+            || config.fetch.timeout_secs == 0
+            || config.embeddings.timeout_secs == 0
+        {
+            bail!("timeout_secs must be at least 1 in [llm], [fetch] and [embeddings]");
+        }
         if config.run.concurrency == 0 || config.run.per_domain == 0 {
             bail!("run.concurrency and run.per_domain must be at least 1");
         }

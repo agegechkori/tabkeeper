@@ -2034,6 +2034,7 @@ dependencies = [
  "clap",
  "directories",
  "dom_smoothie",
+ "encoding_rs",
  "futures-util",
  "globset",
  "indicatif",
