@@ -148,13 +148,23 @@ impl Db {
         Ok(())
     }
 
-    /// Applies the changes as one revision and returns its id.
-    /// Applies the changes as one revision. A change that fails is left out,
-    /// and the others are still applied.
+    #[cfg(test)]
     pub fn apply_tag_changes(&mut self, changes: &[TagChange]) -> Result<Applied> {
+        self.apply_reviewed_changes(changes, &[])
+    }
+
+    /// Applies the changes as one revision. A change that fails is left out,
+    /// and the others are still applied. `decision_keys` holds each change's
+    /// tag_decisions key; undoing the revision declines those changes.
+    pub fn apply_reviewed_changes(
+        &mut self,
+        changes: &[TagChange],
+        decision_keys: &[String],
+    ) -> Result<Applied> {
         let mut tx = self.conn.transaction()?;
         let mut steps = Vec::new();
         let mut applied = Vec::new();
+        let mut keys = Vec::new();
         let mut failed = Vec::new();
         for (i, change) in changes.iter().enumerate() {
             let sp = tx.savepoint()?;
@@ -169,6 +179,7 @@ impl Db {
                     sp.commit()?;
                     steps.extend(change_steps);
                     applied.push(change.clone());
+                    keys.extend(decision_keys.get(i).cloned());
                 }
                 // Dropping the savepoint rolls this change back.
                 Err(err) => failed.push((i, format!("{err:#}"))),
@@ -178,11 +189,13 @@ impl Db {
             None
         } else {
             tx.execute(
-                "INSERT INTO revisions (created_at, status, changes, undo) VALUES (?1, 'applied', ?2, ?3)",
+                "INSERT INTO revisions (created_at, status, changes, undo, decision_keys)
+                 VALUES (?1, 'applied', ?2, ?3, ?4)",
                 params![
                     now(),
                     serde_json::to_string(&applied)?,
-                    serde_json::to_string(&steps)?
+                    serde_json::to_string(&steps)?,
+                    serde_json::to_string(&keys)?
                 ],
             )?;
             Some(tx.last_insert_rowid())
@@ -191,24 +204,32 @@ impl Db {
         Ok(Applied { revision, failed })
     }
 
-    /// Undoes the latest applied revision. Returns its id and how many changes
-    /// it had, or `None` if there is nothing to undo.
+    /// Undoes the latest applied revision, and records its changes as
+    /// declined so the review doesn't propose them again. Returns its id and
+    /// how many changes it had, or `None` if there is nothing to undo.
     pub fn undo_last_revision(&mut self) -> Result<Option<(i64, usize)>> {
         let tx = self.conn.transaction()?;
-        let latest: Option<(i64, String, String)> = tx
+        let latest: Option<(i64, String, String, String)> = tx
             .query_row(
-                "SELECT id, changes, undo FROM revisions WHERE status = 'applied' ORDER BY id DESC LIMIT 1",
+                "SELECT id, changes, undo, decision_keys FROM revisions WHERE status = 'applied' ORDER BY id DESC LIMIT 1",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()?;
-        let Some((id, changes, undo)) = latest else {
+        let Some((id, changes, undo, keys)) = latest else {
             return Ok(None);
         };
         let changes: Vec<TagChange> = serde_json::from_str(&changes)?;
         let steps: Vec<Step> = serde_json::from_str(&undo).context("reading the revision's undo record")?;
         for step in steps.into_iter().rev() {
             undo_step(&tx, step)?;
+        }
+        let keys: Vec<String> = serde_json::from_str(&keys)?;
+        for key in keys {
+            tx.execute(
+                "INSERT OR REPLACE INTO tag_decisions (key, decision, source, created_at) VALUES (?1, 'declined', 'user', ?2)",
+                params![key, now()],
+            )?;
         }
         tx.execute("UPDATE revisions SET status = 'undone' WHERE id = ?1", [id])?;
         tx.commit()?;
@@ -592,6 +613,21 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(names(&db), [("oxide".to_string(), 3), ("rust".to_string(), 1)]);
+    }
+
+    #[test]
+    fn undone_changes_are_declined() {
+        let (mut db, _) = archive(&[&["ml"], &["machine-learning"]]);
+        let (ml, full) = (id(&db, "ml"), id(&db, "machine-learning"));
+        let key = "merge:machine-learning|ml".to_string();
+        db.apply_reviewed_changes(
+            &[TagChange::Merge { from: ml, into: full }],
+            std::slice::from_ref(&key),
+        )
+        .unwrap();
+        assert_eq!(db.tag_decision(&key).unwrap(), None);
+        db.undo_last_revision().unwrap();
+        assert_eq!(db.tag_decision(&key).unwrap().as_deref(), Some("declined"));
     }
 
     #[test]

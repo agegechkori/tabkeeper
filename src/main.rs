@@ -365,21 +365,23 @@ async fn review_tags(db: &mut Db, config: &Config, yes: bool, say: &dyn Fn(&str)
     };
     // Without embeddings, only plural/singular pairs are checked. Vectors
     // missing from earlier runs are filled in first: splits need page vectors.
-    let mut embedder = if config.embeddings.enabled {
+    let embedder = if config.embeddings.enabled {
         embed::OpenAiEmbedder::new(&config.embeddings, &config.llm).ok()
     } else {
         None
     };
-    if let Some(e) = &embedder {
+    let mut usable = embedder.as_ref();
+    if let Some(e) = usable {
         if let Err(err) = pipeline::Embeddings::prepare(db, e, config.embeddings.page_chars).await {
             say(&format!(
                 "Warning: embeddings are unavailable ({err:#}); the review only checks plural/singular pairs."
             ));
-            embedder = None;
+            usable = None;
         }
     }
-    let result = reconcile::review(db, &reviewer, embedder.as_ref(), &config.reconcile, say).await;
+    let result = reconcile::review(db, &reviewer, usable, &config.reconcile, say).await;
     outcome.usage = llm::Reviewer::usage(&reviewer);
+    outcome.embed_usage = embedder.as_ref().map(embed::Embedder::usage).unwrap_or_default();
     let review = match result {
         Ok(review) => review,
         Err(err) => {
@@ -408,6 +410,7 @@ async fn review_tags(db: &mut Db, config: &Config, yes: bool, say: &dyn Fn(&str)
     };
 
     let mut apply = Vec::new();
+    let mut keys = Vec::new();
     for (p, keep) in review.proposed.iter().zip(&chosen) {
         if *keep {
             match &p.change {
@@ -416,6 +419,7 @@ async fn review_tags(db: &mut Db, config: &Config, yes: bool, say: &dyn Fn(&str)
                 db::TagChange::Split { .. } => outcome.splits += 1,
             }
             apply.push(p.change.clone());
+            keys.push(p.decision_key.clone());
         } else {
             outcome.declined += 1;
             if let Err(err) = db.set_tag_decision(&p.decision_key, "declined", "user") {
@@ -424,7 +428,7 @@ async fn review_tags(db: &mut Db, config: &Config, yes: bool, say: &dyn Fn(&str)
         }
     }
     if !apply.is_empty() {
-        match db.apply_tag_changes(&apply) {
+        match db.apply_reviewed_changes(&apply, &keys) {
             Ok(applied) => {
                 outcome.revision = applied.revision;
                 for (i, reason) in applied.failed {

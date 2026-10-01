@@ -18,7 +18,9 @@ CREATE TABLE revisions (
     created_at TEXT NOT NULL,
     status     TEXT NOT NULL CHECK (status IN ('applied', 'undone')),
     changes    TEXT NOT NULL,
-    undo       TEXT NOT NULL
+    undo       TEXT NOT NULL,
+    -- The changes' tag_decisions keys: undoing the revision declines them.
+    decision_keys TEXT NOT NULL DEFAULT '[]'
 );
 
 -- Review answers that should stick: pairs the model found different, tags it

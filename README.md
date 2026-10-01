@@ -55,7 +55,7 @@ At the end of each import, tabkeeper reviews the tags: it merges tags that mean 
 Apply them? [Y]es, [n]o, or the numbers to skip (e.g. 2,5):
 ```
 
-Changes you decline, and pairs the model kept apart, are remembered and not proposed again. `--yes` applies everything without asking; without a terminal nothing is applied. `tabkeeper revise-tags` runs the review on its own, and `tabkeeper undo` reverts the last applied review. The review can use its own model (`[reconcile]` in the config).
+Changes you decline, and pairs the model kept apart, are remembered and not proposed again. `--yes` applies everything without asking; without a terminal nothing is applied. `tabkeeper revise-tags` runs the review on its own, and `tabkeeper undo` reverts the last applied review; its changes then count as declined. The review can use its own model (`[reconcile]` in the config).
 
 Before a big run, `--dry-run` shows what would be processed and estimates tokens, cost and time (from your last run, once there is one) without fetching or saving anything. `--max-tokens N` and `--max-cost DOLLARS` stop starting new pages once a limit would be reached; the rest stay pending for the next run. For cloud models, set `price_input_per_mtok` and `price_output_per_mtok` in `[llm]` to see costs.
 

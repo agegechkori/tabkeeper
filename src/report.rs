@@ -141,6 +141,8 @@ pub struct FailedPage {
 pub struct ReviewReport {
     pub model: String,
     pub usage: StageUsage,
+    /// Embedding requests the review made: missing vectors and tag names.
+    pub embed_usage: StageUsage,
     pub merge_candidates: usize,
     pub split_candidates: usize,
     pub proposed: usize,
@@ -265,6 +267,7 @@ pub async fn build(db: &Db, ctx: &RunContext<'_>) -> Result<Report> {
                 // The tag review is priced like the summaries.
                 + ctx.review.as_ref().map_or(0.0, |r| {
                     prices.cost(r.usage.input_tokens, r.usage.output_tokens)
+                        + r.embed_usage.input_tokens as f64 * config.embeddings.price_per_mtok / 1e6
                 }),
         )
     } else {
@@ -691,6 +694,14 @@ pub fn text(report: &Report) -> String {
             duration(r.usage.request_secs)
         )
         .unwrap();
+        if r.embed_usage.input_tokens > 0 {
+            writeln!(
+                out,
+                "              plus {} embedding tokens",
+                tokens(r.embed_usage.input_tokens)
+            )
+            .unwrap();
+        }
     }
     if m.pages_cut > 0 {
         writeln!(
