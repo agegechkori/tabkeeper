@@ -69,7 +69,7 @@ fn assign_note_files(db: &Db, pages: &mut [DonePage], notes_dir: &Path) -> Resul
     let mut taken: HashSet<String> = db.note_files()?.into_iter().collect();
     for page in pages.iter_mut().filter(|p| p.note_file.is_none()) {
         // The page's own title is shorter and what you'd recognize.
-        let base = slug(page.page_title.as_deref().unwrap_or(&page.title));
+        let base = slug(own_title(page).unwrap_or(&page.title));
         let mut name = format!("{base}.md");
         let mut n = 2;
         while taken.contains(&name) || notes_dir.join(&name).exists() {
@@ -113,33 +113,39 @@ fn one_line(s: &str) -> String {
 }
 
 /// Words only, lowercased, for comparing titles.
-fn title_words(title: &str) -> String {
+fn title_words(title: &str) -> Vec<String> {
     title
         .split(|c: char| !c.is_alphanumeric())
         .filter(|w| !w.is_empty())
         .map(str::to_lowercase)
-        .collect::<Vec<_>>()
-        .join(" ")
+        .collect()
+}
+
+/// Whether `needle`'s words appear in `haystack`, in order and next to each
+/// other: "rust" is in "the rust book", not in "trust and safety".
+fn contains_words(haystack: &[String], needle: &[String]) -> bool {
+    !needle.is_empty() && haystack.windows(needle.len()).any(|window| window == needle)
+}
+
+/// The page's own title, if it has any letters or digits: a tab titled "—"
+/// or with only an emoji says nothing about the page.
+fn own_title(page: &DonePage) -> Option<&str> {
+    page.page_title
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| t.chars().any(char::is_alphanumeric))
 }
 
 /// The page's own title, when it says something the model's title doesn't.
 fn distinct_page_title(page: &DonePage) -> Option<&str> {
-    let own = page
-        .page_title
-        .as_deref()
-        .map(str::trim)
-        .filter(|t| !t.is_empty())?;
+    let own = own_title(page)?;
     let (a, b) = (title_words(own), title_words(&page.title));
-    (!a.contains(&b) && !b.contains(&a)).then_some(own)
+    (!contains_words(&a, &b) && !contains_words(&b, &a)).then_some(own)
 }
 
 /// The note's title for the configured style.
 pub fn display_title(page: &DonePage, style: TitleStyle) -> String {
-    let own = page
-        .page_title
-        .as_deref()
-        .map(str::trim)
-        .filter(|t| !t.is_empty());
+    let own = own_title(page);
     let title = match style {
         TitleStyle::Summary => page.title.clone(),
         TitleStyle::Page => own.unwrap_or(&page.title).to_string(),
@@ -502,6 +508,28 @@ mod tests {
         );
         let contained = titled(Some("Sourdough"), "Sourdough bread");
         assert_eq!(display_title(&contained, TitleStyle::Both), "Sourdough");
+        // Whole words only: "ai" is not in "detailed", "rust" not in "trust".
+        let inside_a_word = titled(Some("AI"), "A detailed guide to tax filing");
+        assert_eq!(
+            display_title(&inside_a_word, TitleStyle::Both),
+            "AI (A detailed guide to tax filing)"
+        );
+        let trust = titled(Some("Trust & Safety"), "Rust");
+        assert_eq!(display_title(&trust, TitleStyle::Both), "Trust & Safety (Rust)");
+        // A title without letters or digits is no title.
+        for empty in ["—", "|", "...", "🙂"] {
+            let p = titled(Some(empty), "The model's title");
+            assert_eq!(
+                display_title(&p, TitleStyle::Both),
+                "The model's title",
+                "{empty}"
+            );
+            assert_eq!(
+                display_title(&p, TitleStyle::Page),
+                "The model's title",
+                "{empty}"
+            );
+        }
         // No page title (older notes): the model's title.
         let none = titled(None, "Model title");
         assert_eq!(display_title(&none, TitleStyle::Both), "Model title");
@@ -549,6 +577,28 @@ mod tests {
             index.contains("[Short Tab Title (A long descriptive model title)](notes/short-tab-title.md)"),
             "{index}"
         );
+    }
+
+    #[test]
+    fn file_name_ignores_a_page_title_without_words() {
+        let mut db = Db::open_in_memory().unwrap();
+        db.add_page("https://a.com/", "https://a.com/", None, "import")
+            .unwrap();
+        let id = db.pending_pages().unwrap()[0].id;
+        db.save_result(
+            id,
+            &PageResult {
+                title: "Model title",
+                summary: "S.",
+                lang: None,
+                tags: &[],
+            },
+        )
+        .unwrap();
+        db.set_page_title(id, "—").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        render_all(&db, dir.path(), TitleStyle::Both).unwrap();
+        assert!(dir.path().join("notes/model-title.md").exists());
     }
 
     #[test]
