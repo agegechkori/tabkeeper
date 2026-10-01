@@ -73,8 +73,9 @@ vocabulary_limit = 50
 style = "hierarchical"
 # Maximum number of levels in the tag tree, e.g. technology/ai/llm is 3.
 max_depth = 3
-# Your own top-level categories (see taxonomy.example.toml). By default they
-# emerge from your pages. --taxonomy sets it for one run.
+# Your own top-level categories (see taxonomy.example.toml), relative to
+# this file. By default they emerge from your pages. --taxonomy sets it for
+# one run.
 # taxonomy = "taxonomy.toml"
 
 [filter]

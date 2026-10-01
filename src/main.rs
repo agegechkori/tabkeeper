@@ -136,6 +136,14 @@ async fn main() -> ExitCode {
 
 async fn run(cli: Cli) -> Result<()> {
     let (mut config, config_path) = Config::load(cli.config.as_deref())?;
+    // A taxonomy file named in the config is next to it, wherever you run from.
+    if let (Some(taxonomy), Some(dir)) = (
+        config.tags.taxonomy.as_mut(),
+        config_path.as_deref().and_then(Path::parent),
+    ) && taxonomy.is_relative()
+    {
+        *taxonomy = dir.join(&*taxonomy);
+    }
     match cli.command {
         Command::Import {
             file,
@@ -157,8 +165,12 @@ async fn run(cli: Cli) -> Result<()> {
             if taxonomy.is_some() {
                 config.tags.taxonomy = taxonomy;
             }
-            // A broken taxonomy file is found before the run, not after it.
-            if let Some(path) = &config.tags.taxonomy {
+            // A broken taxonomy file is found before the run, not after it,
+            // if the review at the end will build the tree.
+            if let Some(path) = &config.tags.taxonomy
+                && config.tags.style == config::TagStyle::Hierarchical
+                && config.reconcile.at_end_of_run
+            {
                 tree::Taxonomy::load(path)?;
             }
             if let Some(model) = model {

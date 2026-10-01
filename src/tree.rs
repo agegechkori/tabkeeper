@@ -259,6 +259,13 @@ impl TreeModel {
         Some(parent)
     }
 
+    /// A tag outside the tree that can't go at the top: locked, or its place
+    /// there was declined. Its name can't start a path.
+    fn blocked_at_top(&self, name: &str) -> bool {
+        !self.parents.contains_key(name)
+            && (self.locked.contains(name) || self.declined.contains(&place_key(name, &[])))
+    }
+
     fn commit(&mut self, tag: &str, parent: &[String]) {
         for (i, name) in parent.iter().enumerate() {
             self.parents
@@ -427,6 +434,9 @@ pub async fn place<R: Reviewer, E: Embedder>(
             let Some((domain, tag)) = domain_of.get(name).copied() else {
                 continue;
             };
+            if model.blocked_at_top(domain) {
+                continue;
+            }
             let mut base = model.parents.get(domain).cloned().unwrap_or_default();
             base.push(domain.to_string());
             choose(db, &mut model, &mut chosen, tag, &base, levels, strict.as_ref())?;
@@ -444,6 +454,11 @@ pub async fn place<R: Reviewer, E: Embedder>(
             .filter(|t| !chosen.iter().any(|(c, _)| c.id == t.id))
             .collect();
         if rest.is_empty() {
+            continue;
+        }
+        // A domain that can't be in the tree leaves its tags for a later
+        // review, instead of putting them all at the top.
+        if model.blocked_at_top(domain) {
             continue;
         }
         // The domain may be a category further down the tree: tags go
@@ -935,6 +950,29 @@ mod tests {
                 "place  technology/programming ← languages"
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn a_domain_whose_top_place_was_declined_keeps_its_tags_out() {
+        use crate::reconcile::tests::{FakeReviewer, NameEmbedder, archive};
+        let db = archive(&[(&["history"], [1.0, 0.0, 0.0]), (&["ww2"], [1.0, 0.1, 0.0])]);
+        db.set_tag_decision("place:history>", "declined", "user").unwrap();
+        let reviewer = FakeReviewer::new(vec![json!({"domains": [
+            {"tag": 1, "domain": "history"},
+            {"tag": 2, "domain": "history"}
+        ]})]);
+        let placement = place(
+            &db,
+            &reviewer,
+            None::<&NameEmbedder>,
+            &ReconcileConfig::default(),
+            3,
+            None,
+            |_| {},
+        )
+        .await
+        .unwrap();
+        assert!(placement.proposed.is_empty(), "{:?}", placement.proposed);
     }
 
     #[tokio::test]
