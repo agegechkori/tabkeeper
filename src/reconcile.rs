@@ -134,7 +134,10 @@ pub async fn review<R: Reviewer, E: Embedder>(
         // can't involve another split.
         let others: Vec<i64> = into
             .iter()
-            .filter_map(|p| db.tag_named(&p.name).ok().flatten())
+            .map(|p| db.tag_named(&p.name))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
             .filter(|id| *id != candidate.tag.id)
             .collect();
         if others.iter().any(|id| split_tags.contains(id)) {
