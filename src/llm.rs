@@ -164,8 +164,11 @@ impl OpenAiCompatible {
     /// the server refuses (400, 413, 422), a model that keeps timing out on it,
     /// and a reply without usable content.
     async fn complete(&self, messages: &[Value]) -> Result<String> {
+        self.send(request_body(&self.config, messages)).await
+    }
+
+    async fn send(&self, body: Value) -> Result<String> {
         let url = format!("{}/chat/completions", self.config.base_url.trim_end_matches('/'));
-        let body = request_body(&self.config, messages);
         let mut attempt = 0;
         let mut timed_out;
         let (text, elapsed) = loop {
@@ -269,6 +272,65 @@ impl Llm for OpenAiCompatible {
     }
 }
 
+/// A model asked for structured decisions, e.g. by the tag review.
+pub trait Reviewer {
+    /// Sends a system and user prompt and returns the reply as JSON matching
+    /// `schema`, asking once more if the first reply isn't valid JSON.
+    async fn ask_json(&self, system: &str, user: &str, name: &str, schema: Value) -> Result<Value>;
+
+    /// Requests and tokens so far.
+    fn usage(&self) -> StageUsage {
+        StageUsage::default()
+    }
+}
+
+impl Reviewer for OpenAiCompatible {
+    async fn ask_json(&self, system: &str, user: &str, name: &str, schema: Value) -> Result<Value> {
+        let mut messages = vec![
+            json!({"role": "system", "content": system}),
+            json!({"role": "user", "content": user}),
+        ];
+        let content = self
+            .send(request_body_with_schema(
+                &self.config,
+                &messages,
+                name,
+                schema.clone(),
+            ))
+            .await?;
+        match parse_json_object(&content) {
+            Ok(value) => Ok(value),
+            Err(err) => {
+                self.usage.update(|u| u.invalid_replies += 1);
+                messages.push(json!({"role": "assistant", "content": content}));
+                messages.push(json!({"role": "user", "content": format!(
+                    "That response was invalid: {err:#}. Reply again with only the JSON object."
+                )}));
+                let content = self
+                    .send(request_body_with_schema(&self.config, &messages, name, schema))
+                    .await?;
+                parse_json_object(&content).context("the model's reply was invalid twice")
+            }
+        }
+    }
+
+    fn usage(&self) -> StageUsage {
+        self.usage.snapshot()
+    }
+}
+
+/// The JSON object in a reply, tolerating code fences and text around it.
+pub fn parse_json_object(content: &str) -> Result<Value> {
+    let start = content
+        .find('{')
+        .ok_or_else(|| anyhow!("no JSON object in the reply"))?;
+    let end = content
+        .rfind('}')
+        .filter(|&end| end > start)
+        .ok_or_else(|| anyhow!("no JSON object in the reply"))?;
+    Ok(serde_json::from_str(&content[start..=end])?)
+}
+
 /// How long to wait for a connection to the model server: 10 s, but always
 /// less than the whole request may take, so an unreachable server hits this
 /// timeout first and isn't mistaken for a slow model.
@@ -330,6 +392,10 @@ pub fn response_schema() -> Value {
 }
 
 fn request_body(config: &LlmConfig, messages: &[Value]) -> Value {
+    request_body_with_schema(config, messages, "page_summary", response_schema())
+}
+
+fn request_body_with_schema(config: &LlmConfig, messages: &[Value], name: &str, schema: Value) -> Value {
     let mut body = json!({
         "model": config.model,
         "messages": messages,
@@ -339,7 +405,7 @@ fn request_body(config: &LlmConfig, messages: &[Value]) -> Value {
         StructuredOutput::JsonSchema => {
             body["response_format"] = json!({
                 "type": "json_schema",
-                "json_schema": {"name": "page_summary", "strict": true, "schema": response_schema()}
+                "json_schema": {"name": name, "strict": true, "schema": schema}
             });
         }
         StructuredOutput::JsonObject => body["response_format"] = json!({"type": "json_object"}),
