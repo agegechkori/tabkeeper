@@ -99,10 +99,32 @@ pub async fn review<R: Reviewer, E: Embedder>(
             TagChange::Split { .. } => vec![],
         })
         .collect();
+    // Two splits in one review mustn't involve each other's tag: one split's
+    // part moving pages onto a tag another split divides would break that
+    // split. The later one waits for the next review.
+    let mut split_tags: HashSet<&str> = HashSet::new();
+    let mut part_names: HashSet<String> = HashSet::new();
     for candidate in splits.iter().filter(|c| !touched.contains(&c.tag.id)) {
-        if let Some(proposed) = review_split(db, reviewer, candidate, &by_name).await? {
-            review.proposed.push(proposed);
+        if part_names.contains(&candidate.tag.name) {
+            continue;
         }
+        let Some(proposed) = review_split(db, reviewer, candidate, &by_name).await? else {
+            continue;
+        };
+        let TagChange::Split { into, .. } = &proposed.change else {
+            continue;
+        };
+        let others: Vec<&str> = into
+            .iter()
+            .map(|p| p.name.as_str())
+            .filter(|name| *name != candidate.tag.name)
+            .collect();
+        if others.iter().any(|name| split_tags.contains(name)) {
+            continue;
+        }
+        split_tags.insert(&candidate.tag.name);
+        part_names.extend(others.into_iter().map(str::to_string));
+        review.proposed.push(proposed);
     }
     Ok(review)
 }
@@ -692,6 +714,35 @@ mod tests {
         }
     }
 
+    /// Splits every tag it is asked about: the first page keeps the tag, the
+    /// others go to the tag named in `into` for it.
+    struct CrossSplitter(Vec<(&'static str, &'static str)>);
+
+    impl Reviewer for CrossSplitter {
+        async fn ask_json(&self, _system: &str, user: &str, _name: &str, _schema: Value) -> Result<Value> {
+            let own = user
+                .strip_prefix("Tag: ")
+                .and_then(|rest| rest.split(' ').next())
+                .unwrap();
+            let other = self.0.iter().find(|(tag, _)| *tag == own).unwrap().1;
+            let pages: Vec<i64> = user
+                .lines()
+                .filter_map(|l| l.strip_prefix("- page ")?.split(':').next()?.parse().ok())
+                .collect();
+            let assignments: Vec<Value> = pages
+                .iter()
+                .enumerate()
+                .map(|(i, page)| json!({"page": page, "tag": if i == 0 { own } else { other }}))
+                .collect();
+            Ok(json!({
+                "meanings": [],
+                "split": true,
+                "tags": [{"name": own, "description": ""}, {"name": other, "description": ""}],
+                "assignments": assignments
+            }))
+        }
+    }
+
     /// Embeds tag names from a fixed table; names not in it get a vector of
     /// their own, unlike any other.
     struct NameEmbedder(Vec<(&'static str, [f32; 3])>);
@@ -1047,6 +1098,34 @@ mod tests {
                 from: tag_id(&db, "rusts"),
                 into: tag_id(&db, "rust")
             }]
+        );
+    }
+
+    #[tokio::test]
+    async fn splits_dont_move_pages_onto_each_others_tags() {
+        let db = archive(&[
+            (&["rust"], [1.0, 0.0, 0.0]),
+            (&["rust"], [1.0, 0.1, 0.0]),
+            (&["rust"], [0.0, 0.0, 1.0]),
+            (&["python"], [0.0, 1.0, 0.0]),
+            (&["python"], [0.0, 1.0, 0.1]),
+            (&["python"], [1.0, 0.0, 0.0]),
+        ]);
+        let reviewer = CrossSplitter(vec![("rust", "python"), ("python", "rust")]);
+        let review = review(
+            &db,
+            &reviewer,
+            Some(&no_names()),
+            &ReconcileConfig::default(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(review.split_candidates, 2);
+        assert_eq!(
+            review.proposed.len(),
+            1,
+            "the second split waits for the next review"
         );
     }
 

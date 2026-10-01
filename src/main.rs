@@ -20,7 +20,7 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
 use crate::config::Config;
@@ -308,6 +308,9 @@ async fn run(cli: Cli) -> Result<()> {
             let mut db = open_db(&cli.out)?;
             let review = review_tags(&mut db, &config, yes, &|text: &str| println!("{text}")).await;
             finish(&db, &cli.out, &config)?;
+            if let Some(error) = &review.error {
+                bail!("the tag review failed: {error}");
+            }
             println!("Tag review: {}.", review.line());
             if let Some(revision) = review.revision {
                 println!("To revert it: tabkeeper undo (revision {revision}).");
