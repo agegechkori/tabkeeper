@@ -13,9 +13,11 @@ mod reconcile;
 mod render;
 mod report;
 mod tags;
+mod tree;
 mod urls;
 mod usage;
 
+use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -92,13 +94,20 @@ enum Command {
         /// Apply the tag review's changes at the end of the run without asking.
         #[arg(long)]
         yes: bool,
+        /// Your own top-level categories for the tag tree, overriding tags.taxonomy.
+        #[arg(long, value_name = "FILE")]
+        taxonomy: Option<PathBuf>,
     },
-    /// Review the tags: merge duplicates, split ambiguous tags. You approve
-    /// the changes; `tabkeeper undo` reverts them.
+    /// Review the tags: merge duplicates, split ambiguous tags and, with
+    /// hierarchical tags, put new tags in the tag tree. You approve the
+    /// changes; `tabkeeper undo` reverts them.
     ReviseTags {
         /// Apply the changes without asking.
         #[arg(long)]
         yes: bool,
+        /// Your own top-level categories for the tag tree, overriding tags.taxonomy.
+        #[arg(long, value_name = "FILE")]
+        taxonomy: Option<PathBuf>,
     },
     /// Undo the latest tag review that changed tags.
     Undo,
@@ -143,7 +152,15 @@ async fn run(cli: Cli) -> Result<()> {
             concurrency,
             max_tags,
             yes,
+            taxonomy,
         } => {
+            if taxonomy.is_some() {
+                config.tags.taxonomy = taxonomy;
+            }
+            // A broken taxonomy file is found before the run, not after it.
+            if let Some(path) = &config.tags.taxonomy {
+                tree::Taxonomy::load(path)?;
+            }
             if let Some(model) = model {
                 config.llm.model = model;
             }
@@ -252,7 +269,7 @@ async fn run(cli: Cli) -> Result<()> {
                 pipeline::process_pending(&mut db, &fetcher, &llm, embeddings.as_mut(), &options).await;
 
             // Render and report whatever was finished, even if the run stopped early.
-            render::render_all(&db, &cli.out, config.notes.title)?;
+            render::render_all(&db, &cli.out, config.notes.title, config.tags.style)?;
             let mut summary = result?;
             // A run stopped by an error skips the review, which would make
             // more model requests; so does a run with a budget, which the
@@ -265,7 +282,7 @@ async fn run(cli: Cli) -> Result<()> {
             }
             let review = if config.reconcile.at_end_of_run && summary.stop.is_none() && !budgeted {
                 let review = review_tags(&mut db, &config, yes, &say).await;
-                render::render_all(&db, &cli.out, config.notes.title)?;
+                render::render_all(&db, &cli.out, config.notes.title, config.tags.style)?;
                 Some(review)
             } else {
                 None
@@ -304,7 +321,10 @@ async fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::Render => finish(&open_db(&cli.out)?, &cli.out, &config)?,
-        Command::ReviseTags { yes } => {
+        Command::ReviseTags { yes, taxonomy } => {
+            if taxonomy.is_some() {
+                config.tags.taxonomy = taxonomy;
+            }
             let mut db = open_db(&cli.out)?;
             let review = review_tags(&mut db, &config, yes, &|text: &str| println!("{text}")).await;
             finish(&db, &cli.out, &config)?;
@@ -312,8 +332,13 @@ async fn run(cli: Cli) -> Result<()> {
                 bail!("the tag review failed: {error}");
             }
             println!("Tag review: {}.", review.line());
-            if let Some(revision) = review.revision {
-                println!("To revert it: tabkeeper undo (revision {revision}).");
+            match review.revisions[..] {
+                [] => {}
+                [revision] => println!("To revert it: tabkeeper undo (revision {revision})."),
+                _ => println!(
+                    "To revert it: tabkeeper undo, once for each of the {} revisions (the tree, then merges and splits).",
+                    review.revisions.len()
+                ),
             }
         }
         Command::Undo => {
@@ -358,13 +383,28 @@ async fn run(cli: Cli) -> Result<()> {
     Ok(())
 }
 
-/// Runs the tag review and asks which changes to apply. A failure is reported,
-/// not returned: the run's pages are saved either way.
+/// Runs the tag review and asks which changes to apply: first merges and
+/// splits, then, with hierarchical tags, where tags go in the tree, which
+/// needs the merged and split tags. A failure is reported, not returned: the
+/// run's pages are saved either way.
 async fn review_tags(db: &mut Db, config: &Config, yes: bool, say: &dyn Fn(&str)) -> report::ReviewReport {
     let llm_config = config.reconcile.llm_config(&config.llm);
     let mut outcome = report::ReviewReport {
         model: llm_config.model.clone(),
         ..Default::default()
+    };
+    let taxonomy = match config
+        .tags
+        .taxonomy
+        .as_deref()
+        .map(tree::Taxonomy::load)
+        .transpose()
+    {
+        Ok(taxonomy) => taxonomy,
+        Err(err) => {
+            outcome.error = Some(format!("{err:#}"));
+            return outcome;
+        }
     };
     let reviewer = match llm::OpenAiCompatible::new(&llm_config) {
         Ok(reviewer) => reviewer,
@@ -389,63 +429,139 @@ async fn review_tags(db: &mut Db, config: &Config, yes: bool, say: &dyn Fn(&str)
             usable = None;
         }
     }
-    let result = reconcile::review(db, &reviewer, usable, &config.reconcile, say).await;
-    outcome.usage = llm::Reviewer::usage(&reviewer);
-    outcome.embed_usage = embedder.as_ref().map(embed::Embedder::usage).unwrap_or_default();
-    let review = match result {
-        Ok(review) => review,
-        Err(err) => {
-            outcome.error = Some(format!("{err:#}"));
-            return outcome;
+
+    match reconcile::review(db, &reviewer, usable, &config.reconcile, say).await {
+        Ok(review) => {
+            outcome.merge_candidates = review.merge_candidates;
+            outcome.split_candidates = review.split_candidates;
+            if usable_or_fail(
+                &mut outcome,
+                &review.failed_requests,
+                review.proposed.is_empty(),
+                say,
+            ) {
+                decide_and_apply(
+                    db,
+                    &review.proposed,
+                    "The tag review proposes these changes:",
+                    yes,
+                    say,
+                    &mut outcome,
+                );
+            }
         }
-    };
-    outcome.merge_candidates = review.merge_candidates;
-    outcome.split_candidates = review.split_candidates;
-    outcome.proposed = review.proposed.len();
-    outcome.failed_requests = review.failed_requests.len();
-    if let Some(first) = review.failed_requests.first() {
-        if review.proposed.is_empty() {
-            outcome.error = Some(first.clone());
-            return outcome;
-        }
-        say(&format!(
-            "Warning: {} of the review's requests failed (first: {first}); those tags are checked again next time.",
-            review.failed_requests.len()
-        ));
-    }
-    if review.proposed.is_empty() {
-        return outcome;
+        Err(err) => outcome.error = Some(format!("{err:#}")),
     }
 
-    say("\nThe tag review proposes these changes:");
-    for (i, p) in review.proposed.iter().enumerate() {
+    if config.tags.style == config::TagStyle::Hierarchical && outcome.error.is_none() {
+        // Placing a first tree is many requests; without anyone to approve
+        // them, they wait for a run that can ask.
+        if yes || std::io::stdin().is_terminal() {
+            let max_depth = config.tags.max_depth;
+            match tree::place(
+                db,
+                &reviewer,
+                usable,
+                &config.reconcile,
+                max_depth,
+                taxonomy.as_ref(),
+                say,
+            )
+            .await
+            {
+                Ok(placement) => {
+                    if usable_or_fail(
+                        &mut outcome,
+                        &placement.failed_requests,
+                        placement.proposed.is_empty(),
+                        say,
+                    ) {
+                        decide_and_apply(
+                            db,
+                            &placement.proposed,
+                            "Placing tags in the tag tree:",
+                            yes,
+                            say,
+                            &mut outcome,
+                        );
+                    }
+                }
+                Err(err) => outcome.error = Some(format!("{err:#}")),
+            }
+        }
+        match db.topic_tags() {
+            Ok(tags) => outcome.unplaced = tags.iter().filter(|t| !t.placed).count(),
+            Err(err) => say(&format!(
+                "Warning: couldn't count the tags outside the tree: {err:#}"
+            )),
+        }
+    }
+    outcome.usage = llm::Reviewer::usage(&reviewer);
+    outcome.embed_usage = embedder.as_ref().map(embed::Embedder::usage).unwrap_or_default();
+    outcome
+}
+
+/// Records failed review requests. When they leave nothing to propose, the
+/// review failed; otherwise it goes on with what it has. Returns whether to go on.
+fn usable_or_fail(
+    outcome: &mut report::ReviewReport,
+    failed: &[String],
+    nothing: bool,
+    say: &dyn Fn(&str),
+) -> bool {
+    outcome.failed_requests += failed.len();
+    let Some(first) = failed.first() else {
+        return true;
+    };
+    if nothing {
+        outcome.error = Some(first.clone());
+        return false;
+    }
+    say(&format!(
+        "Warning: {} of the review's requests failed (first: {first}); those tags are checked again next time.",
+        failed.len()
+    ));
+    true
+}
+
+/// Lists the proposed changes, asks which to apply, and applies them as one
+/// revision.
+fn decide_and_apply(
+    db: &mut Db,
+    proposed: &[reconcile::Proposed],
+    heading: &str,
+    yes: bool,
+    say: &dyn Fn(&str),
+    outcome: &mut report::ReviewReport,
+) {
+    if proposed.is_empty() {
+        return;
+    }
+    outcome.proposed += proposed.len();
+    say(&format!("\n{heading}"));
+    for (i, p) in proposed.iter().enumerate() {
         say(&format!("  {:>2}. {}", i + 1, p.description));
     }
     let chosen: Vec<bool> = if yes {
-        vec![true; review.proposed.len()]
+        vec![true; proposed.len()]
     } else if !std::io::stdin().is_terminal() {
-        outcome.not_asked = review.proposed.len();
-        return outcome;
+        outcome.not_asked += proposed.len();
+        return;
     } else {
-        match ask_which(review.proposed.len()) {
+        match ask_which(proposed.len()) {
             Some(chosen) => chosen,
             // No answer: nothing is applied, and nothing counts as declined.
             None => {
-                outcome.not_asked = review.proposed.len();
-                return outcome;
+                outcome.not_asked += proposed.len();
+                return;
             }
         }
     };
 
     let mut apply = Vec::new();
     let mut keys = Vec::new();
-    for (p, keep) in review.proposed.iter().zip(&chosen) {
+    for (p, keep) in proposed.iter().zip(&chosen) {
         if *keep {
-            match &p.change {
-                db::TagChange::Merge { .. } => outcome.merges += 1,
-                db::TagChange::Rename { .. } => outcome.renames += 1,
-                db::TagChange::Split { .. } => outcome.splits += 1,
-            }
             apply.push(p.change.clone());
             keys.push(p.decision_keys.clone());
         } else {
@@ -457,36 +573,29 @@ async fn review_tags(db: &mut Db, config: &Config, yes: bool, say: &dyn Fn(&str)
             }
         }
     }
-    if !apply.is_empty() {
-        match db.apply_reviewed_changes(&apply, &keys) {
-            Ok(applied) => {
-                outcome.revision = applied.revision;
-                for (i, reason) in applied.failed {
-                    match &apply[i] {
-                        db::TagChange::Merge { .. } => outcome.merges -= 1,
-                        db::TagChange::Rename { .. } => outcome.renames -= 1,
-                        db::TagChange::Split { .. } => outcome.splits -= 1,
-                    }
-                    let description = review
-                        .proposed
-                        .iter()
-                        .find(|p| p.change == apply[i])
-                        .map_or("a change", |p| p.description.as_str());
-                    outcome.failed.push(format!(
-                        "{}: {reason}",
-                        description.split_whitespace().collect::<Vec<_>>().join(" ")
-                    ));
-                }
+    if apply.is_empty() {
+        return;
+    }
+    match db.apply_reviewed_changes(&apply, &keys) {
+        Ok(applied) => {
+            outcome.revisions.extend(applied.revision);
+            let failed: HashSet<usize> = applied.failed.iter().map(|(i, _)| *i).collect();
+            for (_, change) in apply.iter().enumerate().filter(|(i, _)| !failed.contains(i)) {
+                outcome.count_applied(change);
             }
-            Err(err) => {
-                outcome.error = Some(format!("applying the changes: {err:#}"));
-                outcome.merges = 0;
-                outcome.renames = 0;
-                outcome.splits = 0;
+            for (i, reason) in applied.failed {
+                let description = proposed
+                    .iter()
+                    .find(|p| p.change == apply[i])
+                    .map_or("a change", |p| p.description.as_str());
+                outcome.failed.push(format!(
+                    "{}: {reason}",
+                    description.split_whitespace().collect::<Vec<_>>().join(" ")
+                ));
             }
         }
+        Err(err) => outcome.error = Some(format!("applying the changes: {err:#}")),
     }
-    outcome
 }
 
 /// Asks which of `n` numbered changes to apply: all (the default), none, or
@@ -533,7 +642,7 @@ fn open_db(out: &Path) -> Result<Db> {
 
 /// Renders the notes and prints what's in the archive.
 fn finish(db: &Db, out: &Path, config: &Config) -> Result<()> {
-    let rendered = render::render_all(db, out, config.notes.title)?;
+    let rendered = render::render_all(db, out, config.notes.title, config.tags.style)?;
     let counts = db.status_counts()?;
     let causes = db.failure_kinds()?;
     if !causes.is_empty() {

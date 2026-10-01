@@ -4,7 +4,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use crate::config::TitleStyle;
+use crate::config::{TagStyle, TitleStyle};
 use crate::db::{Db, DonePage};
 use crate::tags::{CountedTag, count_tree};
 
@@ -18,7 +18,7 @@ pub struct RenderStats {
 
 /// Writes one note per processed page plus `_tags.md` and `_index.md`.
 /// Files in the notes folder that tabkeeper doesn't know about are left alone.
-pub fn render_all(db: &Db, out_dir: &Path, style: TitleStyle) -> Result<RenderStats> {
+pub fn render_all(db: &Db, out_dir: &Path, style: TitleStyle, tag_style: TagStyle) -> Result<RenderStats> {
     let notes_dir = out_dir.join(NOTES_DIR);
     std::fs::create_dir_all(&notes_dir).with_context(|| format!("creating {}", notes_dir.display()))?;
 
@@ -34,27 +34,38 @@ pub fn render_all(db: &Db, out_dir: &Path, style: TitleStyle) -> Result<RenderSt
             tags_by_page.entry(*page_id).or_default().push(tag);
         }
     }
+    let label = |t: &CountedTag| -> String {
+        match tag_style {
+            TagStyle::Hierarchical => t.path.clone(),
+            TagStyle::Flat => t.name.clone(),
+        }
+    };
     for list in tags_by_page.values_mut() {
-        list.sort_unstable_by(|a, b| a.path.cmp(&b.path));
+        list.sort_unstable_by_key(|t| label(t));
     }
 
     for page in &pages {
         let file = page.note_file.as_deref().expect("note files were just assigned");
-        let page_tags: Vec<&str> = tags_by_page
+        let labels: Vec<String> = tags_by_page
             .get(&page.id)
             .into_iter()
             .flatten()
-            .map(|t| t.path.as_str())
+            .map(|t| label(t))
             .collect();
+        let page_tags: Vec<&str> = labels.iter().map(String::as_str).collect();
         let path = notes_dir.join(file);
         std::fs::write(&path, note(page, &page_tags, style))
             .with_context(|| format!("writing {}", path.display()))?;
     }
 
-    std::fs::write(out_dir.join("_tags.md"), tags_markdown(&counted))?;
+    let listed = match tag_style {
+        TagStyle::Hierarchical => counted.clone(),
+        TagStyle::Flat => flat_list(&counted),
+    };
+    std::fs::write(out_dir.join("_tags.md"), tags_markdown(&listed))?;
     std::fs::write(
         out_dir.join("_index.md"),
-        index_markdown(&pages, &tags_by_page, style),
+        index_markdown(&pages, &tags_by_page, style, tag_style),
     )?;
     Ok(RenderStats { notes: pages.len() })
 }
@@ -193,6 +204,23 @@ pub fn note(page: &DonePage, tags: &[&str], style: TitleStyle) -> String {
     out
 }
 
+/// The tags as a flat list, most used first: each counts the pages tagged
+/// with it, and categories without pages of their own are left out.
+fn flat_list(counted: &[CountedTag]) -> Vec<CountedTag> {
+    let mut flat: Vec<CountedTag> = counted
+        .iter()
+        .filter(|t| t.direct > 0)
+        .map(|t| CountedTag {
+            path: t.name.clone(),
+            depth: 0,
+            total: t.direct,
+            ..t.clone()
+        })
+        .collect();
+    flat.sort_by(|a, b| b.total.cmp(&a.total).then(a.name.cmp(&b.name)));
+    flat
+}
+
 fn tags_markdown(counted: &[CountedTag]) -> String {
     let mut out = String::from("# Tags\n\nPages per tag, most used first.\n\n");
     for t in counted.iter().filter(|t| t.total > 0) {
@@ -218,11 +246,13 @@ fn markdown_link_text(s: &str) -> String {
 }
 
 /// Lists every page once, under its most used tag, so sections are big
-/// topics rather than one section per tag.
+/// topics rather than one section per tag. With hierarchical tags, the
+/// section is that tag's top-level category.
 fn index_markdown(
     pages: &[DonePage],
     tags_by_page: &HashMap<i64, Vec<&CountedTag>>,
     style: TitleStyle,
+    tag_style: TagStyle,
 ) -> String {
     let mut groups: BTreeMap<&str, Vec<&DonePage>> = BTreeMap::new();
     let mut untagged = Vec::new();
@@ -233,7 +263,15 @@ fn index_markdown(
             .flatten()
             .min_by(|a, b| b.total.cmp(&a.total).then(a.path.cmp(&b.path)));
         match main_tag {
-            Some(tag) => groups.entry(tag.path.as_str()).or_default().push(page),
+            Some(tag) => {
+                let section = match tag_style {
+                    // A tag at the top is its own section, `status/unreachable` included.
+                    TagStyle::Hierarchical if tag.depth == 0 => tag.path.as_str(),
+                    TagStyle::Hierarchical => tag.path.split('/').next().unwrap_or(&tag.path),
+                    TagStyle::Flat => tag.name.as_str(),
+                };
+                groups.entry(section).or_default().push(page)
+            }
             None => untagged.push(page),
         }
     }
@@ -353,7 +391,13 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
-            render_all(&db, dir.path(), crate::config::TitleStyle::Both).unwrap(),
+            render_all(
+                &db,
+                dir.path(),
+                crate::config::TitleStyle::Both,
+                TagStyle::Hierarchical
+            )
+            .unwrap(),
             RenderStats { notes: 3 }
         );
         let files: Vec<Option<String>> = db
@@ -393,7 +437,13 @@ mod tests {
         );
 
         // A second render keeps the same file names.
-        render_all(&db, dir.path(), crate::config::TitleStyle::Both).unwrap();
+        render_all(
+            &db,
+            dir.path(),
+            crate::config::TitleStyle::Both,
+            TagStyle::Hierarchical,
+        )
+        .unwrap();
         let again: Vec<Option<String>> = db
             .note_pages()
             .unwrap()
@@ -401,6 +451,67 @@ mod tests {
             .map(|p| p.note_file)
             .collect();
         assert_eq!(files, again);
+    }
+
+    #[test]
+    fn hierarchical_and_flat_tags() {
+        let mut db = Db::open_in_memory().unwrap();
+        let rust = db.create_tag("rust", None).unwrap();
+        let corrosion = db.create_tag("rust-corrosion", None).unwrap();
+        for url in ["https://a.com/", "https://b.com/"] {
+            db.add_page(url, url, None, "import").unwrap();
+        }
+        let ids: Vec<i64> = db.pending_pages().unwrap().iter().map(|p| p.id).collect();
+        for (id, (title, tag)) in ids.iter().zip([("Rust Book", rust), ("Iron Oxide", corrosion)]) {
+            let tags = [("x".to_string(), tag)];
+            db.save_result(
+                *id,
+                &PageResult {
+                    title,
+                    summary: "S.",
+                    lang: None,
+                    tags: &tags,
+                    page_title: None,
+                },
+            )
+            .unwrap();
+        }
+        let place = |parent: &[&str], tag: i64| crate::db::TagChange::Place {
+            parent: parent.iter().map(|s| s.to_string()).collect(),
+            tags: vec![tag],
+        };
+        db.apply_tag_changes(&[
+            place(&["technology", "programming-languages"], rust),
+            place(&["science", "chemistry"], corrosion),
+        ])
+        .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        render_all(&db, dir.path(), TitleStyle::Both, TagStyle::Hierarchical).unwrap();
+        let note = std::fs::read_to_string(dir.path().join("notes/rust-book.md")).unwrap();
+        assert!(
+            note.ends_with("#technology/programming-languages/rust\n"),
+            "{note}"
+        );
+        let index = std::fs::read_to_string(dir.path().join("_index.md")).unwrap();
+        assert!(index.contains("## science\n\n- [Iron Oxide]"), "{index}");
+        assert!(index.contains("## technology\n\n- [Rust Book]"), "{index}");
+        let tags = std::fs::read_to_string(dir.path().join("_tags.md")).unwrap();
+        assert!(
+            tags.contains("- **technology**: 1 page (0 tagged directly)\n  - **programming-languages**"),
+            "{tags}"
+        );
+
+        render_all(&db, dir.path(), TitleStyle::Both, TagStyle::Flat).unwrap();
+        let note = std::fs::read_to_string(dir.path().join("notes/rust-book.md")).unwrap();
+        assert!(note.ends_with("#rust\n"), "{note}");
+        let index = std::fs::read_to_string(dir.path().join("_index.md")).unwrap();
+        assert!(index.contains("## rust\n"), "{index}");
+        let tags = std::fs::read_to_string(dir.path().join("_tags.md")).unwrap();
+        assert!(
+            !tags.contains("technology"),
+            "categories without pages are left out: {tags}"
+        );
     }
 
     #[test]
@@ -418,7 +529,13 @@ mod tests {
         };
         db.save_unreachable(a, &stub, "timeout", "timed out").unwrap();
         let dir = tempfile::tempdir().unwrap();
-        render_all(&db, dir.path(), crate::config::TitleStyle::Both).unwrap();
+        render_all(
+            &db,
+            dir.path(),
+            crate::config::TitleStyle::Both,
+            TagStyle::Hierarchical,
+        )
+        .unwrap();
 
         // Page a goes back to pending and the run stops before retrying it;
         // a new page with the same title must not take a's file name.
@@ -437,7 +554,13 @@ mod tests {
             },
         )
         .unwrap();
-        render_all(&db, dir.path(), crate::config::TitleStyle::Both).unwrap();
+        render_all(
+            &db,
+            dir.path(),
+            crate::config::TitleStyle::Both,
+            TagStyle::Hierarchical,
+        )
+        .unwrap();
         let files: Vec<_> = db
             .note_pages()
             .unwrap()
@@ -474,7 +597,13 @@ mod tests {
         let mine = dir.path().join("notes/rust-ownership.md");
         std::fs::write(&mine, "my own note").unwrap();
 
-        render_all(&db, dir.path(), crate::config::TitleStyle::Both).unwrap();
+        render_all(
+            &db,
+            dir.path(),
+            crate::config::TitleStyle::Both,
+            TagStyle::Hierarchical,
+        )
+        .unwrap();
         assert_eq!(std::fs::read_to_string(&mine).unwrap(), "my own note");
         assert!(dir.path().join("notes/rust-ownership-2.md").exists());
     }
@@ -575,7 +704,7 @@ mod tests {
         .unwrap();
         db.set_page_title(id, "Short Tab Title").unwrap();
         let dir = tempfile::tempdir().unwrap();
-        render_all(&db, dir.path(), TitleStyle::Both).unwrap();
+        render_all(&db, dir.path(), TitleStyle::Both, TagStyle::Hierarchical).unwrap();
         assert!(dir.path().join("notes/short-tab-title.md").exists());
         let index = std::fs::read_to_string(dir.path().join("_index.md")).unwrap();
         assert!(
@@ -603,7 +732,7 @@ mod tests {
         .unwrap();
         db.set_page_title(id, "—").unwrap();
         let dir = tempfile::tempdir().unwrap();
-        render_all(&db, dir.path(), TitleStyle::Both).unwrap();
+        render_all(&db, dir.path(), TitleStyle::Both, TagStyle::Hierarchical).unwrap();
         assert!(dir.path().join("notes/model-title.md").exists());
     }
 

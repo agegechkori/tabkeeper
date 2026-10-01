@@ -28,6 +28,11 @@ pub enum TagChange {
     /// part gets its pages. A part with the tag's own name keeps the tag on its
     /// pages; one with another existing tag's name goes to that tag.
     Split { tag: i64, into: Vec<SplitPart> },
+    /// The tags go in the tag tree under `parent`, a path of category names
+    /// from the top (empty: at the top). Categories on the path that don't
+    /// exist yet are created; existing tags on it that aren't in the tree
+    /// yet are put there.
+    Place { parent: Vec<String>, tags: Vec<i64> },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -44,6 +49,8 @@ pub struct TagInfo {
     pub name: String,
     pub description: Option<String>,
     pub locked: bool,
+    /// Already in the tag tree.
+    pub placed: bool,
     pub pages: usize,
 }
 
@@ -68,10 +75,12 @@ enum Step {
     AliasesDeleted {
         aliases: Vec<(String, i64, String, bool, String)>,
     },
-    /// A new tag; if pages got it after the revision, undoing moves them to `fallback`.
+    /// A new tag; if pages got it after the revision, undoing moves them to
+    /// `fallback`. A new category has none: if pages got it, it stays, out of
+    /// the tree.
     TagCreated {
         id: i64,
-        fallback: i64,
+        fallback: Option<i64>,
     },
     TagDeleted {
         id: i64,
@@ -79,7 +88,15 @@ enum Step {
         description: Option<String>,
         parent_id: Option<i64>,
         locked: bool,
+        #[serde(default)]
+        placed: bool,
         created_at: String,
+    },
+    /// The tag's place in the tree before it was moved.
+    Moved {
+        id: i64,
+        parent: Option<i64>,
+        placed: bool,
     },
     Renamed {
         id: i64,
@@ -91,7 +108,7 @@ impl Db {
     /// Topic tags (not `status/` ones) on at least one page, most used first.
     pub fn topic_tags(&self) -> Result<Vec<TagInfo>> {
         let mut stmt = self.conn.prepare(
-            "SELECT t.id, t.name, t.description, t.locked, COUNT(DISTINCT pt.page_id) AS pages
+            "SELECT t.id, t.name, t.description, t.locked, t.placed, COUNT(DISTINCT pt.page_id) AS pages
              FROM tags t JOIN page_tags pt ON pt.resolved_tag_id = t.id JOIN pages p ON p.id = pt.page_id
              WHERE p.status = 'done' AND t.name NOT LIKE 'status/%'
              GROUP BY t.id ORDER BY pages DESC, t.name",
@@ -102,7 +119,8 @@ impl Db {
                 name: r.get(1)?,
                 description: r.get(2)?,
                 locked: r.get(3)?,
-                pages: usize::try_from(r.get::<_, i64>(4)?).unwrap_or(0),
+                placed: r.get(4)?,
+                pages: usize::try_from(r.get::<_, i64>(5)?).unwrap_or(0),
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -173,6 +191,7 @@ impl Db {
                 TagChange::Merge { from, into } => merge(&sp, *from, *into, &mut change_steps),
                 TagChange::Rename { tag, name } => rename(&sp, *tag, name, &mut change_steps),
                 TagChange::Split { tag, into } => split(&sp, *tag, into, &mut change_steps),
+                TagChange::Place { parent, tags } => place(&sp, parent, tags, &mut change_steps),
             };
             match result {
                 Ok(()) => {
@@ -259,11 +278,15 @@ fn retarget(tx: &Connection, from: i64, to: i64, page: Option<i64>, steps: &mut 
 }
 
 fn delete_tag(tx: &Connection, id: i64, steps: &mut Vec<Step>) -> Result<()> {
-    let (name, description, parent_id, locked, created_at) = tx.query_row(
-        "SELECT name, description, parent_id, locked, created_at FROM tags WHERE id = ?1",
+    let (name, description, parent_id, locked, placed, created_at) = tx.query_row(
+        "SELECT name, description, parent_id, locked, placed, created_at FROM tags WHERE id = ?1",
         [id],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
     )?;
+    // Its children move up a level.
+    for child in children(tx, id)? {
+        move_tag(tx, child, parent_id, steps)?;
+    }
     tx.execute("DELETE FROM embeddings WHERE kind = 'tag' AND ref_id = ?1", [id])?;
     tx.execute("DELETE FROM tags WHERE id = ?1", [id])?;
     steps.push(Step::TagDeleted {
@@ -272,8 +295,106 @@ fn delete_tag(tx: &Connection, id: i64, steps: &mut Vec<Step>) -> Result<()> {
         description,
         parent_id,
         locked,
+        placed,
         created_at,
     });
+    Ok(())
+}
+
+fn children(tx: &Connection, id: i64) -> Result<Vec<i64>> {
+    Ok(tx
+        .prepare("SELECT id FROM tags WHERE parent_id = ?1 ORDER BY id")?
+        .query_map([id], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
+/// (parent, placed) of a tag.
+fn position(tx: &Connection, id: i64) -> Result<(Option<i64>, bool)> {
+    tx.query_row("SELECT parent_id, placed FROM tags WHERE id = ?1", [id], |r| {
+        Ok((r.get(0)?, r.get(1)?))
+    })
+    .with_context(|| format!("tag {id} no longer exists"))
+}
+
+/// Puts a tag in the tree under `parent` (`None`: at the top).
+fn move_tag(tx: &Connection, id: i64, parent: Option<i64>, steps: &mut Vec<Step>) -> Result<()> {
+    let (old_parent, placed) = position(tx, id)?;
+    if placed && old_parent == parent {
+        return Ok(());
+    }
+    tx.execute(
+        "UPDATE tags SET parent_id = ?2, placed = 1 WHERE id = ?1",
+        params![id, parent],
+    )?;
+    steps.push(Step::Moved {
+        id,
+        parent: old_parent,
+        placed,
+    });
+    Ok(())
+}
+
+/// Whether `id` is somewhere below `ancestor` in the tree.
+fn is_below(tx: &Connection, id: i64, ancestor: i64) -> Result<bool> {
+    let mut current = position(tx, id)?.0;
+    let mut seen = 0;
+    while let Some(parent) = current {
+        if parent == ancestor {
+            return Ok(true);
+        }
+        seen += 1;
+        if seen > 64 {
+            bail!("the tag tree has a cycle at tag {id}");
+        }
+        current = position(tx, parent)?.0;
+    }
+    Ok(false)
+}
+
+fn place(tx: &Connection, parent: &[String], tags: &[i64], steps: &mut Vec<Step>) -> Result<()> {
+    let mut at: Option<i64> = None;
+    for name in parent {
+        // A tag, or the tag an alias with this name stands for.
+        let existing: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM tags WHERE name = ?1
+                 UNION ALL SELECT tag_id FROM tag_aliases WHERE alias = ?1
+                 LIMIT 1",
+                [name],
+                |r| r.get(0),
+            )
+            .optional()?;
+        at = Some(match existing {
+            Some(id) => {
+                if tags.contains(&id) {
+                    bail!("can't put {name} under itself");
+                }
+                let (parent_id, placed) = position(tx, id)?;
+                if !placed {
+                    move_tag(tx, id, at, steps)?;
+                } else if parent_id != at {
+                    bail!("{name} is already somewhere else in the tree");
+                }
+                id
+            }
+            None => {
+                tx.execute(
+                    "INSERT INTO tags (name, parent_id, placed, created_at) VALUES (?1, ?2, 1, ?3)",
+                    params![name, at, now()],
+                )?;
+                let id = tx.last_insert_rowid();
+                steps.push(Step::TagCreated { id, fallback: None });
+                id
+            }
+        });
+    }
+    for &tag in tags {
+        let (parent_id, placed) = position(tx, tag)?;
+        if placed && parent_id != at {
+            bail!("{} is already somewhere else in the tree", tag_name(tx, tag)?);
+        }
+        move_tag(tx, tag, at, steps)?;
+    }
     Ok(())
 }
 
@@ -301,6 +422,17 @@ fn merge(tx: &Connection, from: i64, into: i64, steps: &mut Vec<Step>) -> Result
     }
     let from_name = tag_name(tx, from)?;
     tag_name(tx, into)?;
+    // In the tree, `into` takes `from`'s place if it has none, or if it is
+    // below `from`; then `from`'s children move under `into`.
+    let (from_parent, from_placed) = position(tx, from)?;
+    if from_placed && (!position(tx, into)?.1 || is_below(tx, into, from)?) {
+        move_tag(tx, into, from_parent, steps)?;
+    }
+    for child in children(tx, from)? {
+        if child != into {
+            move_tag(tx, child, Some(into), steps)?;
+        }
+    }
     retarget(tx, from, into, None, steps)?;
     let aliases: Vec<String> = tx
         .prepare("SELECT alias FROM tag_aliases WHERE tag_id = ?1")?
@@ -370,7 +502,10 @@ fn split(tx: &Connection, tag: i64, parts: &[SplitPart], steps: &mut Vec<Step>) 
                     params![part.name, part.description, now()],
                 )?;
                 let id = tx.last_insert_rowid();
-                steps.push(Step::TagCreated { id, fallback: tag });
+                steps.push(Step::TagCreated {
+                    id,
+                    fallback: Some(tag),
+                });
                 id
             }
         };
@@ -506,11 +641,31 @@ fn undo_step(tx: &Connection, step: Step, freed_aliases: &mut Vec<(String, i64)>
             }
         }
         Step::TagCreated { id, fallback } => {
-            // Pages that got the new tag after the revision keep a tag.
+            // Children placed under it since go back to the top, out of the tree.
             tx.execute(
-                "UPDATE page_tags SET resolved_tag_id = ?2 WHERE resolved_tag_id = ?1",
-                params![id, fallback],
+                "UPDATE tags SET parent_id = NULL, placed = 0 WHERE parent_id = ?1",
+                [id],
             )?;
+            match fallback {
+                // Pages that got the new tag after the revision keep a tag.
+                Some(fallback) => {
+                    tx.execute(
+                        "UPDATE page_tags SET resolved_tag_id = ?2 WHERE resolved_tag_id = ?1",
+                        params![id, fallback],
+                    )?;
+                }
+                None => {
+                    let used: bool = tx.query_row(
+                        "SELECT EXISTS (SELECT 1 FROM page_tags WHERE resolved_tag_id = ?1)",
+                        [id],
+                        |r| r.get(0),
+                    )?;
+                    if used {
+                        tx.execute("UPDATE tags SET parent_id = NULL, placed = 0 WHERE id = ?1", [id])?;
+                        return Ok(());
+                    }
+                }
+            }
             tx.execute("DELETE FROM tag_aliases WHERE tag_id = ?1", [id])?;
             tx.execute("DELETE FROM embeddings WHERE kind = 'tag' AND ref_id = ?1", [id])?;
             tx.execute("DELETE FROM tags WHERE id = ?1", [id])?;
@@ -521,6 +676,7 @@ fn undo_step(tx: &Connection, step: Step, freed_aliases: &mut Vec<(String, i64)>
             description,
             parent_id,
             locked,
+            placed,
             created_at,
         } => {
             // A later run may have created a tag with the freed name, for a
@@ -535,13 +691,19 @@ fn undo_step(tx: &Connection, step: Step, freed_aliases: &mut Vec<(String, i64)>
                 )?;
             }
             tx.execute(
-                "INSERT INTO tags (id, name, description, parent_id, locked, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![id, name, description, parent_id, locked, created_at],
+                "INSERT INTO tags (id, name, description, parent_id, locked, placed, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![id, name, description, parent_id, locked, placed, created_at],
             )
             .with_context(|| format!("restoring tag {name}"))?;
             if let Some(newcomer) = newcomer {
                 absorb_tag(tx, newcomer, id)?;
             }
+        }
+        Step::Moved { id, parent, placed } => {
+            tx.execute(
+                "UPDATE tags SET parent_id = ?2, placed = ?3 WHERE id = ?1",
+                params![id, parent, placed],
+            )?;
         }
         Step::Renamed { id, old_name } => {
             tx.execute("UPDATE tags SET name = ?2 WHERE id = ?1", params![id, old_name])?;
@@ -776,6 +938,141 @@ mod tests {
         db.undo_last_revision().unwrap();
         assert_eq!(db.find_tag("golang").unwrap(), Some((go, true)));
         assert_eq!(names(&db), [("go".to_string(), 2)]);
+    }
+
+    /// Each tag's path in the tree, for the tags in it.
+    fn tree(db: &Db) -> Vec<String> {
+        let rows = db.tags().unwrap();
+        let mut out: Vec<String> = crate::tags::count_tree(&rows, &[])
+            .into_iter()
+            .filter(|t| rows.iter().any(|r| r.id == t.id && r.placed))
+            .map(|t| t.path)
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn place_change(parent: &[&str], tags: Vec<i64>) -> TagChange {
+        TagChange::Place {
+            parent: parent.iter().map(|s| s.to_string()).collect(),
+            tags,
+        }
+    }
+
+    #[test]
+    fn placing_creates_categories_and_undo_removes_them() {
+        let (mut db, _) = archive(&[&["rust"], &["python"], &["history"]]);
+        let (rust, python, history) = (id(&db, "rust"), id(&db, "python"), id(&db, "history"));
+        let applied = db
+            .apply_tag_changes(&[
+                place_change(&["technology", "programming-languages"], vec![rust, python]),
+                place_change(&[], vec![history]),
+            ])
+            .unwrap();
+        assert!(applied.failed.is_empty(), "{:?}", applied.failed);
+        assert_eq!(
+            tree(&db),
+            [
+                "history",
+                "technology",
+                "technology/programming-languages",
+                "technology/programming-languages/python",
+                "technology/programming-languages/rust"
+            ]
+        );
+        db.undo_last_revision().unwrap();
+        assert!(tree(&db).is_empty());
+        assert_eq!(db.find_tag("technology").unwrap(), None);
+        assert_eq!(names(&db).len(), 3);
+    }
+
+    #[test]
+    fn an_unplaced_tag_on_the_path_is_placed_and_a_conflict_fails() {
+        let (mut db, _) = archive(&[&["rust"], &["programming-languages"], &["go"]]);
+        let (rust, langs, go) = (id(&db, "rust"), id(&db, "programming-languages"), id(&db, "go"));
+        let applied = db
+            .apply_tag_changes(&[
+                place_change(&["technology", "programming-languages"], vec![rust]),
+                // programming-languages is under technology now.
+                place_change(&["science", "programming-languages"], vec![go]),
+                place_change(&["technology", "rust"], vec![rust]),
+            ])
+            .unwrap();
+        assert_eq!(applied.failed.iter().map(|(i, _)| *i).collect::<Vec<_>>(), [1, 2]);
+        assert_eq!(
+            tree(&db),
+            [
+                "technology",
+                "technology/programming-languages",
+                "technology/programming-languages/rust"
+            ]
+        );
+        assert!(db.tags().unwrap().iter().find(|t| t.id == langs).unwrap().placed);
+    }
+
+    #[test]
+    fn merging_keeps_the_tree() {
+        let (mut db, _) = archive(&[&["programming"], &["coding"], &["rust"]]);
+        let (programming, coding, rust) = (id(&db, "programming"), id(&db, "coding"), id(&db, "rust"));
+        db.apply_tag_changes(&[
+            place_change(&["technology"], vec![programming]),
+            place_change(&["technology", "programming"], vec![rust]),
+        ])
+        .unwrap();
+        // coding isn't in the tree: it takes programming's place, and rust
+        // moves under it.
+        db.apply_tag_changes(&[TagChange::Merge {
+            from: programming,
+            into: coding,
+        }])
+        .unwrap();
+        assert_eq!(
+            tree(&db),
+            ["technology", "technology/coding", "technology/coding/rust"]
+        );
+        db.undo_last_revision().unwrap();
+        assert_eq!(
+            tree(&db),
+            [
+                "technology",
+                "technology/programming",
+                "technology/programming/rust"
+            ]
+        );
+        // Merging a category into a tag below it lifts that tag up first.
+        db.apply_tag_changes(&[TagChange::Merge {
+            from: programming,
+            into: rust,
+        }])
+        .unwrap();
+        assert_eq!(tree(&db), ["technology", "technology/rust"]);
+        db.undo_last_revision().unwrap();
+        assert_eq!(
+            tree(&db),
+            [
+                "technology",
+                "technology/programming",
+                "technology/programming/rust"
+            ]
+        );
+    }
+
+    #[test]
+    fn undo_keeps_a_category_that_pages_got_since() {
+        let (mut db, pages) = archive(&[&["rust"]]);
+        let rust = id(&db, "rust");
+        db.apply_tag_changes(&[place_change(&["technology"], vec![rust])])
+            .unwrap();
+        let technology = id(&db, "technology");
+        db.conn
+            .execute(
+                "INSERT INTO page_tags (page_id, raw_tag, resolved_tag_id) VALUES (?1, 'technology', ?2)",
+                params![pages[0], technology],
+            )
+            .unwrap();
+        db.undo_last_revision().unwrap();
+        assert!(tree(&db).is_empty());
+        assert_eq!(db.find_tag("technology").unwrap(), Some((technology, false)));
     }
 
     #[test]

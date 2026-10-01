@@ -8,7 +8,7 @@ use crate::tags::TagRow;
 mod review;
 pub use review::{SplitPart, TagChange, TagInfo};
 
-const SCHEMA_VERSION: i32 = 6;
+const SCHEMA_VERSION: i32 = 7;
 
 /// Added in version 6: the tag review.
 const REVIEW_TABLES: &str = "
@@ -37,6 +37,11 @@ CREATE TABLE tag_decisions (
 /// Added in version 5: the page's own title, as in the browser tab or its
 /// HTML <title>, shown next to the model's title.
 const PAGE_TITLE_COLUMN: &str = "ALTER TABLE pages ADD COLUMN page_title TEXT;";
+
+/// Added in version 7: whether the tag has been put in the tag tree. A tag
+/// without a parent is either at the top of the tree (placed) or not in it
+/// yet, waiting for the next tag review to place it.
+const TREE_COLUMN: &str = "ALTER TABLE tags ADD COLUMN placed INTEGER NOT NULL DEFAULT 0;";
 
 const PAGES_TABLE: &str = "
 CREATE TABLE pages (
@@ -225,7 +230,7 @@ impl Db {
         let mut version: i32 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
         if version == 0 {
             conn.execute_batch(&format!(
-                "BEGIN; {PAGES_TABLE} {PAGE_TITLE_COLUMN} {SCHEMA} {RUNS_TABLE} {REVIEW_TABLES} COMMIT;"
+                "BEGIN; {PAGES_TABLE} {PAGE_TITLE_COLUMN} {SCHEMA} {TREE_COLUMN} {RUNS_TABLE} {REVIEW_TABLES} COMMIT;"
             ))?;
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             version = SCHEMA_VERSION;
@@ -253,6 +258,15 @@ impl Db {
         if version == 5 {
             migrate_v5_to_v6(&conn)?;
             version = 6;
+        }
+        if version == 6 {
+            conn.execute_batch(&format!(
+                "BEGIN; {TREE_COLUMN}
+                 UPDATE tags SET placed = 1
+                 WHERE parent_id IS NOT NULL OR id IN (SELECT parent_id FROM tags WHERE parent_id IS NOT NULL);
+                 PRAGMA user_version = 7; COMMIT;"
+            ))?;
+            version = 7;
         }
         if version != SCHEMA_VERSION {
             bail!(
@@ -427,6 +441,15 @@ impl Db {
         Ok(self.conn.last_insert_rowid())
     }
 
+    /// Every alias, with the tag it stands for.
+    pub fn aliases(&self) -> Result<Vec<(String, i64)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT alias, tag_id FROM tag_aliases ORDER BY alias")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// Records that `alias` resolves to `tag_id`. An existing alias is kept.
     pub fn add_alias(&self, alias: &str, tag_id: i64, source: &str) -> Result<()> {
         self.conn.execute(
@@ -437,15 +460,18 @@ impl Db {
     }
 
     pub fn tags(&self) -> Result<Vec<TagRow>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, parent_id, name, description FROM tags ORDER BY name")?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT id, parent_id, name, description, {placed} FROM tags ORDER BY name",
+            // A read-only database from before version 7 has no tree.
+            placed = if self.version >= 7 { "placed" } else { "0" }
+        ))?;
         let rows = stmt.query_map([], |r| {
             Ok(TagRow {
                 id: r.get(0)?,
                 parent_id: r.get(1)?,
                 name: r.get(2)?,
                 description: r.get(3)?,
+                placed: r.get(4)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -914,6 +940,7 @@ mod tests {
             })
             .unwrap();
         assert!(tags_sql.contains("AUTOINCREMENT"), "{tags_sql}");
+        assert!(tags_sql.contains("placed"), "{tags_sql}");
         assert!(tags_sql.contains("REFERENCES tags(id)"), "{tags_sql}");
         assert_eq!(db.find_tag("rust").unwrap(), Some((3, false)));
 

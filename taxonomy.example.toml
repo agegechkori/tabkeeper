@@ -1,0 +1,25 @@
+# Top-level categories for the tag tree, for --taxonomy or [tags] taxonomy.
+# Without a file they emerge from your pages.
+
+# true: these are the only top-level categories allowed. false: the model
+# prefers them, and adds others only when none fits.
+strict = false
+
+# A name, or a name with a description that tells the model what goes there.
+categories = [
+    { name = "technology", description = "software, hardware, the internet, AI" },
+    { name = "science", description = "natural sciences, mathematics, research" },
+    "business",
+    "finance",
+    "health",
+    "food",
+    "travel",
+    "entertainment",
+    "sports",
+    "politics",
+    "history",
+    "culture",
+    "education",
+    "home",
+    "shopping",
+]

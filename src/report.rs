@@ -149,11 +149,16 @@ pub struct ReviewReport {
     pub merges: usize,
     pub renames: usize,
     pub splits: usize,
+    /// Groups of tags put in the tag tree, and how many tags they held.
+    pub placements: usize,
+    pub tags_placed: usize,
+    /// Tags still outside the tag tree (hierarchical mode).
+    pub unplaced: usize,
     pub declined: usize,
     /// Proposed changes left unapplied because nobody could be asked.
     pub not_asked: usize,
-    /// The revision `tabkeeper undo` reverts.
-    pub revision: Option<i64>,
+    /// The revisions applied, oldest first; `tabkeeper undo` reverts the last.
+    pub revisions: Vec<i64>,
     /// Approved changes that couldn't be applied, with the reason.
     pub failed: Vec<String>,
     /// Review requests that failed; their tags are checked again next time.
@@ -164,7 +169,20 @@ pub struct ReviewReport {
 
 impl ReviewReport {
     pub fn applied(&self) -> usize {
-        self.merges + self.renames + self.splits
+        self.merges + self.renames + self.splits + self.placements
+    }
+
+    pub fn count_applied(&mut self, change: &crate::db::TagChange) {
+        use crate::db::TagChange;
+        match change {
+            TagChange::Merge { .. } => self.merges += 1,
+            TagChange::Rename { .. } => self.renames += 1,
+            TagChange::Split { .. } => self.splits += 1,
+            TagChange::Place { tags, .. } => {
+                self.placements += 1;
+                self.tags_placed += tags.len();
+            }
+        }
     }
 
     /// One line for the end of a run or `revise-tags`.
@@ -172,16 +190,29 @@ impl ReviewReport {
         if let Some(error) = &self.error {
             return format!("the tag review failed ({error}); run `tabkeeper revise-tags` to try again");
         }
+        let unplaced = (self.unplaced > 0).then(|| {
+            format!(
+                "{} not in the tag tree yet, for the next `tabkeeper revise-tags`",
+                crate::reconcile::count(self.unplaced, "tag", "tags")
+            )
+        });
         if self.proposed == 0 {
-            return "no changes needed".into();
+            return unplaced.unwrap_or_else(|| "no changes needed".into());
+        }
+        let mut done = format!(
+            "{} merges · {} renames · {} splits",
+            self.merges, self.renames, self.splits
+        );
+        if self.placements > 0 {
+            done.push_str(&format!(
+                " · {} placed in the tree",
+                crate::reconcile::count(self.tags_placed, "tag", "tags")
+            ));
         }
         let mut parts = vec![format!(
-            "{} of {} proposed changes applied ({} merges · {} renames · {} splits)",
+            "{} of {} proposed changes applied ({done})",
             self.applied(),
-            self.proposed,
-            self.merges,
-            self.renames,
-            self.splits
+            self.proposed
         )];
         if self.declined > 0 {
             parts.push(format!("{} declined", self.declined));
@@ -205,6 +236,7 @@ impl ReviewReport {
                 self.not_asked
             ));
         }
+        parts.extend(unplaced);
         parts.join(" · ")
     }
 }
