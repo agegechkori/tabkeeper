@@ -150,6 +150,8 @@ struct TreeModel {
     /// Placements decided before (declined): a path doesn't put a tag
     /// there as a category either.
     declined: HashSet<String>,
+    /// Locked tags outside the tree, which no path puts in it.
+    locked: HashSet<String>,
 }
 
 impl TreeModel {
@@ -179,10 +181,16 @@ impl TreeModel {
             }
         }
         let declined = db.tag_decision_keys("place:")?.into_iter().collect();
+        let locked = rows
+            .iter()
+            .filter(|t| t.locked && !t.placed)
+            .map(|t| t.name.clone())
+            .collect();
         Ok(Self {
             parents,
             canonical,
             declined,
+            locked,
         })
     }
 
@@ -235,8 +243,8 @@ impl TreeModel {
             let name = self.canonical.get(&name).cloned().unwrap_or(name);
             let elsewhere = self.parents.get(&name).is_some_and(|p| p[..] != parent[..]);
             // A tag not in the tree yet would be put here as a category.
-            let declined_here =
-                !self.parents.contains_key(&name) && self.declined.contains(&place_key(&name, &parent));
+            let declined_here = !self.parents.contains_key(&name)
+                && (self.declined.contains(&place_key(&name, &parent)) || self.locked.contains(&name));
             if name == tag || parent.contains(&name) || elsewhere || declined_here {
                 break;
             }
@@ -324,11 +332,15 @@ pub async fn place<R: Reviewer, E: Embedder>(
         }}}
     });
     for batch in unplaced.chunks(DOMAIN_BATCH.min(config.batch_size)) {
-        let domains: Vec<String> = model
+        // Domains in the tree, and those chosen in earlier batches.
+        let mut domains: Vec<String> = model
             .categories()
             .into_iter()
             .filter(|c| !c.contains('/'))
+            .chain(by_domain.keys().cloned())
             .collect();
+        domains.sort();
+        domains.dedup();
         let mut user = format!(
             "Existing domains: {}\n\nTags:\n",
             if domains.is_empty() {
@@ -667,6 +679,7 @@ mod tests {
                 .collect(),
             canonical: HashMap::from([("golang".to_string(), "go".to_string())]),
             declined: HashSet::from([place_key("history", &[])]),
+            locked: HashSet::from(["research".to_string()]),
         }
     }
 
@@ -701,6 +714,11 @@ mod tests {
         assert_eq!(
             m.check("gin", &path(&["technology", "golang"]), 2, None),
             Some(path(&["technology", "go"]))
+        );
+        // So does a locked tag outside the tree.
+        assert_eq!(
+            m.check("labs", &path(&["science", "research"]), 2, None),
+            Some(path(&["science"]))
         );
         // So does a category whose placement there was declined.
         assert_eq!(m.check("ww2", &path(&["history"]), 2, None), Some(vec![]));

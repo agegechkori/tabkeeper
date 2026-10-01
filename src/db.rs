@@ -461,7 +461,7 @@ impl Db {
 
     pub fn tags(&self) -> Result<Vec<TagRow>> {
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT id, parent_id, name, description, {placed} FROM tags ORDER BY name",
+            "SELECT id, parent_id, name, description, {placed}, locked FROM tags ORDER BY name",
             // A read-only database from before version 7 has no tree.
             placed = if self.version >= 7 { "placed" } else { "0" }
         ))?;
@@ -472,6 +472,7 @@ impl Db {
                 name: r.get(2)?,
                 description: r.get(3)?,
                 placed: r.get(4)?,
+                locked: r.get(5)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)

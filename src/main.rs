@@ -396,19 +396,6 @@ async fn review_tags(db: &mut Db, config: &Config, yes: bool, say: &dyn Fn(&str)
         model: llm_config.model.clone(),
         ..Default::default()
     };
-    let taxonomy = match config
-        .tags
-        .taxonomy
-        .as_deref()
-        .map(tree::Taxonomy::load)
-        .transpose()
-    {
-        Ok(taxonomy) => taxonomy,
-        Err(err) => {
-            outcome.error = Some(format!("{err:#}"));
-            return outcome;
-        }
-    };
     let reviewer = match llm::OpenAiCompatible::new(&llm_config) {
         Ok(reviewer) => reviewer,
         Err(err) => {
@@ -461,7 +448,19 @@ async fn review_tags(db: &mut Db, config: &Config, yes: bool, say: &dyn Fn(&str)
     if config.tags.style == config::TagStyle::Hierarchical && outcome.error.is_none() {
         // Placing a first tree is many requests; without anyone to approve
         // them, they wait for a run that can ask.
-        if yes || std::io::stdin().is_terminal() {
+        // The taxonomy only matters for the tree, so only the tree needs it.
+        let taxonomy = config
+            .tags
+            .taxonomy
+            .as_deref()
+            .map(tree::Taxonomy::load)
+            .transpose();
+        if let Err(err) = &taxonomy {
+            outcome.tree_error = Some(format!("{err:#}"));
+        }
+        if let Ok(taxonomy) = taxonomy
+            && (yes || std::io::stdin().is_terminal())
+        {
             let max_depth = config.tags.max_depth;
             match tree::place(
                 db,
@@ -618,7 +617,7 @@ fn decide_and_apply(
             if through {
                 apply.remove(i);
                 keys.remove(i);
-                outcome.not_asked += 1;
+                outcome.held_back += 1;
             } else {
                 i += 1;
             }

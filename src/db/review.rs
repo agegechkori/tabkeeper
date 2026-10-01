@@ -380,6 +380,11 @@ fn place(tx: &Connection, parent: &[String], tags: &[i64], steps: &mut Vec<Step>
                 }
                 let (parent_id, placed) = position(tx, id)?;
                 if !placed {
+                    let locked: bool =
+                        tx.query_row("SELECT locked FROM tags WHERE id = ?1", [id], |r| r.get(0))?;
+                    if locked {
+                        bail!("{name} is locked outside the tree");
+                    }
                     move_tag(tx, id, at, steps)?;
                 } else if parent_id != at {
                     bail!("{name} is already somewhere else in the tree");

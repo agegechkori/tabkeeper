@@ -157,6 +157,9 @@ pub struct ReviewReport {
     pub declined: usize,
     /// Proposed changes left unapplied because nobody could be asked.
     pub not_asked: usize,
+    /// Approved placements held back because their path goes through a tag
+    /// whose own placement was declined.
+    pub held_back: usize,
     /// The revisions applied, oldest first; `tabkeeper undo` reverts the last.
     pub revisions: Vec<i64>,
     /// Approved changes that couldn't be applied, with the reason.
@@ -243,6 +246,12 @@ impl ReviewReport {
             parts.push(format!(
                 "{} waiting: run `tabkeeper revise-tags` in a terminal, or add --yes",
                 self.not_asked
+            ));
+        }
+        if self.held_back > 0 {
+            parts.push(format!(
+                "{} held back: they go through a tag whose placement you declined",
+                self.held_back
             ));
         }
         parts.extend(notes);

@@ -81,6 +81,8 @@ pub struct TagRow {
     pub description: Option<String>,
     /// Put in the tag tree; see `placed` in the database schema.
     pub placed: bool,
+    /// Decided by you: the tag review leaves it where it is.
+    pub locked: bool,
 }
 
 /// A tag with page counts, in tree order.
@@ -223,6 +225,7 @@ mod tests {
             name: name.into(),
             description: None,
             placed: parent.is_some(),
+            locked: false,
         }
     }
 
