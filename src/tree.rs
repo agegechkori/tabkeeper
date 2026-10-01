@@ -221,7 +221,9 @@ impl TreeModel {
         }
         let mut parent: Vec<String> = Vec::new();
         for segment in raw.iter().take(levels) {
-            let name = normalize_name(segment)?;
+            let Some(name) = normalize_name(segment) else {
+                break;
+            };
             let name = self.canonical.get(&name).cloned().unwrap_or(name);
             let elsewhere = self.parents.get(&name).is_some_and(|p| p[..] != parent[..]);
             if name == tag || parent.contains(&name) || elsewhere {
@@ -286,7 +288,16 @@ pub async fn place<R: Reviewer, E: Embedder>(
         return Ok(placement);
     }
     if let Some(embedder) = embedder {
-        unplaced = similar_together(unplaced, embedder).await?;
+        // Only an aid to batching: without it, batches go by use.
+        match similar_together(&unplaced, embedder).await {
+            Ok(order) => {
+                let mut slots: Vec<Option<TagInfo>> = unplaced.into_iter().map(Some).collect();
+                unplaced = order.into_iter().filter_map(|i| slots[i].take()).collect();
+            }
+            Err(err) => note(&format!(
+                "Warning: couldn't embed the tag names ({err:#}); tags are placed in order of use."
+            )),
+        }
     }
     note(&format!("Placing {} tags in the tag tree.", unplaced.len()));
 
@@ -362,11 +373,31 @@ pub async fn place<R: Reviewer, E: Embedder>(
         }}}
     });
     let mut chosen: Vec<(&TagInfo, Vec<String>)> = Vec::new();
+    // A tag that is a domain of other tags but was itself put in a domain
+    // goes there first, so its tags follow it wherever the domains come.
+    for (domain, tags) in &by_domain {
+        for tag in tags
+            .iter()
+            .filter(|t| &t.name != domain && by_domain.contains_key(&t.name))
+        {
+            let mut base = model.parents.get(domain).cloned().unwrap_or_default();
+            base.push(domain.clone());
+            choose(db, &mut model, &mut chosen, tag, &base, levels, strict.as_ref())?;
+        }
+    }
     for (domain, tags) in &by_domain {
         // A tag that is its own domain goes at the top.
         let (own, rest): (Vec<&TagInfo>, Vec<&TagInfo>) = tags.iter().partition(|t| &t.name == domain);
         for tag in own {
             choose(db, &mut model, &mut chosen, tag, &[], levels, strict.as_ref())?;
+        }
+        // Tags already placed (as another domain) aren't asked about again.
+        let rest: Vec<&TagInfo> = rest
+            .into_iter()
+            .filter(|t| !chosen.iter().any(|(c, _)| c.id == t.id))
+            .collect();
+        if rest.is_empty() {
+            continue;
         }
         // The domain may be a category further down the tree: tags go
         // under its whole path, as deep as the tree allows.
@@ -534,20 +565,19 @@ fn group(db: &Db, chosen: Vec<(&TagInfo, Vec<String>)>) -> Result<Vec<Proposed>>
 
 /// Orders tags so similar ones are next to each other and land in the same
 /// batch, where the model places them consistently.
-async fn similar_together<E: Embedder>(tags: Vec<TagInfo>, embedder: &E) -> Result<Vec<TagInfo>> {
+/// Returns the new order as indexes into `tags`.
+async fn similar_together<E: Embedder>(tags: &[TagInfo], embedder: &E) -> Result<Vec<usize>> {
     // The ordering is quadratic; past this, batches stay in usage order.
     const MAX: usize = 3000;
     if tags.len() < 3 || tags.len() > MAX {
-        return Ok(tags);
+        return Ok((0..tags.len()).collect());
     }
     let names: Vec<String> = tags.iter().map(|t| t.name.replace('-', " ")).collect();
     let mut vectors = Vec::with_capacity(names.len());
     for chunk in names.chunks(BATCH_SIZE) {
         vectors.extend(embedder.embed(chunk).await?);
     }
-    let order = nearest_neighbour_order(&vectors);
-    let mut slots: Vec<Option<TagInfo>> = tags.into_iter().map(Some).collect();
-    Ok(order.into_iter().filter_map(|i| slots[i].take()).collect())
+    Ok(nearest_neighbour_order(&vectors))
 }
 
 /// Starts at the first vector and keeps going to the most similar one not
@@ -635,6 +665,11 @@ mod tests {
         assert_eq!(
             m.check("gin", &path(&["technology", "golang"]), 2, None),
             Some(path(&["technology", "go"]))
+        );
+        // So does a name that can't be a tag.
+        assert_eq!(
+            m.check("rust", &path(&["technology", "2024", "x"]), 2, None),
+            Some(path(&["technology"]))
         );
         // A strict taxonomy limits the top level.
         let allowed = HashSet::from(["technology"]);
@@ -771,6 +806,41 @@ mod tests {
             .map(|p| p.description.as_str())
             .collect();
         assert_eq!(descriptions, ["place  technology/programming ← rust"]);
+    }
+
+    #[tokio::test]
+    async fn a_tag_that_is_a_domain_goes_in_its_own_domain_first() {
+        use crate::reconcile::tests::{FakeReviewer, NameEmbedder, archive};
+        let db = archive(&[(&["programming"], [1.0, 0.0, 0.0]), (&["rust"], [1.0, 0.1, 0.0])]);
+        // programming is in technology, and rust in programming: whatever the
+        // order of the domains, rust ends up under technology/programming.
+        let reviewer = FakeReviewer::new(vec![json!({"domains": [
+            {"tag": 1, "domain": "technology"},
+            {"tag": 2, "domain": "programming"}
+        ]})]);
+        let placement = place(
+            &db,
+            &reviewer,
+            None::<&NameEmbedder>,
+            &ReconcileConfig::default(),
+            3,
+            None,
+            |_| {},
+        )
+        .await
+        .unwrap();
+        let descriptions: Vec<&str> = placement
+            .proposed
+            .iter()
+            .map(|p| p.description.as_str())
+            .collect();
+        assert_eq!(
+            descriptions,
+            [
+                "place  technology ← programming (new: technology)",
+                "place  technology/programming ← rust"
+            ]
+        );
     }
 
     #[tokio::test]

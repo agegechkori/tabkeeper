@@ -451,6 +451,7 @@ async fn review_tags(db: &mut Db, config: &Config, yes: bool, say: &dyn Fn(&str)
                     yes,
                     say,
                     &mut outcome,
+                    false,
                 );
             }
         }
@@ -488,6 +489,7 @@ async fn review_tags(db: &mut Db, config: &Config, yes: bool, say: &dyn Fn(&str)
                             yes,
                             say,
                             &mut outcome,
+                            true,
                         );
                     }
                 }
@@ -546,6 +548,7 @@ fn decide_and_apply(
     yes: bool,
     say: &dyn Fn(&str),
     outcome: &mut report::ReviewReport,
+    tree_step: bool,
 ) {
     if proposed.is_empty() {
         return;
@@ -586,6 +589,41 @@ fn decide_and_apply(
             }
         }
     }
+    // A placement whose path goes through a tag whose own placement was
+    // declined would put that tag in the tree anyway; it waits for the next
+    // review.
+    let declined_tags: HashSet<i64> = proposed
+        .iter()
+        .zip(&chosen)
+        .filter(|(_, keep)| !**keep)
+        .filter_map(|(p, _)| match &p.change {
+            db::TagChange::Place { tags, .. } => Some(tags.clone()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    if !declined_tags.is_empty() {
+        let names: HashSet<String> = db
+            .tags()
+            .map(|rows| {
+                rows.into_iter()
+                    .filter(|t| declined_tags.contains(&t.id))
+                    .map(|t| t.name)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut i = 0;
+        while i < apply.len() {
+            let through = matches!(&apply[i], db::TagChange::Place { parent, .. } if parent.iter().any(|p| names.contains(p)));
+            if through {
+                apply.remove(i);
+                keys.remove(i);
+                outcome.not_asked += 1;
+            } else {
+                i += 1;
+            }
+        }
+    }
     if apply.is_empty() {
         return;
     }
@@ -607,7 +645,14 @@ fn decide_and_apply(
                 ));
             }
         }
-        Err(err) => outcome.error = Some(format!("applying the changes: {err:#}")),
+        Err(err) => {
+            let error = Some(format!("applying the changes: {err:#}"));
+            if tree_step {
+                outcome.tree_error = error;
+            } else {
+                outcome.error = error;
+            }
+        }
     }
 }
 
