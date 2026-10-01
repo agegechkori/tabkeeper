@@ -136,34 +136,48 @@ async fn run(cli: Cli) -> Result<()> {
                 );
             }
 
+            // With --json, stdout is only for the report; everything else goes to stderr.
+            let say = |text: &str| {
+                if json {
+                    eprintln!("{text}")
+                } else {
+                    println!("{text}")
+                }
+            };
             let started_at = db::now();
             let started = std::time::Instant::now();
             let mut db = open_db(&cli.out)?;
             let stats = import::import_url_list(&db, &text, &filter)?;
-            println!(
+            say(&format!(
                 "Imported {} new URLs ({} already known, {} duplicates, {} skipped by the filter, {} non-web).",
                 stats.added, stats.known, stats.duplicates, stats.filtered, stats.not_web
-            );
+            ));
             for bad in &stats.invalid {
-                println!("Skipped invalid URL: {bad}");
+                say(&format!("Skipped invalid URL: {bad}"));
             }
             if retry_failed {
-                println!("Retrying {} failed and unreachable pages.", db.retry_failed()?);
+                say(&format!(
+                    "Retrying {} failed and unreachable pages.",
+                    db.retry_failed()?
+                ));
             }
 
             let fetcher = fetch::HttpFetcher::new(&config.fetch)?;
             let llm = llm::OpenAiCompatible::new(&config.llm)?;
-            println!("Using model {} at {}.", config.llm.model, config.llm.base_url);
+            say(&format!(
+                "Using model {} at {}.",
+                config.llm.model, config.llm.base_url
+            ));
 
             // Embeddings are optional: any problem setting them up is a warning,
             // and the model is shown the most used tags instead.
             let unavailable = |err: anyhow::Error| {
-                println!(
+                say(&format!(
                     "Warning: embeddings are unavailable ({err:#}).\n\
                      The model will be shown the most used tags instead of the most relevant ones. \
                      If the embedding model is missing on Ollama, run: ollama pull {}",
                     config.embeddings.model
-                )
+                ))
             };
             let embedder = if config.embeddings.enabled {
                 embed::OpenAiEmbedder::new(&config.embeddings, &config.llm)
@@ -176,10 +190,10 @@ async fn run(cli: Cli) -> Result<()> {
             if let Some(embedder) = &embedder {
                 match pipeline::Embeddings::prepare(&db, embedder, config.embeddings.page_chars).await {
                     Ok(e) => {
-                        println!(
+                        say(&format!(
                             "Using embedding model {} to pick relevant tags.",
                             config.embeddings.model
-                        );
+                        ));
                         embeddings = Some(e);
                     }
                     Err(err) => unavailable(err),
@@ -193,12 +207,14 @@ async fn run(cli: Cli) -> Result<()> {
                 filter: &filter,
                 limit,
                 budget,
+                progress_to_stderr: json,
             };
-            let mut summary =
-                pipeline::process_pending(&mut db, &fetcher, &llm, embeddings.as_mut(), &options).await?;
+            let result =
+                pipeline::process_pending(&mut db, &fetcher, &llm, embeddings.as_mut(), &options).await;
 
             // Render and report whatever was finished, even if the run stopped early.
             render::render_all(&db, &cli.out)?;
+            let mut summary = result?;
             let embed_usage = match (&embedder, &embeddings) {
                 (Some(embedder), Some(e)) => Some((embed::Embedder::usage(embedder), e.errors)),
                 _ => None,

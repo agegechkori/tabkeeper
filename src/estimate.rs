@@ -85,15 +85,21 @@ struct PerPage {
 fn per_page(last: Option<&Report>, config: &Config) -> PerPage {
     if let Some(report) = last {
         let usage = &report.model.summaries.usage;
-        let answered = usage
-            .requests
-            .saturating_sub(usage.retries)
-            .saturating_sub(usage.responses_without_usage);
+        // Per page sent to the model: a page whose reply was invalid is asked
+        // twice, and both requests count. Reports from before model_pages was
+        // recorded fall back to counting replies.
+        let pages = match report.run.model_pages {
+            0 => usage
+                .requests
+                .saturating_sub(usage.retries)
+                .saturating_sub(usage.responses_without_usage) as usize,
+            n => n,
+        };
         let processed = report.run.processed;
-        if answered > 0 && processed > 0 {
+        if pages > 0 && processed > 0 && usage.input_tokens > 0 {
             return PerPage {
-                input_tokens: usage.input_tokens as f64 / answered as f64,
-                output_tokens: usage.output_tokens as f64 / answered as f64,
+                input_tokens: usage.input_tokens as f64 / pages as f64,
+                output_tokens: usage.output_tokens as f64 / pages as f64,
                 secs: Some(report.duration_secs / processed as f64),
                 from_last_run: true,
             };
@@ -282,5 +288,11 @@ mod tests {
             (each.input_tokens, each.output_tokens, each.secs),
             (3_000.0, 250.0, Some(10.0))
         );
+
+        // Per page, not per request: pages asked twice after an invalid reply
+        // use both requests' tokens.
+        last.run.model_pages = 5;
+        let each = per_page(Some(&last), &config);
+        assert_eq!((each.input_tokens, each.output_tokens), (6_000.0, 500.0));
     }
 }

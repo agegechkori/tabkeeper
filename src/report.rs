@@ -49,6 +49,8 @@ pub struct RunCounts {
     pub skipped_by_filter: usize,
     /// Pages still pending after the run.
     pub pending: usize,
+    /// Pages sent to the model (done, or failed at the model).
+    pub model_pages: usize,
     /// Unreachable and failed pages by cause, e.g. `not_found`.
     pub causes: BTreeMap<String, usize>,
 }
@@ -185,9 +187,11 @@ pub async fn build(db: &Db, ctx: &RunContext<'_>) -> Result<Report> {
     });
     let prices = config.llm.prices();
     let embed_tokens = embeddings.as_ref().map_or(0, |e| e.usage.input_tokens);
+    // Without prices for the summaries, which cost by far the most, the cost
+    // of a cloud run is unknown, whatever the embeddings cost.
     let cost = if local {
         Some(0.0)
-    } else if prices.is_set() || config.embeddings.price_per_mtok > 0.0 {
+    } else if prices.is_set() {
         Some(
             prices.cost(summaries.usage.input_tokens, summaries.usage.output_tokens)
                 + embed_tokens as f64 * config.embeddings.price_per_mtok / 1e6,
@@ -213,6 +217,7 @@ pub async fn build(db: &Db, ctx: &RunContext<'_>) -> Result<Report> {
             failed: stats.failed,
             skipped_by_filter: stats.filtered,
             pending: counts.pending,
+            model_pages: stats.model_pages,
             causes: stats.causes.clone(),
         },
         archive: ArchiveCounts {
@@ -232,7 +237,7 @@ pub async fn build(db: &Db, ctx: &RunContext<'_>) -> Result<Report> {
             pages_cut: stats.pages_cut,
             max_input_chars: config.llm.max_input_chars,
             fetch_secs_per_page: per(ctx.summary.fetch_secs, processed),
-            model_secs_per_page: per(ctx.summary.model_secs, stats.done + stats.failed),
+            model_secs_per_page: per(ctx.summary.model_secs, stats.model_pages),
             concurrency: config.run.concurrency,
         },
         tabkeeper: process_usage(),
@@ -749,6 +754,41 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[tokio::test]
+    async fn cloud_cost_is_unknown_without_summary_prices() {
+        let db = Db::open_in_memory().unwrap();
+        let mut config = Config::default();
+        config.llm.base_url = "https://api.example.com/v1".into();
+        config.embeddings.price_per_mtok = 0.02;
+        let summary = RunSummary::default();
+        let usage = StageUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 100_000,
+            ..Default::default()
+        };
+        let embeddings = StageUsage {
+            input_tokens: 500_000,
+            ..Default::default()
+        };
+        let ctx = |config| RunContext {
+            started_at: "2026-01-01T00:00:00Z",
+            started: std::time::Instant::now(),
+            import: None,
+            summary: &summary,
+            summaries: usage.clone(),
+            embeddings: Some((embeddings.clone(), 0)),
+            config,
+        };
+        let mut priced = config.clone();
+        priced.llm.price_input_per_mtok = 1.0;
+        assert_eq!(build(&db, &ctx(&config)).await.unwrap().model.cost, None);
+        let cost = build(&db, &ctx(&priced)).await.unwrap().model.cost.unwrap();
+        assert!(
+            (cost - 1.01).abs() < 1e-9,
+            "$1 for summaries plus $0.01 for embeddings: {cost}"
+        );
+    }
 
     #[test]
     fn formats_numbers_tokens_and_durations() {
