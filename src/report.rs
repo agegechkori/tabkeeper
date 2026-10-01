@@ -252,7 +252,11 @@ pub async fn build(db: &Db, ctx: &RunContext<'_>) -> Result<Report> {
     } else if prices.is_set() {
         Some(
             prices.cost(summaries.usage.input_tokens, summaries.usage.output_tokens)
-                + embed_tokens as f64 * config.embeddings.price_per_mtok / 1e6,
+                + embed_tokens as f64 * config.embeddings.price_per_mtok / 1e6
+                // The tag review is priced like the summaries.
+                + ctx.review.as_ref().map_or(0.0, |r| {
+                    prices.cost(r.usage.input_tokens, r.usage.output_tokens)
+                }),
         )
     } else {
         None

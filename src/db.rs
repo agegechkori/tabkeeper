@@ -59,8 +59,10 @@ CREATE TABLE pages (
 const SCHEMA: &str = "
 -- Every tag has a unique flat name. parent_id places it in the tag tree,
 -- which the end-of-run reconciliation builds; until then all tags are roots.
+-- AUTOINCREMENT keeps the id of a deleted tag from being reused, so undoing a
+-- tag review can put the tag back under its old id.
 CREATE TABLE tags (
-    id          INTEGER PRIMARY KEY,
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
     name        TEXT NOT NULL UNIQUE,
     parent_id   INTEGER REFERENCES tags(id),
     description TEXT,
@@ -247,9 +249,7 @@ impl Db {
             version = 5;
         }
         if version == 5 {
-            conn.execute_batch(&format!(
-                "BEGIN; {REVIEW_TABLES} PRAGMA user_version = 6; COMMIT;"
-            ))?;
+            migrate_v5_to_v6(&conn)?;
             version = 6;
         }
         if version != SCHEMA_VERSION {
@@ -662,6 +662,33 @@ impl Db {
 }
 
 /// Version 3 adds the 'unreachable' page status and pages.error_kind. SQLite
+/// Version 6 adds the tag review's tables, and rebuilds the tags table with
+/// AUTOINCREMENT (see SCHEMA), keeping every row and id.
+fn migrate_v5_to_v6(conn: &Connection) -> Result<()> {
+    const COLUMNS: &str = "id, name, parent_id, description, locked, created_at";
+    let start = SCHEMA.find("CREATE TABLE tags (").expect("tags table in SCHEMA");
+    let end = start + SCHEMA[start..].find(");").expect("end of tags table") + 2;
+    let new_table = SCHEMA[start..end].replace("CREATE TABLE tags (", "CREATE TABLE tags_v6 (");
+    // Foreign keys can only be switched off outside a transaction.
+    conn.pragma_update(None, "foreign_keys", "OFF")?;
+    let result = conn.execute_batch(&format!(
+        "BEGIN;
+         {new_table}
+         INSERT INTO tags_v6 ({COLUMNS}) SELECT {COLUMNS} FROM tags;
+         DROP TABLE tags;
+         ALTER TABLE tags_v6 RENAME TO tags;
+         {REVIEW_TABLES}
+         PRAGMA user_version = 6;
+         COMMIT;"
+    ));
+    if result.is_err() {
+        conn.execute_batch("ROLLBACK").ok();
+    }
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    result.context("upgrading the database to version 6")?;
+    Ok(())
+}
+
 /// can't change a CHECK constraint, so the pages table is rebuilt, keeping
 /// every row and id. Pages that failed under version 2 have no stub note and
 /// no cause (a 404 and a PDF were both just 'failed'), so they become pending
@@ -878,6 +905,15 @@ mod tests {
             .pragma_query_value(None, "foreign_keys", |r| r.get(0))
             .unwrap();
         assert!(fk, "foreign keys are back on");
+        let tags_sql: String = db
+            .conn
+            .query_row("SELECT sql FROM sqlite_master WHERE name = 'tags'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(tags_sql.contains("AUTOINCREMENT"), "{tags_sql}");
+        assert!(tags_sql.contains("REFERENCES tags(id)"), "{tags_sql}");
+        assert_eq!(db.find_tag("rust").unwrap(), Some((3, false)));
 
         // The page that failed under version 2 is pending again.
         assert_eq!(

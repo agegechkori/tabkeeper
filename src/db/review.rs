@@ -502,6 +502,46 @@ mod tests {
     }
 
     #[test]
+    fn undo_after_a_new_tag_takes_no_old_id() {
+        let (mut db, _) = archive(&[&["board-game"], &["board-games"]]);
+        let (one, many) = (id(&db, "board-game"), id(&db, "board-games"));
+        db.apply_tag_changes(&[TagChange::Merge {
+            from: many,
+            into: one,
+        }])
+        .unwrap();
+        // The newest tag was deleted; a new tag must not get its id.
+        let new = db.create_tag("chess", None).unwrap();
+        assert!(new > many);
+        db.undo_last_revision().unwrap();
+        assert_eq!(db.find_tag("board-games").unwrap(), Some((many, false)));
+    }
+
+    #[test]
+    fn a_split_part_follows_a_merge_applied_before_it() {
+        let (mut db, _) = archive(&[&["rust"], &["rust"], &["oxides"], &["oxide"]]);
+        let (rust, plural, oxide) = (id(&db, "rust"), id(&db, "oxides"), id(&db, "oxide"));
+        let pages = db.tag_pages(rust).unwrap();
+        let part = |name: &str, page: i64| SplitPart {
+            name: name.into(),
+            description: String::new(),
+            pages: vec![page],
+        };
+        db.apply_tag_changes(&[
+            TagChange::Merge {
+                from: plural,
+                into: oxide,
+            },
+            TagChange::Split {
+                tag: rust,
+                into: vec![part("rust", pages[0].0), part("oxides", pages[1].0)],
+            },
+        ])
+        .unwrap();
+        assert_eq!(names(&db), [("oxide".to_string(), 3), ("rust".to_string(), 1)]);
+    }
+
+    #[test]
     fn rename_and_undo() {
         let (mut db, _) = archive(&[&["js"]]);
         let js = id(&db, "js");

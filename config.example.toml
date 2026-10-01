@@ -91,6 +91,7 @@ rules = [
 at_end_of_run = true
 # The review is only a few requests per run, so a stronger model, or a
 # thinking model allowed to think, is affordable here. Defaults to [llm].
+# The report prices its tokens with the prices in [llm].
 # model = "qwen3:8b"
 # [reconcile.extra_body] replaces [llm.extra_body] for the review; an empty
 # table lets a thinking model think.

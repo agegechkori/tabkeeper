@@ -87,58 +87,24 @@ pub async fn review<R: Reviewer, E: Embedder>(
     review.proposed.extend(merge_changes(&tags, &merges, &name_owner));
 
     // A tag that a merge or rename changes isn't also split: the split's pages
-    // and names were taken before the merge. Split parts naming a tag that is
-    // merged away go to the tag it is merged into.
-    let mut touched = HashSet::new();
-    let mut final_name: HashMap<i64, String> = HashMap::new();
-    for p in &review.proposed {
-        match &p.change {
-            TagChange::Rename { tag, name } => {
-                touched.insert(*tag);
-                final_name.insert(*tag, name.clone());
-            }
-            TagChange::Merge { from, into } => {
-                touched.extend([*from, *into]);
-            }
-            TagChange::Split { .. } => {}
-        }
-    }
-    let by_id: HashMap<i64, &TagInfo> = tags.iter().map(|t| (t.id, t)).collect();
-    let mut merged_into: HashMap<&str, String> = HashMap::new();
-    for p in &review.proposed {
-        if let TagChange::Merge { from, into } = p.change
-            && let (Some(from), Some(into)) = (by_id.get(&from), by_id.get(&into))
-        {
-            let name = final_name.get(&into.id).unwrap_or(&into.name).clone();
-            merged_into.insert(from.name.as_str(), name);
-        }
-    }
+    // and names were taken before the merge. A split part naming a tag that is
+    // merged away or renamed follows it when the changes are applied, through
+    // the alias the old name becomes, and only if that change is approved.
+    let touched: HashSet<i64> = review
+        .proposed
+        .iter()
+        .flat_map(|p| match p.change {
+            TagChange::Merge { from, into } => vec![from, into],
+            TagChange::Rename { tag, .. } => vec![tag],
+            TagChange::Split { .. } => vec![],
+        })
+        .collect();
     for candidate in splits.iter().filter(|c| !touched.contains(&c.tag.id)) {
-        if let Some(mut proposed) = review_split(db, reviewer, candidate, &by_name).await? {
-            if let TagChange::Split { into, .. } = &mut proposed.change {
-                redirect_parts(into, &merged_into);
-            }
+        if let Some(proposed) = review_split(db, reviewer, candidate, &by_name).await? {
             review.proposed.push(proposed);
         }
     }
     Ok(review)
-}
-
-/// Renames split parts that name a tag being merged away, joining parts that
-/// end up with the same name.
-fn redirect_parts(parts: &mut Vec<SplitPart>, merged_into: &HashMap<&str, String>) {
-    let mut out: Vec<SplitPart> = Vec::new();
-    for mut part in parts.drain(..) {
-        if let Some(name) = merged_into.get(part.name.as_str()) {
-            part.name = name.clone();
-            part.description.clear();
-        }
-        match out.iter_mut().find(|p| p.name == part.name) {
-            Some(existing) => existing.pages.extend(part.pages),
-            None => out.push(part),
-        }
-    }
-    *parts = out;
 }
 
 /// "1 page", "3 pages".
@@ -1005,27 +971,6 @@ mod tests {
                 from: tag_id(&db, "rusts"),
                 into: tag_id(&db, "rust")
             }]
-        );
-    }
-
-    #[test]
-    fn split_parts_follow_merges() {
-        let part = |name: &str, pages: Vec<i64>| SplitPart {
-            name: name.into(),
-            description: "d".into(),
-            pages,
-        };
-        let mut parts = vec![
-            part("rust", vec![1]),
-            part("oxides", vec![2]),
-            part("oxide", vec![3]),
-        ];
-        let merged_into = HashMap::from([("oxides", "oxide".to_string())]);
-        redirect_parts(&mut parts, &merged_into);
-        assert_eq!(parts.len(), 2);
-        assert_eq!(
-            (parts[1].name.as_str(), parts[1].pages.as_slice()),
-            ("oxide", &[2, 3][..])
         );
     }
 
