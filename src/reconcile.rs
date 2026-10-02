@@ -313,6 +313,10 @@ fn split_candidates<'t>(
 /// vector's group and how similar the two group centres are. A group may be a
 /// single page: a tag on one page it doesn't describe is worth a look too.
 fn two_groups(vectors: &[&[f32]]) -> Option<(Vec<usize>, f32)> {
+    // Two pages are two groups; how alike they are decides.
+    if let [a, b] = vectors {
+        return Some((vec![0, 1], similarity(a, b)));
+    }
     if vectors.len() < 3 {
         return None;
     }
@@ -1221,6 +1225,10 @@ pub(crate) mod tests {
         assert_eq!(labels[0], labels[1]);
         assert_eq!(labels[2], labels[3]);
         assert_ne!(labels[0], labels[2]);
+        assert!(centres < 0.2, "{centres}");
+        // Two pages are a group each.
+        let (labels, centres) = two_groups(&refs[1..3]).unwrap();
+        assert_eq!(labels, [0, 1]);
         assert!(centres < 0.2, "{centres}");
 
         let mut parts = vec![

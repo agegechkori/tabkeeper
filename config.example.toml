@@ -109,7 +109,7 @@ at_end_of_run = true
 similarity = 0.80
 # Tags on at least this many pages are checked for covering different
 # meanings, when their pages fall into two groups at most this similar.
-split_min_pages = 3
+split_min_pages = 2
 split_similarity = 0.75
 # Tag pairs per review request.
 batch_size = 20

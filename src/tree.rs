@@ -94,18 +94,18 @@ Reply with a JSON object: {\"domains\": [{\"tag\": 1, \"domain\": \"technology\"
 
 const BRANCH_SYSTEM: &str = "You organize one domain of the tag tree of a personal archive of web pages: {domain}. For each numbered tag, give path: the categories between {domain} and the tag, at most {levels}, each a lowercase kebab-case English name.
 
-- Group related tags under a shared category, e.g. rust and python under programming-languages. Reuse existing categories wherever they fit.
-- Create a category only when it groups several of these tags. A tag that fits no group gets an empty path and goes directly under {domain}.
+- Name each category for what its tags have in common within {domain}, and reuse existing categories wherever they fit. A category name says what is in it; never use one that doesn't describe the tag.
+- Put most tags in a category: a domain with more than a few tags needs several categories, like the sections of a library. Create a category when it groups two or more tags, including tags placed earlier. Only a tag that fits no group gets an empty path and goes directly under {domain}.
 - A broad tag can be a category itself: put narrower tags under it by naming it in their path.
 
-Reply with a JSON object: {\"placements\": [{\"tag\": 1, \"path\": [\"programming-languages\"]}, ...]}, one per tag.";
+Reply with a JSON object: {\"placements\": [{\"tag\": 1, \"path\": [\"category\"]}, {\"tag\": 2, \"path\": []}, ...]}, one per tag, where category stands for a name you choose.";
 
 /// Tags per request when sorting them into domains, which small models do
 /// best a few at a time.
 const DOMAIN_BATCH: usize = 10;
 /// Tags per request when organizing a domain: enough to see what belongs
-/// together.
-const BRANCH_BATCH: usize = 40;
+/// together, few enough that a small model still groups them.
+const BRANCH_BATCH: usize = 15;
 
 #[derive(Deserialize)]
 struct DomainReply {
