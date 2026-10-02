@@ -273,6 +273,29 @@ tabkeeper close-tabs                 # optional, phase 7
 ### Crates
 tokio, reqwest, clap, serde, serde_json, rusqlite (bundled), lz4_flex, dom_smoothie, pdf-extract, whatlang, globset, regex, governor, indicatif, directories, toml, url, chrono.
 
+## Phase 3c results
+
+Phase 1 (the model tags each page with paths) against the current design (flat tags per page, then the tag review merges, splits and builds the tree), on the same 60 pages: [scripts/compare_urls.txt](../scripts/compare_urls.txt), which includes pairs of pages that share an ambiguous word (rust, python, go, java, mercury, jaguar, apple, crane, bass). Both used `qwen3:4b` with thinking off on Ollama; [scripts/compare_trees.py](../scripts/compare_trees.py) computes the numbers.
+
+| | Phase 1 | Current |
+|---|---|---|
+| Pages tagged | 59 (1 failed) | 60 |
+| Tags per page | 1.17 | 3.08 |
+| Distinct tags / used on one page only | 60 / 87% | 170 / 94% |
+| Average depth of a page's tag | 2.58 | 2.20 |
+| Top-level categories | 26 | 12 |
+| Ambiguous pages on the right meaning (of 19) | 17 | 19 |
+| Time | 13.7 min, a page at a time | 15 min for pages (4 at a time) + 4 min tag review |
+
+- **Ambiguity:** both get most pairs right. Phase 1 put the apple fruit under `biology/mammals/felids` and gave the Java island the tags of other pages. The current design gets all 19, after allowing tags on just two pages to be checked for a split: the island page had reused the `java` tag, and only a two-page check could catch it.
+- **Top level:** phase 1 invents a top-level category for almost every topic (`fish`, `coffee`, `beverage`, `machinery` next to `biology` and `food`), 26 for 60 pages. Sorting tags into broad domains first keeps it to 12.
+- **Depth:** phase 1 is deeper and more specific (`chemistry/elements/mercury`, `astronomy/planets`). In the current tree the big domains are still fairly flat: a small model asked to organize 40 tags at once put nearly all of them directly under the domain; batches of 15 do better but not by enough. A stronger `reconcile.model` should help most here.
+- **Reuse:** in both, about 90% of tags are on one page. Per-page tagging makes tags too specific (`python-naming`, `mercury-features`); that is the next thing to improve, in the page prompt and with merges of near-duplicates.
+- **Speed:** about the same per page. Four pages at a time didn't help on a single local GPU (requests waited in Ollama's queue), and the current prompt is longer, with the vocabulary. The tag review adds a few minutes per run.
+- **Fixed along the way:** the per-domain prompt's example (`"path": ["programming-languages"]`) was copied by the model for every science tag; the examples are neutral now.
+
+Decision: keep the current design. Its top level stays consistent as the archive grows, ambiguous words are told apart by both name and place, and every tree change is reviewed and can be undone, which per-page paths can't offer across thousands of pages.
+
 ## Phases
 1. **Core** ([PR #1](https://github.com/agegechkori/tabkeeper/pull/1)): config, SQLite schema, `import` from a URL list, fetch and extract, OpenAI-compatible/Ollama adapter, tag registry, Markdown rendering, report, `_index.md`.
 2. **Flat tagging and scale**, in three pull requests:
@@ -282,7 +305,7 @@ tokio, reqwest, clap, serde, serde_json, rusqlite (bundled), lz4_flex, dom_smoot
 3. **Tag reconciliation**, in three pull requests:
    - 3a: the review for flat tags. Merge candidates come from plural forms and from embeddings of the tag names alone (tag descriptions made tags from the same page look alike); split candidates are tags whose pages form two dissimilar groups. The model decides in batches, the changes are listed for approval, applied in one transaction and logged with an undo record (`revisions`), and declined changes are remembered (`tag_decisions`). Instead of the alias and override tables planned above, a revision retargets `page_tags.resolved_tag_id` (the raw tags stay untouched) and stores what it changed.
    - 3b: the tree in hierarchical mode, `tags.style`, the taxonomy file. Placement runs after merges and splits, as its own approval and revision, so it sees the final tags. It is two steps, which small models handle much better than placing a mixed list in one go: each tag's broad domain, a few tags at a time, then one domain at a time, with all of that domain's tags in view, the categories inside it. Tag names stay unique and flat, so a category name is in one place in the tree; a path that runs into a category elsewhere is cut short there. Tags are placed once; moving placed tags around (restructuring) is left for later.
-   - 3c: compare with phase 1's direct hierarchical tagging on the same 50–100 URLs: tree depth, tag reuse, whether `rust` is split correctly, speed.
+   - 3c: compare with phase 1's direct hierarchical tagging on the same 50–100 URLs: tree depth, tag reuse, whether `rust` is split correctly, speed. Results in [Phase 3c results](#phase-3c-results).
 4. **Browser sources:** Firefox; the Chromium family via SNSS; Safari and macOS via AppleScript; profile discovery on all three operating systems.
 5. **Providers:** Anthropic and Gemini adapters, URL-only mode, `--batch`.
 6. **Distribution:** CI builds for macOS, Linux and Windows; GitHub Releases; `cargo install`.

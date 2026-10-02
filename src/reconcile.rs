@@ -150,7 +150,21 @@ pub async fn review<R: Reviewer, E: Embedder>(
     Ok(review)
 }
 
-/// "1 page", "3 pages".
+/// Whether a tag the model found to have one meaning has grown enough since
+/// to be checked again: a verdict from a few pages shouldn't stand for good.
+/// Other decisions, like a split the user declined, stand.
+fn grown_since(decision: &str, pages: usize) -> bool {
+    let Some(rest) = decision.strip_prefix("single-meaning") else {
+        return false;
+    };
+    // A decision from before the page count was recorded gets it stamped
+    // when it's next seen (see `split_candidates`), so it isn't re-asked.
+    let Some(then) = rest.strip_prefix(':').and_then(|n| n.parse::<usize>().ok()) else {
+        return false;
+    };
+    pages >= (then * 2).max(then + 3)
+}
+
 /// "1 tag", "3 tags".
 pub(crate) fn count(n: usize, one: &str, many: &str) -> String {
     if n == 1 {
@@ -160,6 +174,7 @@ pub(crate) fn count(n: usize, one: &str, many: &str) -> String {
     }
 }
 
+/// "1 page", "3 pages".
 pub(crate) fn pages(n: usize) -> String {
     if n == 1 {
         "1 page".into()
@@ -268,8 +283,15 @@ fn split_candidates<'t>(
         .iter()
         .filter(|t| !t.locked && t.pages >= config.split_min_pages)
     {
-        if db.tag_decision(&format!("split:{}", tag.name))?.is_some() {
-            continue;
+        let key = format!("split:{}", tag.name);
+        if let Some(decision) = db.tag_decision(&key)? {
+            if decision == "single-meaning" {
+                db.set_tag_decision(&key, &format!("single-meaning:{}", tag.pages), "llm")?;
+                continue;
+            }
+            if !grown_since(&decision, tag.pages) {
+                continue;
+            }
         }
         let pages = db.tag_pages(tag.id)?;
         let vectors: Vec<(i64, &Vec<f32>)> = pages
@@ -313,6 +335,10 @@ fn split_candidates<'t>(
 /// vector's group and how similar the two group centres are. A group may be a
 /// single page: a tag on one page it doesn't describe is worth a look too.
 fn two_groups(vectors: &[&[f32]]) -> Option<(Vec<usize>, f32)> {
+    // Two pages are two groups; how alike they are decides.
+    if let [a, b] = vectors {
+        return Some((vec![0, 1], similarity(a, b)));
+    }
     if vectors.len() < 3 {
         return None;
     }
@@ -630,7 +656,7 @@ async fn review_split<R: Reviewer>(
     )?;
     let key = format!("split:{}", tag.name);
     if !reply.split {
-        db.set_tag_decision(&key, "single-meaning", "llm")?;
+        db.set_tag_decision(&key, &format!("single-meaning:{}", tag.pages), "llm")?;
         return Ok(None);
     }
     // An unusable split isn't remembered, so the next review asks again.
@@ -1211,6 +1237,16 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn single_meaning_verdicts_are_checked_again_as_tags_grow() {
+        assert!(!grown_since("single-meaning:2", 4));
+        assert!(grown_since("single-meaning:2", 5));
+        assert!(!grown_since("single-meaning:10", 19));
+        assert!(grown_since("single-meaning:10", 20));
+        assert!(!grown_since("single-meaning", 50));
+        assert!(!grown_since("declined", 100));
+    }
+
+    #[test]
     fn two_groups_and_placing_the_rest() {
         let vectors: Vec<Vec<f32>> = [[1.0, 0.0, 0.0], [1.0, 0.1, 0.0], [0.0, 0.0, 1.0], [0.1, 0.0, 1.0]]
             .iter()
@@ -1221,6 +1257,10 @@ pub(crate) mod tests {
         assert_eq!(labels[0], labels[1]);
         assert_eq!(labels[2], labels[3]);
         assert_ne!(labels[0], labels[2]);
+        assert!(centres < 0.2, "{centres}");
+        // Two pages are a group each.
+        let (labels, centres) = two_groups(&refs[1..3]).unwrap();
+        assert_eq!(labels, [0, 1]);
         assert!(centres < 0.2, "{centres}");
 
         let mut parts = vec![

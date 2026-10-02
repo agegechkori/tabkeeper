@@ -50,7 +50,7 @@ impl Default for ReconcileConfig {
             model: None,
             extra_body: None,
             similarity: 0.80,
-            split_min_pages: 3,
+            split_min_pages: 2,
             split_similarity: 0.75,
             batch_size: 20,
         }
