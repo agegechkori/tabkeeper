@@ -281,7 +281,7 @@ Phase 1 (the model tags each page with paths) against the current design (flat t
 |---|---|---|
 | Pages tagged | 59 (1 failed) | 60 |
 | Tags per page | 1.17 | 3.08 |
-| Distinct tags / used on one page only | 60 / 87% | 170 / 92% |
+| Distinct tags / used on one page only | 60 / 87% | 170 / 94% |
 | Average depth of a page's tag | 2.58 | 2.20 |
 | Top-level categories | 26 | 12 |
 | Ambiguous pages on the right meaning (of 19) | 17 | 19 |
