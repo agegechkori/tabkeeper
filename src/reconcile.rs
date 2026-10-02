@@ -151,6 +151,18 @@ pub async fn review<R: Reviewer, E: Embedder>(
 }
 
 /// "1 page", "3 pages".
+/// Whether a tag the model found to have one meaning has grown enough since
+/// to be checked again: a verdict from a few pages shouldn't stand for good.
+/// Other decisions, like a split the user declined, stand.
+fn grown_since(decision: &str, pages: usize) -> bool {
+    let Some(rest) = decision.strip_prefix("single-meaning") else {
+        return false;
+    };
+    // Decisions from before the page count was recorded came from 3 pages or more.
+    let then: usize = rest.strip_prefix(':').and_then(|n| n.parse().ok()).unwrap_or(3);
+    pages >= (then * 2).max(then + 3)
+}
+
 /// "1 tag", "3 tags".
 pub(crate) fn count(n: usize, one: &str, many: &str) -> String {
     if n == 1 {
@@ -268,7 +280,9 @@ fn split_candidates<'t>(
         .iter()
         .filter(|t| !t.locked && t.pages >= config.split_min_pages)
     {
-        if db.tag_decision(&format!("split:{}", tag.name))?.is_some() {
+        if let Some(decision) = db.tag_decision(&format!("split:{}", tag.name))?
+            && !grown_since(&decision, tag.pages)
+        {
             continue;
         }
         let pages = db.tag_pages(tag.id)?;
@@ -634,7 +648,7 @@ async fn review_split<R: Reviewer>(
     )?;
     let key = format!("split:{}", tag.name);
     if !reply.split {
-        db.set_tag_decision(&key, "single-meaning", "llm")?;
+        db.set_tag_decision(&key, &format!("single-meaning:{}", tag.pages), "llm")?;
         return Ok(None);
     }
     // An unusable split isn't remembered, so the next review asks again.
@@ -1212,6 +1226,17 @@ pub(crate) mod tests {
             1,
             "the second split waits for the next review"
         );
+    }
+
+    #[test]
+    fn single_meaning_verdicts_are_checked_again_as_tags_grow() {
+        assert!(!grown_since("single-meaning:2", 4));
+        assert!(grown_since("single-meaning:2", 5));
+        assert!(!grown_since("single-meaning:10", 19));
+        assert!(grown_since("single-meaning:10", 20));
+        assert!(!grown_since("single-meaning", 5));
+        assert!(grown_since("single-meaning", 6));
+        assert!(!grown_since("declined", 100));
     }
 
     #[test]

@@ -15,6 +15,9 @@ use crate::llm::Reviewer;
 use crate::reconcile::{Proposed, describe_tag};
 use crate::tags::normalize_name;
 
+/// The stand-in category name in the branch prompt's example.
+const PLACEHOLDER: &str = "category";
+
 /// Categories shown to the model; more are left out.
 const MAX_CATEGORIES_SHOWN: usize = 400;
 /// Tag names listed in a proposal's description; more are counted.
@@ -237,7 +240,8 @@ impl TreeModel {
         }
         let mut parent: Vec<String> = Vec::new();
         for segment in raw.iter().take(levels) {
-            let Some(name) = normalize_name(segment) else {
+            // "category" is the stand-in in the prompt's example, copied.
+            let Some(name) = normalize_name(segment).filter(|n| n != PLACEHOLDER) else {
                 break;
             };
             let name = self.canonical.get(&name).cloned().unwrap_or(name);
@@ -778,6 +782,11 @@ mod tests {
         );
         // So does a category whose placement there was declined.
         assert_eq!(m.check("ww2", &path(&["history"]), 2, None), Some(vec![]));
+        // So does the prompt's stand-in name, copied.
+        assert_eq!(
+            m.check("rust", &path(&["technology", "category"]), 2, None),
+            Some(path(&["technology"]))
+        );
         // So does a name that can't be a tag.
         assert_eq!(
             m.check("rust", &path(&["technology", "2024", "x"]), 2, None),
