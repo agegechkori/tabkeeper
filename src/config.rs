@@ -46,12 +46,6 @@ pub struct ReconcileConfig {
     pub min_support: usize,
     /// Vocabulary tags offered to the model for each page.
     pub candidates: usize,
-    /// Let a thinking model think when confirming that a word has several
-    /// meanings (python the language and the snake); a few requests per run.
-    pub think_meanings: bool,
-    /// The most tokens, thinking included, a meanings confirmation may use;
-    /// thinking models sometimes don't stop on their own.
-    pub meanings_max_tokens: u32,
     /// Pages of one tag whose embeddings fall into two groups at most this
     /// similar to each other are checked for a split.
     pub split_similarity: f32,
@@ -71,8 +65,6 @@ impl Default for ReconcileConfig {
             cluster_similarity: 0.80,
             min_support: 3,
             candidates: 8,
-            think_meanings: true,
-            meanings_max_tokens: 4000,
             split_similarity: 0.75,
             batch_size: 20,
         }
@@ -89,22 +81,6 @@ impl ReconcileConfig {
         if let Some(extra_body) = &self.extra_body {
             config.extra_body = extra_body.clone();
         }
-        config
-    }
-    /// The LLM settings for confirming that a word has several meanings:
-    /// the review's, without request options, so a thinking model thinks,
-    /// with a cap on output and no retries, so a runaway answer costs one
-    /// request. A confirmation that fails leaves the word as it is.
-    pub fn meanings_llm_config(&self, llm: &LlmConfig) -> LlmConfig {
-        let mut config = self.llm_config(llm);
-        if self.think_meanings {
-            config.extra_body = serde_json::Map::new();
-        }
-        config
-            .extra_body
-            .insert("max_tokens".into(), self.meanings_max_tokens.into());
-        config.retries = 0;
-        config.timeout_secs = config.timeout_secs.min(180);
         config
     }
 }

@@ -26,18 +26,6 @@ pub struct StageUsage {
 }
 
 impl StageUsage {
-    /// Adds another stage's numbers to this one's.
-    pub fn add(&mut self, other: &StageUsage) {
-        self.requests += other.requests;
-        self.retries += other.retries;
-        self.invalid_replies += other.invalid_replies;
-        self.input_tokens += other.input_tokens;
-        self.output_tokens += other.output_tokens;
-        self.responses_without_usage += other.responses_without_usage;
-        self.texts_embedded += other.texts_embedded;
-        self.request_secs += other.request_secs;
-    }
-
     pub fn total_tokens(&self) -> u64 {
         self.input_tokens + self.output_tokens
     }

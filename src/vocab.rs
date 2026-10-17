@@ -13,6 +13,7 @@ use crate::db::{AnalyzedPage, Db};
 use crate::embed::{BATCH_SIZE, Embedder, similarity};
 use crate::extract::truncate_chars;
 use crate::llm::Reviewer;
+use crate::meanings;
 use crate::tags::normalize_name;
 
 /// Member pages shown to the model when it names a cluster.
@@ -62,11 +63,14 @@ pub struct Retag {
     pub assignments: Vec<(i64, Vec<(String, String)>)>,
     pub untagged: usize,
     pub failed_requests: Vec<String>,
-    /// Words a quick answer found to have several meanings, asked again to confirm.
+    /// Words asked whether they have several meanings.
     pub meaning_checks: usize,
+    /// Each word checked for several meanings, with the titles of the first
+    /// page of each group it was shown.
+    pub checked: Vec<(String, Vec<String>)>,
     /// One-word topics found to have several meanings, with the tags they
-    /// became; none when the model's names were unusable and the word kept
-    /// only its largest meaning.
+    /// became: the word itself for the meaning with the most pages, then a
+    /// qualified tag for each other meaning.
     pub ambiguous: Vec<(String, Vec<String>)>,
 }
 
@@ -95,32 +99,8 @@ struct ClusterReply {
     fits: Vec<usize>,
 }
 
-const AMBIGUITY_SYSTEM: &str = "A tag of a personal archive of web pages is used on the groups of pages below. Decide whether it means the same thing in every group.
-
-- same_meaning is true when the tag means one thing everywhere, even if the groups are about different parts of it: technology for phones, cars and software is one meaning.
-- same_meaning is false only when one word names unrelated things: python the programming language and python the snake, java the programming language and java the island.
-- When false, give each group a tag qualified by its meaning (python-programming, python-snake) with a one-line description; groups with the same meaning get the same tag.
-
-Reply with a JSON object: {\"same_meaning\": false, \"groups\": [{\"group\": 1, \"tag\": \"...\", \"description\": \"...\"}]}.";
-
 /// Groups of pages shown when asking whether a word has several meanings.
 const MAX_MEANING_GROUPS: usize = 4;
-
-#[derive(Deserialize)]
-struct AmbiguityReply {
-    same_meaning: bool,
-    #[serde(default)]
-    groups: Vec<MeaningGroup>,
-}
-
-#[derive(Deserialize)]
-struct MeaningGroup {
-    group: usize,
-    #[serde(default)]
-    tag: String,
-    #[serde(default)]
-    description: String,
-}
 
 #[derive(Deserialize)]
 struct ClassifyReply {
@@ -188,18 +168,6 @@ pub fn agglomerate(vectors: &[Vec<f32>], threshold: f32) -> Vec<Vec<usize>> {
     clusters
 }
 
-async fn ask_meanings<R: Reviewer>(
-    reviewer: &R,
-    user: &str,
-    schema: &serde_json::Value,
-) -> std::result::Result<Option<AmbiguityReply>, String> {
-    let reply = reviewer
-        .ask_json(AMBIGUITY_SYSTEM, user, "tag_meanings", schema.clone())
-        .await
-        .map_err(|err| format!("{err:#}"))?;
-    Ok(serde_json::from_value(reply).ok())
-}
-
 fn page_line(page: &AnalyzedPage) -> String {
     if page.tags.is_empty() {
         page.title.clone()
@@ -211,12 +179,9 @@ fn page_line(page: &AnalyzedPage) -> String {
 /// Builds the vocabulary from the whole archive and tags every done page
 /// from it. Only the model's "one meaning" verdicts are saved, so they aren't
 /// asked again; `Retag::assignments` says which tags to save.
-/// `meanings` answers whether a word has several meanings: the hardest
-/// question, asked a few times per run, so it may be a thinking model.
-pub async fn retag<R: Reviewer, M: Reviewer, E: Embedder>(
+pub async fn retag<R: Reviewer, E: Embedder>(
     db: &Db,
     reviewer: &R,
-    meanings: &M,
     embedder: &E,
     settings: &Settings,
     note: impl Fn(&str),
@@ -366,15 +331,6 @@ pub async fn retag<R: Reviewer, M: Reviewer, E: Embedder>(
     // A one-word topic whose pages fall into different clusters may be one
     // word for unrelated things (python the language and the snake): the
     // model says whether it is, and each meaning gets a qualified tag.
-    let ambiguity_schema = json!({
-        "type": "object", "additionalProperties": false, "required": ["same_meaning", "groups"],
-        "properties": {
-            "same_meaning": {"type": "boolean"},
-            "groups": {"type": "array", "items": {"type": "object", "additionalProperties": false,
-                "required": ["group", "tag", "description"],
-                "properties": {"group": {"type": "integer"}, "tag": {"type": "string"}, "description": {"type": "string"}}}}
-        }
-    });
     let words: Vec<String> = vocabulary
         .values()
         .filter(|t| t.source == Source::Topic && !t.name.contains('-'))
@@ -406,66 +362,72 @@ pub async fn retag<R: Reviewer, M: Reviewer, E: Embedder>(
             let extra = groups.pop().unwrap_or_default();
             groups[0].extend(extra);
         }
-        let mut user = format!("Tag: {word}\n");
-        for (g, group) in groups.iter().enumerate() {
-            user.push_str(&format!("\nGroup {}:\n", g + 1));
-            for &i in group.iter().take(5) {
-                user.push_str(&format!("- {}\n", pages[i].title));
+        let shown: Vec<Vec<&AnalyzedPage>> = groups
+            .iter()
+            .map(|g| {
+                g.iter()
+                    .take(meanings::PAGES_PER_GROUP)
+                    .map(|&i| &pages[i])
+                    .collect()
+            })
+            .collect();
+        out.meaning_checks += 1;
+        out.checked.push((
+            word.clone(),
+            shown
+                .iter()
+                .filter_map(|g| g.first().map(|p| p.title.clone()))
+                .collect(),
+        ));
+        let things = match meanings::check(reviewer, &word, &shown).await {
+            Ok(meanings::Verdict::Same) => {
+                db.set_tag_decision(&key, &format!("same:{}", list.len()), "llm")?;
+                continue;
             }
-        }
-        // A quick answer first: "same meaning" from it is reliable, while
-        // "several meanings" is confirmed by `meanings`, which may think.
-        let reply = match ask_meanings(reviewer, &user, &ambiguity_schema).await {
-            Ok(Some(r)) if !r.same_meaning => {
-                out.meaning_checks += 1;
-                ask_meanings(meanings, &user, &ambiguity_schema).await
-            }
-            other => other,
-        };
-        let reply = match reply {
-            Ok(reply) => reply,
+            Ok(meanings::Verdict::Several(things)) => things,
             Err(err) => {
                 out.failed_requests.push(err);
-                None
+                continue;
             }
         };
-        let Some(reply) = reply else { continue };
-        if reply.same_meaning {
-            db.set_tag_decision(&key, &format!("same:{}", list.len()), "llm")?;
-            continue;
+        // The meaning with the most pages keeps the plain word, so a false
+        // split only takes the word off the other groups' pages; each other
+        // meaning gets its qualified tag.
+        let pages_of =
+            |thing: &(String, String, Vec<usize>)| thing.2.iter().map(|&g| groups[g].len()).sum::<usize>();
+        let main = (0..things.len())
+            .max_by_key(|&t| pages_of(&things[t]))
+            .unwrap_or(0);
+        let mut names = vec![word.clone()];
+        let kept: Vec<usize> = things[main]
+            .2
+            .iter()
+            .flat_map(|&g| groups[g].iter().copied())
+            .collect();
+        members.insert(word.clone(), kept);
+        // The word now names that meaning: its description says so, so a page
+        // about another meaning isn't given it.
+        if let Some(tag) = vocabulary.get_mut(&word)
+            && !things[main].1.is_empty()
+        {
+            tag.description = format!("{word}: {}", things[main].1);
         }
-        // Each group's qualified tag; a name that isn't qualified, or a group
-        // left out, is ambiguous still.
-        let mut named: BTreeMap<String, (String, Vec<usize>)> = BTreeMap::new();
-        let mut usable = true;
-        for (g, group) in groups.iter().enumerate() {
-            let answer = reply.groups.iter().find(|a| a.group == g + 1);
-            match answer.and_then(|a| normalize_name(&a.tag).map(|n| (n, a.description.trim().to_string()))) {
-                Some((name, description)) if name != word => {
-                    let entry = named.entry(name).or_insert((description, Vec::new()));
-                    entry.1.extend(group);
-                }
-                _ => usable = false,
+        for (t, (name, description, member_groups)) in things.into_iter().enumerate() {
+            if t == main || name == word || names.contains(&name) {
+                continue;
             }
-        }
-        let tag = vocabulary.remove(&word).expect("a vocabulary tag");
-        members.remove(&word);
-        if !usable || named.len() < 2 {
-            // Unsure: the word keeps only its largest meaning.
-            members.insert(word.clone(), groups[0].clone());
-            vocabulary.insert(word.clone(), tag);
-            out.ambiguous.push((word, Vec::new()));
-            continue;
-        }
-        let names: Vec<String> = named.keys().cloned().collect();
-        for (name, (description, list)) in named {
+            let list: Vec<usize> = member_groups
+                .iter()
+                .flat_map(|&g| groups[g].iter().copied())
+                .collect();
             members.entry(name.clone()).or_default().extend(list);
             vocabulary.entry(name.clone()).or_insert(VocabTag {
-                name,
+                name: name.clone(),
                 description,
                 source: Source::Topic,
                 pages: 0,
             });
+            names.push(name);
         }
         out.ambiguous.push((word, names));
     }
@@ -587,41 +549,42 @@ mod tests {
             (&["python"], [0.0, 1.0, 0.0]),
             (&["python"], [0.0, 0.0, 1.0]),
         ]);
-        let split = json!({"same_meaning": false, "groups": [
-            {"group": 1, "tag": "python-programming", "description": "Python, the programming language."},
-            {"group": 2, "tag": "Python Programming", "description": "Python, the programming language."},
-            {"group": 3, "tag": "python-snake", "description": "Pythons, the snakes."}
-        ]});
         let reviewer = FakeReviewer::new(vec![
             // The test embedder makes every page unlike the others: no
-            // clusters, so the topics on 2+ pages are the vocabulary.
-            json!({"same_meaning": true, "groups": []}),
-            split.clone(),
+            // clusters, so the topics on 2+ pages are the vocabulary, and
+            // each page is its own group when checking meanings.
+            json!({"groups": [], "same_meaning": true}),
+            json!({"groups": [], "same_meaning": false}),
+            json!({"referent": "the programming language"}),
+            json!({"referent": "the programming language"}),
+            json!({"referent": "the snake"}),
+            json!({"groups": [
+                {"group": 1, "tag": "python-programming", "description": "Python, the language."},
+                {"group": 2, "tag": "python-programming", "description": "Python, the language."},
+                {"group": 3, "tag": "python-snake", "description": "Pythons, the snakes."}]}),
             json!({"tags": ["coffee"]}),
             json!({"tags": ["coffee"]}),
             json!({"tags": ["coffee", "nowhere"]}),
-            json!({"tags": ["python-programming"]}),
-            json!({"tags": ["python-programming"]}),
+            json!({"tags": ["python"]}),
+            json!({"tags": ["python"]}),
             json!({"tags": ["python-snake"]}),
         ]);
-        // "Several meanings" is confirmed by the other model.
-        let meanings = FakeReviewer::new(vec![split]);
         let settings = Settings {
             cluster_similarity: 0.8,
             min_support: 2,
             candidates: 8,
             max_tags: 3,
         };
-        let out = retag(&db, &reviewer, &meanings, &no_names(), &settings, |_| {})
+        let out = retag(&db, &reviewer, &no_names(), &settings, |_| {})
             .await
             .unwrap();
-        assert_eq!(out.meaning_checks, 1);
-        assert_eq!(meanings.prompts.borrow().len(), 1);
+        assert_eq!(out.meaning_checks, 2);
+        // The meaning with the most pages keeps the plain word.
         assert_eq!(
             out.ambiguous,
             [(
                 "python".to_string(),
-                vec!["python-programming".to_string(), "python-snake".to_string()]
+                vec!["python".to_string(), "python-snake".to_string()]
             )]
         );
         let tags: Vec<Vec<&str>> = out
@@ -636,8 +599,8 @@ mod tests {
                 vec!["coffee"],
                 vec!["coffee"],
                 vec!["coffee"],
-                vec!["python-programming"],
-                vec!["python-programming"],
+                vec!["python"],
+                vec!["python"],
                 vec![]
             ]
         );

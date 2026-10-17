@@ -122,11 +122,6 @@ vocabulary = true
 cluster_similarity = 0.80
 min_support = 3
 candidates = 8
-# Confirm "several meanings" with thinking allowed (clears [llm.extra_body]
-# for those few requests): much more reliable with small models.
-think_meanings = true
-# The most output tokens, thinking included, for each of those requests.
-meanings_max_tokens = 4000
 # Tag pairs per review request.
 batch_size = 20
 

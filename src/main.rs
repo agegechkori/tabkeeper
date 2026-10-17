@@ -7,6 +7,7 @@ mod fetch;
 mod filter;
 mod import;
 mod llm;
+mod meanings;
 mod pipeline;
 mod progress;
 mod reconcile;
@@ -433,17 +434,11 @@ async fn review_tags(db: &mut Db, config: &Config, yes: bool, say: &dyn Fn(&str)
         }
     }
 
-    let mut meanings_usage = None;
     if config.reconcile.vocabulary {
-        match (
-            usable,
-            llm::OpenAiCompatible::new(&config.reconcile.meanings_llm_config(&config.llm)),
-        ) {
-            (None, _) => say("Building the vocabulary needs embeddings; the tags were left as they are."),
-            (_, Err(err)) => outcome.error = Some(format!("{err:#}")),
-            (Some(embedder), Ok(meanings)) => {
-                vocabulary_review(db, config, &reviewer, &meanings, embedder, yes, say, &mut outcome).await;
-                meanings_usage = Some(llm::Reviewer::usage(&meanings));
+        match usable {
+            None => say("Building the vocabulary needs embeddings; the tags were left as they are."),
+            Some(embedder) => {
+                vocabulary_review(db, config, &reviewer, embedder, yes, say, &mut outcome).await
             }
         }
     } else {
@@ -532,9 +527,6 @@ async fn review_tags(db: &mut Db, config: &Config, yes: bool, say: &dyn Fn(&str)
         }
     }
     outcome.usage = llm::Reviewer::usage(&reviewer);
-    if let Some(usage) = &meanings_usage {
-        outcome.usage.add(usage);
-    }
     outcome.embed_usage = embedder.as_ref().map(embed::Embedder::usage).unwrap_or_default();
     outcome
 }
@@ -546,7 +538,6 @@ async fn vocabulary_review(
     db: &mut Db,
     config: &Config,
     reviewer: &llm::OpenAiCompatible,
-    meanings: &llm::OpenAiCompatible,
     embedder: &embed::OpenAiEmbedder,
     yes: bool,
     say: &dyn Fn(&str),
@@ -559,7 +550,7 @@ async fn vocabulary_review(
         candidates: r.candidates,
         max_tags: config.tags.max_per_page,
     };
-    let retag = match vocab::retag(db, reviewer, meanings, embedder, &settings, say).await {
+    let retag = match vocab::retag(db, reviewer, embedder, &settings, say).await {
         Ok(retag) => retag,
         Err(err) => {
             outcome.error = Some(format!("{err:#}"));
@@ -611,8 +602,15 @@ async fn vocabulary_review(
     for t in &retag.vocabulary {
         say(&format!("  {:>4}  {:<28} {}", t.pages, t.name, t.description));
     }
-    for (word, names) in retag.ambiguous.iter().filter(|(_, n)| !n.is_empty()) {
-        say(&format!("  ({word} has several meanings: {})", names.join(", ")));
+    for (word, groups) in &retag.checked {
+        let verdict = match retag.ambiguous.iter().find(|(w, _)| w == word) {
+            Some((_, names)) => format!("several meanings: {}", names.join(", ")),
+            None => "one meaning".into(),
+        };
+        say(&format!(
+            "  ({word}: {verdict}; groups starting with {})",
+            groups.join(" | ")
+        ));
     }
     if retag.untagged > 0 {
         say(&format!(
