@@ -149,6 +149,9 @@ pub struct ReviewReport {
     pub merges: usize,
     pub renames: usize,
     pub splits: usize,
+    /// Groups of tags folded into a broader one, and how many tags they held.
+    pub fold_groups: usize,
+    pub folded: usize,
     /// Groups of tags put in the tag tree, and how many tags they held.
     pub placements: usize,
     pub tags_placed: usize,
@@ -174,7 +177,7 @@ pub struct ReviewReport {
 
 impl ReviewReport {
     pub fn applied(&self) -> usize {
-        self.merges + self.renames + self.splits + self.placements
+        self.merges + self.renames + self.splits + self.placements + self.fold_groups
     }
 
     pub fn count_applied(&mut self, change: &crate::db::TagChange) {
@@ -183,6 +186,10 @@ impl ReviewReport {
             TagChange::Merge { .. } => self.merges += 1,
             TagChange::Rename { .. } => self.renames += 1,
             TagChange::Split { .. } => self.splits += 1,
+            TagChange::Fold { from, .. } => {
+                self.fold_groups += 1;
+                self.folded += from.len();
+            }
             TagChange::Place { tags, .. } => {
                 self.placements += 1;
                 self.tags_placed += tags.len();
@@ -215,6 +222,12 @@ impl ReviewReport {
             "{} merges · {} renames · {} splits",
             self.merges, self.renames, self.splits
         );
+        if self.folded > 0 {
+            done.push_str(&format!(
+                " · {} folded into broader ones",
+                crate::reconcile::count(self.folded, "tag", "tags")
+            ));
+        }
         if self.placements > 0 {
             done.push_str(&format!(
                 " · {} placed in the tree",

@@ -673,7 +673,7 @@ fn group(db: &Db, chosen: Vec<(&TagInfo, Vec<String>)>) -> Result<Vec<Proposed>>
 /// Orders tags so similar ones are next to each other and land in the same
 /// batch, where the model places them consistently.
 /// Returns the new order as indexes into `tags`.
-async fn similar_together<E: Embedder>(tags: &[TagInfo], embedder: &E) -> Result<Vec<usize>> {
+pub(crate) async fn similar_together<E: Embedder>(tags: &[TagInfo], embedder: &E) -> Result<Vec<usize>> {
     // The ordering is quadratic; past this, batches stay in usage order.
     const MAX: usize = 3000;
     if tags.len() < 3 || tags.len() > MAX {

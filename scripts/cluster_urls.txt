@@ -1,0 +1,170 @@
+# Test set for tag reuse: clusters of pages on one topic, and words with
+# several meanings spread over clusters. "# cluster: name" starts a cluster.
+# cluster: rust-language
+https://www.rust-lang.org/
+https://doc.rust-lang.org/book/ch04-01-what-is-ownership.html
+https://doc.rust-lang.org/book/ch08-01-vectors.html
+https://doc.rust-lang.org/cargo/getting-started/first-steps.html
+https://en.wikipedia.org/wiki/Rust_(programming_language)
+https://doc.rust-lang.org/book/ch16-00-concurrency.html
+# cluster: python-language
+https://www.python.org/about/
+https://docs.python.org/3/tutorial/introduction.html
+https://en.wikipedia.org/wiki/Python_(programming_language)
+https://peps.python.org/pep-0008/
+https://docs.python.org/3/library/asyncio.html
+https://docs.python.org/3/tutorial/classes.html
+# cluster: java-language
+https://en.wikipedia.org/wiki/Java_(programming_language)
+https://en.wikipedia.org/wiki/Java_virtual_machine
+https://en.wikipedia.org/wiki/Spring_Framework
+https://en.wikipedia.org/wiki/Kotlin_(programming_language)
+# cluster: go-language
+https://go.dev/doc/effective_go
+https://en.wikipedia.org/wiki/Go_(programming_language)
+https://go.dev/doc/tutorial/getting-started
+# cluster: machine-learning
+https://en.wikipedia.org/wiki/Machine_learning
+https://en.wikipedia.org/wiki/Transformer_(deep_learning_architecture)
+https://en.wikipedia.org/wiki/Neural_network_(machine_learning)
+https://en.wikipedia.org/wiki/Large_language_model
+https://en.wikipedia.org/wiki/Reinforcement_learning
+https://en.wikipedia.org/wiki/Backpropagation
+# cluster: apple-company
+https://en.wikipedia.org/wiki/Apple_Inc.
+https://en.wikipedia.org/wiki/IPhone
+https://en.wikipedia.org/wiki/MacOS
+https://en.wikipedia.org/wiki/Steve_Jobs
+# cluster: coffee
+https://en.wikipedia.org/wiki/Coffee
+https://en.wikipedia.org/wiki/Espresso
+https://en.wikipedia.org/wiki/Latte
+https://en.wikipedia.org/wiki/Cappuccino
+https://en.wikipedia.org/wiki/Coffea_arabica
+https://en.wikipedia.org/wiki/French_press
+https://en.wikipedia.org/wiki/Coffee_roasting
+# cluster: bread
+https://en.wikipedia.org/wiki/Sourdough
+https://en.wikipedia.org/wiki/Bread
+https://en.wikipedia.org/wiki/Baguette
+https://en.wikipedia.org/wiki/Baker%27s_yeast
+https://en.wikipedia.org/wiki/Rye_bread
+https://en.wikipedia.org/wiki/Gluten
+# cluster: fruit
+https://en.wikipedia.org/wiki/Apple
+https://en.wikipedia.org/wiki/Pear
+https://en.wikipedia.org/wiki/Cherry
+https://en.wikipedia.org/wiki/Orchard
+# cluster: astronomy
+https://en.wikipedia.org/wiki/Black_hole
+https://en.wikipedia.org/wiki/Mercury_(planet)
+https://en.wikipedia.org/wiki/Mars
+https://en.wikipedia.org/wiki/Jupiter
+https://en.wikipedia.org/wiki/Galaxy
+https://en.wikipedia.org/wiki/Neutron_star
+https://en.wikipedia.org/wiki/Exoplanet
+# cluster: chemistry
+https://en.wikipedia.org/wiki/Mercury_(element)
+https://en.wikipedia.org/wiki/Rust
+https://en.wikipedia.org/wiki/Redox
+https://en.wikipedia.org/wiki/Iron
+https://en.wikipedia.org/wiki/Corrosion
+https://en.wikipedia.org/wiki/Periodic_table
+# cluster: running
+https://en.wikipedia.org/wiki/Marathon
+https://en.wikipedia.org/wiki/Half_marathon
+https://en.wikipedia.org/wiki/Ultramarathon
+https://en.wikipedia.org/wiki/Running
+https://en.wikipedia.org/wiki/Boston_Marathon
+https://en.wikipedia.org/wiki/Sneakers
+# cluster: investing
+https://en.wikipedia.org/wiki/Index_fund
+https://en.wikipedia.org/wiki/Stock_market
+https://en.wikipedia.org/wiki/Exchange-traded_fund
+https://en.wikipedia.org/wiki/Bond_(finance)
+https://en.wikipedia.org/wiki/Dividend
+https://en.wikipedia.org/wiki/Inflation
+https://en.wikipedia.org/wiki/Mortgage
+# cluster: snakes
+https://en.wikipedia.org/wiki/Python_(genus)
+https://en.wikipedia.org/wiki/Boa_constrictor
+https://en.wikipedia.org/wiki/King_cobra
+https://en.wikipedia.org/wiki/Rattlesnake
+https://en.wikipedia.org/wiki/Snake
+# cluster: big-cats
+https://en.wikipedia.org/wiki/Jaguar
+https://en.wikipedia.org/wiki/Leopard
+https://en.wikipedia.org/wiki/Tiger
+https://en.wikipedia.org/wiki/Lion
+https://en.wikipedia.org/wiki/Cheetah
+# cluster: cars
+https://en.wikipedia.org/wiki/Jaguar_Cars
+https://en.wikipedia.org/wiki/Electric_vehicle
+https://en.wikipedia.org/wiki/Tesla,_Inc.
+https://en.wikipedia.org/wiki/Porsche
+https://en.wikipedia.org/wiki/Hybrid_vehicle
+https://en.wikipedia.org/wiki/Internal_combustion_engine
+# cluster: board-games
+https://en.wikipedia.org/wiki/Chess
+https://en.wikipedia.org/wiki/Go_(game)
+https://en.wikipedia.org/wiki/Shogi
+https://en.wikipedia.org/wiki/Backgammon
+https://en.wikipedia.org/wiki/Draughts
+# cluster: music
+https://en.wikipedia.org/wiki/Jazz
+https://en.wikipedia.org/wiki/Violin
+https://en.wikipedia.org/wiki/Bass_guitar
+https://en.wikipedia.org/wiki/Piano
+https://en.wikipedia.org/wiki/Blues
+https://en.wikipedia.org/wiki/Saxophone
+# cluster: japan
+https://en.wikipedia.org/wiki/Kyoto
+https://en.wikipedia.org/wiki/Tokyo
+https://en.wikipedia.org/wiki/Osaka
+https://en.wikipedia.org/wiki/Mount_Fuji
+https://en.wikipedia.org/wiki/Shinkansen
+https://en.wikipedia.org/wiki/Nara_(city)
+# cluster: indonesia
+https://en.wikipedia.org/wiki/Java
+https://en.wikipedia.org/wiki/Bali
+https://en.wikipedia.org/wiki/Jakarta
+https://en.wikipedia.org/wiki/Sumatra
+# cluster: birds
+https://en.wikipedia.org/wiki/Crane_(bird)
+https://en.wikipedia.org/wiki/Grey_heron
+https://en.wikipedia.org/wiki/Bald_eagle
+https://en.wikipedia.org/wiki/Owl
+https://en.wikipedia.org/wiki/Bird_migration
+# cluster: construction-machines
+https://en.wikipedia.org/wiki/Crane_(machine)
+https://en.wikipedia.org/wiki/Excavator
+https://en.wikipedia.org/wiki/Bulldozer
+https://en.wikipedia.org/wiki/Forklift
+# cluster: fishing
+https://en.wikipedia.org/wiki/Bass_(fish)
+https://en.wikipedia.org/wiki/Trout
+https://en.wikipedia.org/wiki/Fly_fishing
+https://en.wikipedia.org/wiki/Salmon
+# cluster: houseplants
+https://en.wikipedia.org/wiki/Houseplant
+https://en.wikipedia.org/wiki/Monstera_deliciosa
+https://en.wikipedia.org/wiki/Succulent_plant
+https://en.wikipedia.org/wiki/Compost
+https://en.wikipedia.org/wiki/Pruning
+# cluster: sleep
+https://en.wikipedia.org/wiki/Sleep_hygiene
+https://en.wikipedia.org/wiki/Insomnia
+https://en.wikipedia.org/wiki/Circadian_rhythm
+https://en.wikipedia.org/wiki/Melatonin
+# cluster: history
+https://en.wikipedia.org/wiki/French_Revolution
+https://en.wikipedia.org/wiki/Napoleon
+https://en.wikipedia.org/wiki/Renaissance
+https://en.wikipedia.org/wiki/Industrial_Revolution
+https://en.wikipedia.org/wiki/Roman_Empire
+# cluster: climate
+https://en.wikipedia.org/wiki/Climate_change
+https://en.wikipedia.org/wiki/Glacier
+https://en.wikipedia.org/wiki/Greenhouse_gas
+https://en.wikipedia.org/wiki/Renewable_energy
+https://en.wikipedia.org/wiki/Solar_power

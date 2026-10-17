@@ -1386,10 +1386,11 @@ mod tests {
 
     #[tokio::test]
     async fn merges_spelling_variants_into_existing_tags() {
-        let mut db = db_with(&["https://a.com/", "https://b.com/"]);
+        let mut db = db_with(&["https://a.com/", "https://b.com/", "https://c.com/"]);
         let llm = FakeLlm::new(vec![
-            Ok(summary("T", &["board-games", "machine-learning", "glass"], &[])),
-            Ok(summary("T", &["Board Games", "machinelearning", "glasses"], &[])),
+            Ok(summary("T", &["board-games", "machine-learning"], &[])),
+            Ok(summary("T", &["Board Games", "machinelearning", "glass"], &[])),
+            Ok(summary("T", &["glasses"], &[])),
         ]);
         run(&mut db, &llm).await.unwrap();
         // Spacing and hyphen variants resolve to the existing tags; a plural is
@@ -1408,7 +1409,8 @@ mod tests {
         let mut db = db_with(&["https://a.com/"]);
         let llm = FakeLlm::new(vec![Ok(summary("T", &["a", "b", "c", "d", "e"], &[]))]);
         run(&mut db, &llm).await.unwrap();
-        assert_eq!(page_tag_names(&db), ["a", "b", "c"]);
+        // Two new tags per page by default.
+        assert_eq!(page_tag_names(&db), ["a", "b"]);
     }
 
     #[tokio::test]

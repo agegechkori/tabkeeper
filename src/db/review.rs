@@ -33,6 +33,9 @@ pub enum TagChange {
     /// exist yet are created; existing tags on it that aren't in the tree
     /// yet are put there.
     Place { parent: Vec<String>, tags: Vec<i64> },
+    /// Narrow or near-duplicate tags folded into a broader one: each is
+    /// merged into `into`, as with `Merge`.
+    Fold { into: i64, from: Vec<i64> },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -201,6 +204,9 @@ impl Db {
                 TagChange::Rename { tag, name } => rename(&sp, *tag, name, &mut change_steps),
                 TagChange::Split { tag, into } => split(&sp, *tag, into, &mut change_steps),
                 TagChange::Place { parent, tags } => place(&sp, parent, tags, &mut change_steps),
+                TagChange::Fold { into, from } => from
+                    .iter()
+                    .try_for_each(|from| merge(&sp, *from, *into, &mut change_steps)),
             };
             match result {
                 Ok(()) => {

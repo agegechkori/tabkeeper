@@ -1,4 +1,5 @@
 mod config;
+mod consolidate;
 mod db;
 mod embed;
 mod estimate;
@@ -457,6 +458,45 @@ async fn review_tags(db: &mut Db, config: &Config, yes: bool, say: &dyn Fn(&str)
         Err(err) => outcome.error = Some(format!("{err:#}")),
     }
 
+    // With merges and splits applied, the whole vocabulary is consolidated
+    // before the tree is built from it.
+    let mut consolidation_usage = None;
+    if config.reconcile.consolidate && outcome.error.is_none() {
+        match (
+            usable,
+            llm::OpenAiCompatible::new(&config.reconcile.consolidate_llm_config(&config.llm)),
+        ) {
+            (None, _) => say("Consolidation needs embeddings to find broader tags; skipped."),
+            (_, Err(err)) => outcome.error = Some(format!("{err:#}")),
+            (Some(embedder), Ok(consolidator)) => {
+                let threshold = config.reconcile.fold_similarity;
+                match consolidate::consolidate(db, &consolidator, embedder, threshold, say).await {
+                    Ok(consolidation) => {
+                        if usable_or_fail(
+                            &mut outcome,
+                            &consolidation.failed_requests,
+                            consolidation.proposed.is_empty(),
+                            false,
+                            say,
+                        ) {
+                            decide_and_apply(
+                                db,
+                                &consolidation.proposed,
+                                "Folding narrow tags into broader ones:",
+                                yes,
+                                say,
+                                &mut outcome,
+                                false,
+                            );
+                        }
+                    }
+                    Err(err) => outcome.error = Some(format!("{err:#}")),
+                }
+                consolidation_usage = Some(llm::Reviewer::usage(&consolidator));
+            }
+        }
+    }
+
     if config.tags.style == config::TagStyle::Hierarchical && outcome.error.is_none() {
         // Placing a first tree is many requests; without anyone to approve
         // them, they wait for a run that can ask.
@@ -516,6 +556,9 @@ async fn review_tags(db: &mut Db, config: &Config, yes: bool, say: &dyn Fn(&str)
         }
     }
     outcome.usage = llm::Reviewer::usage(&reviewer);
+    if let Some(usage) = &consolidation_usage {
+        outcome.usage.add(usage);
+    }
     outcome.embed_usage = embedder.as_ref().map(embed::Embedder::usage).unwrap_or_default();
     outcome
 }

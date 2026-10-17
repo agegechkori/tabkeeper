@@ -62,8 +62,8 @@ user_agent = "Mozilla/5.0 (compatible; tabkeeper/0.1; +https://github.com/agegec
 
 [tags]
 # Maximum tags per page, and how many of them may be new tags.
-max_per_page = 5
-max_new_per_page = 3
+max_per_page = 3
+max_new_per_page = 2
 # How many existing tags are shown to the model for each page.
 vocabulary_limit = 50
 # "hierarchical": notes get tags as paths in a tag tree, like
@@ -111,6 +111,16 @@ similarity = 0.80
 # meanings, when their pages fall into two groups at most this similar.
 split_min_pages = 2
 split_similarity = 0.75
+# Fold near-duplicates and tags too narrow to stand on their own (a tag for
+# one detail of one page) into broader tags. A tag is offered a broader tag
+# only when their pages are at least fold_similarity alike, which also keeps
+# different meanings of a word apart; the model decides. Runs after merges
+# and splits, before the tag tree is built.
+consolidate = true
+fold_similarity = 0.85
+# [reconcile.consolidate_extra_body] replaces the request options for this
+# step only. It asks few questions, so an empty table, letting a thinking
+# model think, is affordable here.
 # Tag pairs per review request.
 batch_size = 20
 

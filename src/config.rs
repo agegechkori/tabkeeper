@@ -36,6 +36,15 @@ pub struct ReconcileConfig {
     /// Tags on at least this many pages are checked for covering different
     /// meanings.
     pub split_min_pages: usize,
+    /// Fold near-duplicates and tags too narrow to stand on their own into
+    /// broader tags whose pages are about the same things.
+    pub consolidate: bool,
+    /// How alike two tags' pages must be (cosine similarity of the average
+    /// page vectors) for one to be offered as the other's broader tag.
+    pub fold_similarity: f32,
+    /// Replaces the review's request options for consolidation only, e.g. `{}`
+    /// to let a thinking model think about the few folds it is asked about.
+    pub consolidate_extra_body: Option<serde_json::Map<String, serde_json::Value>>,
     /// Pages of one tag whose embeddings fall into two groups at most this
     /// similar to each other are checked for a split.
     pub split_similarity: f32,
@@ -51,6 +60,9 @@ impl Default for ReconcileConfig {
             extra_body: None,
             similarity: 0.80,
             split_min_pages: 2,
+            consolidate: true,
+            fold_similarity: 0.85,
+            consolidate_extra_body: None,
             split_similarity: 0.75,
             batch_size: 20,
         }
@@ -65,6 +77,15 @@ impl ReconcileConfig {
             config.model = model.clone();
         }
         if let Some(extra_body) = &self.extra_body {
+            config.extra_body = extra_body.clone();
+        }
+        config
+    }
+    /// The LLM settings for consolidation: the review's, with its own
+    /// request options if set.
+    pub fn consolidate_llm_config(&self, llm: &LlmConfig) -> LlmConfig {
+        let mut config = self.llm_config(llm);
+        if let Some(extra_body) = &self.consolidate_extra_body {
             config.extra_body = extra_body.clone();
         }
         config
@@ -277,8 +298,8 @@ impl Default for TagConfig {
             style: TagStyle::Hierarchical,
             max_depth: 3,
             taxonomy: None,
-            max_per_page: 5,
-            max_new_per_page: 3,
+            max_per_page: 3,
+            max_new_per_page: 2,
             vocabulary_limit: 50,
         }
     }

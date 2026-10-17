@@ -102,9 +102,10 @@ pub async fn review<R: Reviewer, E: Embedder>(
     let touched: HashSet<i64> = review
         .proposed
         .iter()
-        .flat_map(|p| match p.change {
-            TagChange::Merge { from, into } => vec![from, into],
-            TagChange::Rename { tag, .. } => vec![tag],
+        .flat_map(|p| match &p.change {
+            TagChange::Merge { from, into } => vec![*from, *into],
+            TagChange::Rename { tag, .. } => vec![*tag],
+            TagChange::Fold { into, from } => [vec![*into], from.clone()].concat(),
             TagChange::Split { .. } | TagChange::Place { .. } => vec![],
         })
         .collect();
@@ -374,7 +375,7 @@ fn two_groups(vectors: &[&[f32]]) -> Option<(Vec<usize>, f32)> {
     Some((labels, similarity(&centres[0], &centres[1])))
 }
 
-fn normalized_mean(vectors: &[&[f32]]) -> Vec<f32> {
+pub(crate) fn normalized_mean(vectors: &[&[f32]]) -> Vec<f32> {
     let mut mean = vec![0.0f32; vectors[0].len()];
     for v in vectors {
         for (m, x) in mean.iter_mut().zip(v.iter()) {
