@@ -33,9 +33,10 @@ pub enum TagChange {
     /// exist yet are created; existing tags on it that aren't in the tree
     /// yet are put there.
     Place { parent: Vec<String>, tags: Vec<i64> },
-    /// Narrow or near-duplicate tags folded into a broader one: each is
-    /// merged into `into`, as with `Merge`.
-    Fold { into: i64, from: Vec<i64> },
+    /// Every listed page gets these topic tags instead of its current ones:
+    /// the tags chosen from a vocabulary built from the whole archive. Tags
+    /// that don't exist yet are created with the given descriptions.
+    Retag { pages: Vec<PageTags> },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -43,6 +44,13 @@ pub struct SplitPart {
     pub name: String,
     pub description: String,
     pub pages: Vec<i64>,
+}
+
+/// A page's new topic tags, as (name, description).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PageTags {
+    pub page: i64,
+    pub tags: Vec<(String, String)>,
 }
 
 /// A done page with its topic tags.
@@ -103,6 +111,12 @@ enum Step {
         #[serde(default)]
         placed: bool,
         created_at: String,
+    },
+    /// A page's topic tags before and after a retag, as (raw tag, tag id).
+    PageTagsReplaced {
+        page: i64,
+        old: Vec<(String, i64)>,
+        new: Vec<(String, i64)>,
     },
     /// The tag's place in the tree before it was moved.
     Moved {
@@ -172,40 +186,6 @@ impl Db {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Replaces the topic tags of each page with the given (name,
-    /// description) tags, creating tags that don't exist yet.
-    pub fn replace_topic_tags(&mut self, assignments: &[(i64, Vec<(String, String)>)]) -> Result<()> {
-        let tx = self.conn.transaction()?;
-        for (page, tags) in assignments {
-            tx.execute(
-                "DELETE FROM page_tags WHERE page_id = ?1 AND resolved_tag_id IN
-                 (SELECT id FROM tags WHERE name NOT LIKE 'status/%')",
-                [page],
-            )?;
-            for (name, description) in tags {
-                let existing: Option<i64> = tx
-                    .query_row("SELECT id FROM tags WHERE name = ?1", [name], |r| r.get(0))
-                    .optional()?;
-                let id = match existing {
-                    Some(id) => id,
-                    None => {
-                        tx.execute(
-                            "INSERT INTO tags (name, description, created_at) VALUES (?1, ?2, ?3)",
-                            params![name, description, now()],
-                        )?;
-                        tx.last_insert_rowid()
-                    }
-                };
-                tx.execute(
-                    "INSERT OR IGNORE INTO page_tags (page_id, raw_tag, resolved_tag_id) VALUES (?1, ?2, ?3)",
-                    params![page, name, id],
-                )?;
-            }
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
     /// The tag that uses `name`, as its name or as an alias.
     pub fn tag_named(&self, name: &str) -> Result<Option<i64>> {
         Ok(self
@@ -270,9 +250,7 @@ impl Db {
                 TagChange::Rename { tag, name } => rename(&sp, *tag, name, &mut change_steps),
                 TagChange::Split { tag, into } => split(&sp, *tag, into, &mut change_steps),
                 TagChange::Place { parent, tags } => place(&sp, parent, tags, &mut change_steps),
-                TagChange::Fold { into, from } => from
-                    .iter()
-                    .try_for_each(|from| merge(&sp, *from, *into, &mut change_steps)),
+                TagChange::Retag { pages } => retag(&sp, pages, &mut change_steps),
             };
             match result {
                 Ok(()) => {
@@ -430,6 +408,53 @@ fn is_below(tx: &Connection, id: i64, ancestor: i64) -> Result<bool> {
         current = position(tx, parent)?.0;
     }
     Ok(false)
+}
+
+fn retag(tx: &Connection, pages: &[PageTags], steps: &mut Vec<Step>) -> Result<()> {
+    for PageTags { page, tags } in pages {
+        let old: Vec<(String, i64)> = tx
+            .prepare(
+                "SELECT x.raw_tag, x.resolved_tag_id FROM page_tags x JOIN tags t ON t.id = x.resolved_tag_id
+                 WHERE x.page_id = ?1 AND t.name NOT LIKE 'status/%'",
+            )?
+            .query_map([page], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        for (raw, tag) in &old {
+            tx.execute(
+                "DELETE FROM page_tags WHERE page_id = ?1 AND raw_tag = ?2 AND resolved_tag_id = ?3",
+                params![page, raw, tag],
+            )?;
+        }
+        let mut new = Vec::new();
+        for (name, description) in tags {
+            let existing: Option<i64> = tx
+                .query_row("SELECT id FROM tags WHERE name = ?1", [name], |r| r.get(0))
+                .optional()?;
+            let id = match existing {
+                Some(id) => id,
+                None => {
+                    tx.execute(
+                        "INSERT INTO tags (name, description, created_at) VALUES (?1, ?2, ?3)",
+                        params![name, description, now()],
+                    )?;
+                    let id = tx.last_insert_rowid();
+                    steps.push(Step::TagCreated { id, fallback: None });
+                    id
+                }
+            };
+            tx.execute(
+                "INSERT OR IGNORE INTO page_tags (page_id, raw_tag, resolved_tag_id) VALUES (?1, ?2, ?3)",
+                params![page, name, id],
+            )?;
+            new.push((name.clone(), id));
+        }
+        steps.push(Step::PageTagsReplaced {
+            page: *page,
+            old,
+            new,
+        });
+    }
+    Ok(())
 }
 
 fn place(tx: &Connection, parent: &[String], tags: &[i64], steps: &mut Vec<Step>) -> Result<()> {
@@ -783,6 +808,20 @@ fn undo_step(tx: &Connection, step: Step, freed_aliases: &mut Vec<(String, i64)>
             .with_context(|| format!("restoring tag {name}"))?;
             if let Some(newcomer) = newcomer {
                 absorb_tag(tx, newcomer, id)?;
+            }
+        }
+        Step::PageTagsReplaced { page, old, new } => {
+            for (raw, tag) in new {
+                tx.execute(
+                    "DELETE FROM page_tags WHERE page_id = ?1 AND raw_tag = ?2 AND resolved_tag_id = ?3",
+                    params![page, raw, tag],
+                )?;
+            }
+            for (raw, tag) in old {
+                tx.execute(
+                    "INSERT OR IGNORE INTO page_tags (page_id, raw_tag, resolved_tag_id) VALUES (?1, ?2, ?3)",
+                    params![page, raw, tag],
+                )?;
             }
         }
         Step::Moved { id, parent, placed } => {
@@ -1159,6 +1198,24 @@ mod tests {
         db.undo_last_revision().unwrap();
         assert!(tree(&db).is_empty());
         assert_eq!(db.find_tag("technology").unwrap(), Some((technology, false)));
+    }
+
+    #[test]
+    fn retag_replaces_page_tags_and_undo_restores_them() {
+        let (mut db, pages) = archive(&[&["sourdough", "baguette"], &["rye-bread"]]);
+        let before = names(&db);
+        let bread = |page| PageTags {
+            page,
+            tags: vec![("bread".to_string(), "Bread and baking.".to_string())],
+        };
+        db.apply_tag_changes(&[TagChange::Retag {
+            pages: vec![bread(pages[0]), bread(pages[1])],
+        }])
+        .unwrap();
+        assert_eq!(names(&db), [("bread".to_string(), 2)]);
+        db.undo_last_revision().unwrap();
+        assert_eq!(names(&db), before);
+        assert_eq!(db.find_tag("bread").unwrap(), None, "the new tag is gone again");
     }
 
     #[test]

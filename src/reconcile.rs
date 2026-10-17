@@ -105,7 +105,7 @@ pub async fn review<R: Reviewer, E: Embedder>(
         .flat_map(|p| match &p.change {
             TagChange::Merge { from, into } => vec![*from, *into],
             TagChange::Rename { tag, .. } => vec![*tag],
-            TagChange::Fold { into, from } => [vec![*into], from.clone()].concat(),
+            TagChange::Retag { .. } => vec![],
             TagChange::Split { .. } | TagChange::Place { .. } => vec![],
         })
         .collect();

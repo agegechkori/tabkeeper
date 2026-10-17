@@ -6,7 +6,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::tags::TagRow;
 
 mod review;
-pub use review::{AnalyzedPage, SplitPart, TagChange, TagInfo};
+pub use review::{AnalyzedPage, PageTags, SplitPart, TagChange, TagInfo};
 
 const SCHEMA_VERSION: i32 = 7;
 

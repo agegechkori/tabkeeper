@@ -36,15 +36,22 @@ pub struct ReconcileConfig {
     /// Tags on at least this many pages are checked for covering different
     /// meanings.
     pub split_min_pages: usize,
-    /// Fold near-duplicates and tags too narrow to stand on their own into
-    /// broader tags whose pages are about the same things.
-    pub consolidate: bool,
-    /// How alike two tags' pages must be (cosine similarity of the average
-    /// page vectors) for one to be offered as the other's broader tag.
-    pub fold_similarity: f32,
-    /// Replaces the review's request options for consolidation only, e.g. `{}`
-    /// to let a thinking model think about the few folds it is asked about.
-    pub consolidate_extra_body: Option<serde_json::Map<String, serde_json::Value>>,
+    /// Build the vocabulary from the whole archive and retag every page from
+    /// it. Off: only merge duplicate tags and split ambiguous ones.
+    pub vocabulary: bool,
+    /// Pages at least this alike (cosine similarity) form a cluster that gets
+    /// a tag.
+    pub cluster_similarity: f32,
+    /// A tag needs at least this many pages to stay in the vocabulary.
+    pub min_support: usize,
+    /// Vocabulary tags offered to the model for each page.
+    pub candidates: usize,
+    /// Let a thinking model think when confirming that a word has several
+    /// meanings (python the language and the snake); a few requests per run.
+    pub think_meanings: bool,
+    /// The most tokens, thinking included, a meanings confirmation may use;
+    /// thinking models sometimes don't stop on their own.
+    pub meanings_max_tokens: u32,
     /// Pages of one tag whose embeddings fall into two groups at most this
     /// similar to each other are checked for a split.
     pub split_similarity: f32,
@@ -60,9 +67,12 @@ impl Default for ReconcileConfig {
             extra_body: None,
             similarity: 0.80,
             split_min_pages: 2,
-            consolidate: true,
-            fold_similarity: 0.85,
-            consolidate_extra_body: None,
+            vocabulary: true,
+            cluster_similarity: 0.80,
+            min_support: 3,
+            candidates: 8,
+            think_meanings: true,
+            meanings_max_tokens: 4000,
             split_similarity: 0.75,
             batch_size: 20,
         }
@@ -81,13 +91,20 @@ impl ReconcileConfig {
         }
         config
     }
-    /// The LLM settings for consolidation: the review's, with its own
-    /// request options if set.
-    pub fn consolidate_llm_config(&self, llm: &LlmConfig) -> LlmConfig {
+    /// The LLM settings for confirming that a word has several meanings:
+    /// the review's, without request options, so a thinking model thinks,
+    /// with a cap on output and no retries, so a runaway answer costs one
+    /// request. A confirmation that fails leaves the word as it is.
+    pub fn meanings_llm_config(&self, llm: &LlmConfig) -> LlmConfig {
         let mut config = self.llm_config(llm);
-        if let Some(extra_body) = &self.consolidate_extra_body {
-            config.extra_body = extra_body.clone();
+        if self.think_meanings {
+            config.extra_body = serde_json::Map::new();
         }
+        config
+            .extra_body
+            .insert("max_tokens".into(), self.meanings_max_tokens.into());
+        config.retries = 0;
+        config.timeout_secs = config.timeout_secs.min(180);
         config
     }
 }
@@ -338,6 +355,9 @@ impl Config {
         }
         if config.reconcile.batch_size == 0 || config.reconcile.split_min_pages < 2 {
             bail!("reconcile.batch_size must be at least 1 and reconcile.split_min_pages at least 2");
+        }
+        if config.reconcile.min_support < 2 || config.reconcile.candidates == 0 {
+            bail!("reconcile.min_support must be at least 2 and reconcile.candidates at least 1");
         }
         if config.run.concurrency == 0 || config.run.per_domain == 0 {
             bail!("run.concurrency and run.per_domain must be at least 1");

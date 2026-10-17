@@ -111,16 +111,22 @@ similarity = 0.80
 # meanings, when their pages fall into two groups at most this similar.
 split_min_pages = 2
 split_similarity = 0.75
-# Fold near-duplicates and tags too narrow to stand on their own (a tag for
-# one detail of one page) into broader tags. A tag is offered a broader tag
-# only when their pages are at least fold_similarity alike, which also keeps
-# different meanings of a word apart; the model decides. Runs after merges
-# and splits, before the tag tree is built.
-consolidate = true
-fold_similarity = 0.85
-# [reconcile.consolidate_extra_body] replaces the request options for this
-# step only. It asks few questions, so an empty table, letting a thinking
-# model think, is affordable here.
+# Build the tag vocabulary from the whole archive, then retag every page
+# from it: pages are clustered by what they're about, the model names each
+# cluster, topics on several pages join in, one-word topics used for
+# unrelated things (python the language and the snake) get qualified tags,
+# and each page gets 1 to max_per_page tags from the vocabulary tags nearest
+# to it. Tags on fewer than min_support pages are dropped. false: only merge
+# duplicate tags and split ambiguous ones.
+vocabulary = true
+cluster_similarity = 0.80
+min_support = 3
+candidates = 8
+# Confirm "several meanings" with thinking allowed (clears [llm.extra_body]
+# for those few requests): much more reliable with small models.
+think_meanings = true
+# The most output tokens, thinking included, for each of those requests.
+meanings_max_tokens = 4000
 # Tag pairs per review request.
 batch_size = 20
 
