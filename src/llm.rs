@@ -440,7 +440,7 @@ Reply with a single JSON object with the fields title, summary, language, tags a
 - summary: 2 to 4 sentences describing the content of the page.
 - {lang}
 - language: the ISO 639-1 code of the language you wrote the title and summary in.
-- tags: {min_tags} to {max_tags} topic tags for the page, most important first. One or two general tags are usually enough; add a narrower one only for a topic someone would look for on its own. Each tag is one lowercase kebab-case English name, such as machine-learning or sourdough, with no \"/\" and no \"#\". Tag what the page is about, not its format: never tags like article, website, blog or wikipedia.
+- tags: {min_tags} to {max_tags} topic tags for the page, starting with the broad topic someone would file the page under (bread, investing, japan, classical-music, machine-learning), then at most two narrower ones for what the page is specifically about (baguette, index-funds). Each tag is one lowercase kebab-case English name, such as machine-learning or sourdough, with no \"/\" and no \"#\". Tag what the page is about, not its format: never tags like article, website, blog or wikipedia.
 - Reuse existing tags whenever one fits: the list below shows the existing tags most relevant to this page. Create a new tag only for a topic none of them covers, and never a new tag that means the same as an existing one. At most {max_new} new tags per page.
 - If a tag's word has several common meanings, qualify it: rust-programming versus rust-corrosion, python-programming versus python-snake.
 - new_tags: every tag in tags that is not in the existing list, each with a one-line description of what it covers.

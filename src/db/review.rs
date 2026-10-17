@@ -45,6 +45,15 @@ pub struct SplitPart {
     pub pages: Vec<i64>,
 }
 
+/// A done page with its topic tags.
+#[derive(Debug, Clone)]
+pub struct AnalyzedPage {
+    pub id: i64,
+    pub title: String,
+    pub summary: String,
+    pub tags: Vec<String>,
+}
+
 /// A topic tag with the number of pages it's on.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TagInfo {
@@ -138,6 +147,63 @@ impl Db {
         )?;
         let rows = stmt.query_map([tag_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Done pages with their topic tags (not `status/` ones), for building
+    /// the vocabulary from the whole archive.
+    pub fn analyzed_pages(&self) -> Result<Vec<AnalyzedPage>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT p.id, p.title, p.summary,
+                    (SELECT group_concat(t.name, ' ') FROM page_tags x JOIN tags t ON t.id = x.resolved_tag_id
+                     WHERE x.page_id = p.id AND t.name NOT LIKE 'status/%')
+             FROM pages p WHERE p.status = 'done' ORDER BY p.id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let tags: Option<String> = r.get(3)?;
+            Ok(AnalyzedPage {
+                id: r.get(0)?,
+                title: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                summary: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                tags: tags
+                    .map(|t| t.split(' ').map(str::to_string).collect())
+                    .unwrap_or_default(),
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Replaces the topic tags of each page with the given (name,
+    /// description) tags, creating tags that don't exist yet.
+    pub fn replace_topic_tags(&mut self, assignments: &[(i64, Vec<(String, String)>)]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        for (page, tags) in assignments {
+            tx.execute(
+                "DELETE FROM page_tags WHERE page_id = ?1 AND resolved_tag_id IN
+                 (SELECT id FROM tags WHERE name NOT LIKE 'status/%')",
+                [page],
+            )?;
+            for (name, description) in tags {
+                let existing: Option<i64> = tx
+                    .query_row("SELECT id FROM tags WHERE name = ?1", [name], |r| r.get(0))
+                    .optional()?;
+                let id = match existing {
+                    Some(id) => id,
+                    None => {
+                        tx.execute(
+                            "INSERT INTO tags (name, description, created_at) VALUES (?1, ?2, ?3)",
+                            params![name, description, now()],
+                        )?;
+                        tx.last_insert_rowid()
+                    }
+                };
+                tx.execute(
+                    "INSERT OR IGNORE INTO page_tags (page_id, raw_tag, resolved_tag_id) VALUES (?1, ?2, ?3)",
+                    params![page, name, id],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// The tag that uses `name`, as its name or as an alias.

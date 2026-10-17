@@ -17,6 +17,7 @@ mod tags;
 mod tree;
 mod urls;
 mod usage;
+mod vocab;
 
 use std::collections::HashSet;
 use std::io::IsTerminal;
@@ -109,6 +110,23 @@ enum Command {
         /// Your own top-level categories for the tag tree, overriding tags.taxonomy.
         #[arg(long, value_name = "FILE")]
         taxonomy: Option<PathBuf>,
+    },
+    /// Experimental: build the tag vocabulary from the whole archive and
+    /// retag every page from it, replacing the pages' tags. Try it on a copy.
+    #[command(hide = true)]
+    Retag {
+        /// Pages at least this alike form a cluster that gets a tag.
+        #[arg(long, default_value_t = 0.80)]
+        cluster_similarity: f32,
+        /// A tag needs at least this many pages.
+        #[arg(long, default_value_t = 3)]
+        min_support: usize,
+        /// Vocabulary tags offered to the model for each page.
+        #[arg(long, default_value_t = 8)]
+        candidates: usize,
+        /// Let a thinking model think when deciding whether a word has several meanings.
+        #[arg(long)]
+        think_meanings: bool,
     },
     /// Undo the latest tag review that changed tags.
     Undo,
@@ -356,6 +374,75 @@ async fn run(cli: Cli) -> Result<()> {
             if let Some(error) = &review.tree_error {
                 bail!("putting tags in the tree failed: {error}");
             }
+        }
+        Command::Retag {
+            cluster_similarity,
+            min_support,
+            candidates,
+            think_meanings,
+        } => {
+            let mut db = open_db(&cli.out)?;
+            let reviewer = llm::OpenAiCompatible::new(&config.reconcile.llm_config(&config.llm))?;
+            let embedder = embed::OpenAiEmbedder::new(&config.embeddings, &config.llm)?;
+            pipeline::Embeddings::prepare(&db, &embedder, config.embeddings.page_chars).await?;
+            let settings = vocab::Settings {
+                cluster_similarity,
+                min_support,
+                candidates,
+                max_tags: config.tags.max_per_page,
+            };
+            let started = std::time::Instant::now();
+            let mut meanings_config = config.reconcile.llm_config(&config.llm);
+            if think_meanings {
+                meanings_config.extra_body = serde_json::Map::new();
+            }
+            let meanings = llm::OpenAiCompatible::new(&meanings_config)?;
+            let retag = vocab::retag(&db, &reviewer, &meanings, &embedder, &settings, &|t: &str| {
+                println!("{t}")
+            })
+            .await?;
+            let mut usage = llm::Reviewer::usage(&reviewer);
+            usage.add(&llm::Reviewer::usage(&meanings));
+            println!(
+                "\nClusters with {min_support}+ pages: {} (sizes {:?})",
+                retag.clusters.len(),
+                retag.clusters
+            );
+            println!("Vocabulary: {} tags", retag.vocabulary.len());
+            for t in &retag.vocabulary {
+                let source = match t.source {
+                    vocab::Source::Topic => "topic",
+                    vocab::Source::Cluster => "cluster",
+                };
+                println!("  {:>3}  {:<28} {source:<7} {}", t.pages, t.name, t.description);
+            }
+            println!("Dropped for too few pages: {}", retag.dropped.join(", "));
+            let renamed: Vec<String> = retag.renamed.iter().map(|(a, b)| format!("{a} → {b}")).collect();
+            println!("Renamed when refined: {}", renamed.join(", "));
+            let ambiguous: Vec<String> = retag
+                .ambiguous
+                .iter()
+                .map(|(w, names)| {
+                    if names.is_empty() {
+                        format!("{w} (kept its largest meaning)")
+                    } else {
+                        format!("{w} → {}", names.join(" + "))
+                    }
+                })
+                .collect();
+            println!("Words with several meanings: {}", ambiguous.join(", "));
+
+            println!(
+                "Pages without tags: {} · failed requests: {} · {} requests, {} in / {} out tokens · {:.0} s",
+                retag.untagged,
+                retag.failed_requests.len(),
+                usage.requests,
+                usage.input_tokens,
+                usage.output_tokens,
+                started.elapsed().as_secs_f64()
+            );
+            db.replace_topic_tags(&retag.assignments)?;
+            finish(&db, &cli.out, &config)?;
         }
         Command::Undo => {
             let mut db = open_db(&cli.out)?;
