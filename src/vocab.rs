@@ -3,7 +3,7 @@
 //! cluster, topics already used on several pages join the vocabulary, and each
 //! page then gets its tags from the vocabulary tags nearest to it.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use anyhow::Result;
 use serde::Deserialize;
@@ -54,12 +54,14 @@ pub struct VocabTag {
 /// What retagging found and decided.
 #[derive(Debug, Default)]
 pub struct Retag {
-    /// Sizes of the clusters with at least `min_support` pages.
-    pub clusters: Vec<usize>,
     pub vocabulary: Vec<VocabTag>,
     /// Tags offered or chosen but used on too few pages in the end.
     pub dropped: Vec<String>,
-    /// (page, its new tags as (name, description)).
+    /// Each done page's topic tags now, without locked ones.
+    pub before: HashMap<i64, Vec<String>>,
+    /// (page, its new tags as (name, description)), for the pages the model
+    /// tagged. Pages whose request failed keep their tags. Locked tags stay
+    /// on their pages and aren't listed.
     pub assignments: Vec<(i64, Vec<(String, String)>)>,
     pub untagged: usize,
     pub failed_requests: Vec<String>,
@@ -126,7 +128,9 @@ async fn embed_all<E: Embedder>(embedder: &E, texts: &[String]) -> Result<Vec<Ve
 
 /// Average-linkage agglomerative clustering: the two most alike clusters are
 /// joined until no two are at least `threshold` alike. Pages like no other
-/// stay on their own. O(n³) in the worst case, fine for a few thousand pages.
+/// stay on their own. Each cluster remembers its most alike other cluster, so
+/// a join only rescans the clusters that pointed at the joined two: about
+/// O(n²) time, and O(n²) memory for the similarities.
 pub fn agglomerate(vectors: &[Vec<f32>], threshold: f32) -> Vec<Vec<usize>> {
     let n = vectors.len();
     let mut members: Vec<Option<Vec<usize>>> = (0..n).map(|i| Some(vec![i])).collect();
@@ -138,19 +142,20 @@ pub fn agglomerate(vectors: &[Vec<f32>], threshold: f32) -> Vec<Vec<usize>> {
             sim[j][i] = s;
         }
     }
-    loop {
-        let mut best: Option<(usize, usize, f32)> = None;
-        for a in (0..n).filter(|&a| members[a].is_some()) {
-            for b in (a + 1..n).filter(|&b| members[b].is_some()) {
-                if best.is_none_or(|(_, _, s)| sim[a][b] > s) {
-                    best = Some((a, b, sim[a][b]));
-                }
-            }
-        }
-        let Some((a, b, s)) = best.filter(|(_, _, s)| *s >= threshold) else {
-            break;
-        };
-        let _ = s;
+    // The most alike other live cluster of each live cluster.
+    let nearest = |a: usize, sim: &[Vec<f32>], members: &[Option<Vec<usize>>]| {
+        (0..n)
+            .filter(|&b| b != a && members[b].is_some())
+            .map(|b| (b, sim[a][b]))
+            .max_by(|x, y| x.1.total_cmp(&y.1).then(y.0.cmp(&x.0)))
+    };
+    let mut best: Vec<Option<(usize, f32)>> = (0..n).map(|a| nearest(a, &sim, &members)).collect();
+    while let Some((a, b)) = (0..n)
+        .filter_map(|a| best[a].map(|(b, s)| (a, b, s)))
+        .max_by(|x, y| x.2.total_cmp(&y.2).then((y.0, y.1).cmp(&(x.0, x.1))))
+        .filter(|(_, _, s)| *s >= threshold)
+        .map(|(a, b, _)| (a.min(b), a.max(b)))
+    {
         let (na, nb) = (
             members[a].as_ref().map_or(0, Vec::len) as f32,
             members[b].as_ref().map_or(0, Vec::len) as f32,
@@ -162,6 +167,15 @@ pub fn agglomerate(vectors: &[Vec<f32>], threshold: f32) -> Vec<Vec<usize>> {
         }
         let moved = members[b].take().unwrap_or_default();
         members[a].get_or_insert_with(Vec::new).extend(moved);
+        best[b] = None;
+        best[a] = nearest(a, &sim, &members);
+        for k in (0..n).filter(|&k| k != a && members[k].is_some()) {
+            best[k] = match best[k] {
+                Some((p, _)) if p == a || p == b => nearest(k, &sim, &members),
+                Some((p, s)) if sim[k][a] > s || (sim[k][a] == s && a < p) => Some((a, sim[k][a])),
+                other => other,
+            };
+        }
     }
     let mut clusters: Vec<Vec<usize>> = members.into_iter().flatten().collect();
     clusters.sort_by(|a, b| b.len().cmp(&a.len()).then(a.cmp(b)));
@@ -205,10 +219,22 @@ pub async fn retag<R: Reviewer, E: Embedder>(
     let page_vectors = embed_all(embedder, &texts).await?;
 
     // Topics several pages already share.
-    let descriptions: HashMap<String, String> = db
-        .topic_tags()?
-        .into_iter()
-        .map(|t| (t.name, t.description.unwrap_or_default()))
+    let topics = db.topic_tags()?;
+    let descriptions: HashMap<String, String> = topics
+        .iter()
+        .map(|t| (t.name.clone(), t.description.clone().unwrap_or_default()))
+        .collect();
+    let locked: HashSet<String> = topics
+        .iter()
+        .filter(|t| t.locked)
+        .map(|t| t.name.clone())
+        .collect();
+    out.before = pages
+        .iter()
+        .map(|p| {
+            let tags = p.tags.iter().filter(|t| !locked.contains(*t)).cloned().collect();
+            (p.id, tags)
+        })
         .collect();
     let mut topic_counts: BTreeMap<&str, usize> = BTreeMap::new();
     for page in &pages {
@@ -229,17 +255,12 @@ pub async fn retag<R: Reviewer, E: Embedder>(
             }
         }
     }
-    members.retain(|_, list| list.len() >= settings.min_support);
-    for (name, n) in topic_counts
-        .iter()
-        .filter(|(name, _)| members.contains_key(**name))
-    {
-        let _ = n;
+    for name in members.keys() {
         vocabulary.insert(
             name.to_string(),
             VocabTag {
                 name: name.to_string(),
-                description: descriptions.get(*name).cloned().unwrap_or_default(),
+                description: descriptions.get(name).cloned().unwrap_or_default(),
                 source: Source::Topic,
                 pages: 0,
             },
@@ -258,7 +279,6 @@ pub async fn retag<R: Reviewer, E: Embedder>(
         .into_iter()
         .filter(|c| c.len() >= settings.min_support)
         .collect();
-    out.clusters = clusters.iter().map(Vec::len).collect();
     note(&format!(
         "Building the vocabulary: {} clusters of pages, {} shared topics.",
         clusters.len(),
@@ -307,6 +327,8 @@ pub async fn retag<R: Reviewer, E: Embedder>(
             .iter()
             .filter(|&&i| i >= 1 && i <= sample.len())
             .map(|&i| cluster[i - 1])
+            .collect::<BTreeSet<usize>>()
+            .into_iter()
             .collect();
         if fitting.len() < settings.min_support.min(sample.len()) {
             continue;
@@ -399,12 +421,6 @@ pub async fn retag<R: Reviewer, E: Embedder>(
             .max_by_key(|&t| pages_of(&things[t]))
             .unwrap_or(0);
         let mut names = vec![word.clone()];
-        let kept: Vec<usize> = things[main]
-            .2
-            .iter()
-            .flat_map(|&g| groups[g].iter().copied())
-            .collect();
-        members.insert(word.clone(), kept);
         // The word now names that meaning: its description says so, so a page
         // about another meaning isn't given it.
         if let Some(tag) = vocabulary.get_mut(&word)
@@ -412,15 +428,10 @@ pub async fn retag<R: Reviewer, E: Embedder>(
         {
             tag.description = format!("{word}: {}", things[main].1);
         }
-        for (t, (name, description, member_groups)) in things.into_iter().enumerate() {
+        for (t, (name, description, _)) in things.into_iter().enumerate() {
             if t == main || name == word || names.contains(&name) {
                 continue;
             }
-            let list: Vec<usize> = member_groups
-                .iter()
-                .flat_map(|&g| groups[g].iter().copied())
-                .collect();
-            members.entry(name.clone()).or_default().extend(list);
             vocabulary.entry(name.clone()).or_insert(VocabTag {
                 name: name.clone(),
                 description,
@@ -449,7 +460,8 @@ pub async fn retag<R: Reviewer, E: Embedder>(
         "type": "object", "additionalProperties": false, "required": ["tags"],
         "properties": {"tags": {"type": "array", "items": {"type": "string"}}}
     });
-    let mut chosen: Vec<Vec<String>> = Vec::with_capacity(pages.len());
+    // None for a page whose request failed: it keeps its tags.
+    let mut chosen: Vec<Option<Vec<String>>> = Vec::with_capacity(pages.len());
     for (page, vector) in pages.iter().zip(&page_vectors) {
         let mut ranked: Vec<(f32, usize)> = tag_vectors
             .iter()
@@ -474,12 +486,18 @@ pub async fn retag<R: Reviewer, E: Embedder>(
             .ask_json(&system, &user, "page_tags", classify_schema.clone())
             .await
         {
-            Ok(reply) => serde_json::from_value::<ClassifyReply>(reply)
-                .map(|r| r.tags)
-                .unwrap_or_default(),
+            Ok(reply) => match serde_json::from_value::<ClassifyReply>(reply) {
+                Ok(reply) => reply.tags,
+                Err(_) => {
+                    out.failed_requests.push("a page's tags were unusable".into());
+                    chosen.push(None);
+                    continue;
+                }
+            },
             Err(err) => {
                 out.failed_requests.push(format!("{err:#}"));
-                Vec::new()
+                chosen.push(None);
+                continue;
             }
         };
         let mut tags: Vec<String> = Vec::new();
@@ -492,12 +510,12 @@ pub async fn retag<R: Reviewer, E: Embedder>(
                 tags.push(name);
             }
         }
-        chosen.push(tags);
+        chosen.push(Some(tags));
     }
 
     // Tags too few pages chose are dropped.
     let mut counts: HashMap<String, usize> = HashMap::new();
-    for tags in &chosen {
+    for tags in chosen.iter().flatten() {
         for t in tags {
             *counts.entry(t.clone()).or_default() += 1;
         }
@@ -509,15 +527,17 @@ pub async fn retag<R: Reviewer, E: Embedder>(
         .collect();
     out.dropped = names.iter().filter(|n| !kept.contains(*n)).cloned().collect();
     for (page, tags) in pages.iter().zip(chosen) {
+        let Some(tags) = tags else { continue };
         let tags: Vec<(String, String)> = tags
             .into_iter()
-            .filter(|t| kept.contains(t))
+            .filter(|t| kept.contains(t) && !locked.contains(t))
             .map(|t| {
                 let description = vocabulary[&t].description.clone();
                 (t, description)
             })
             .collect();
-        if tags.is_empty() {
+        // A page with a locked tag keeps it.
+        if tags.is_empty() && !page.tags.iter().any(|t| locked.contains(t)) {
             out.untagged += 1;
         }
         out.assignments.push((page.id, tags));
@@ -611,6 +631,92 @@ mod tests {
             db.tag_decision("meanings:coffee").unwrap().as_deref(),
             Some("same:3")
         );
+    }
+
+    #[tokio::test]
+    async fn a_page_whose_request_fails_keeps_its_tags() {
+        use crate::reconcile::tests::{FakeReviewer, archive, no_names};
+        let db = archive(&[
+            (&["coffee"], [1.0, 0.0, 0.0]),
+            (&["coffee"], [1.0, 0.0, 0.0]),
+            (&["coffee"], [1.0, 0.0, 0.0]),
+        ]);
+        let reviewer = FakeReviewer::new(vec![
+            json!({"groups": [], "same_meaning": true}),
+            json!({"tags": ["coffee"]}),
+            json!({"tags": ["coffee"]}),
+            json!({"tags": 5}),
+        ]);
+        let settings = Settings {
+            cluster_similarity: 0.8,
+            min_support: 2,
+            candidates: 8,
+            max_tags: 3,
+        };
+        let out = retag(&db, &reviewer, &no_names(), &settings, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(out.failed_requests.len(), 1);
+        assert_eq!(out.assignments.len(), 2, "the third page isn't retagged");
+        assert_eq!(out.untagged, 0);
+    }
+
+    /// Joining the most alike pair by scanning every pair, as agglomerate did
+    /// before it remembered each cluster's nearest one.
+    fn agglomerate_by_scanning(vectors: &[Vec<f32>], threshold: f32) -> Vec<Vec<usize>> {
+        let n = vectors.len();
+        let mut members: Vec<Option<Vec<usize>>> = (0..n).map(|i| Some(vec![i])).collect();
+        let mut sim: Vec<Vec<f32>> = (0..n)
+            .map(|i| (0..n).map(|j| similarity(&vectors[i], &vectors[j])).collect())
+            .collect();
+        loop {
+            let mut best: Option<(usize, usize, f32)> = None;
+            for a in (0..n).filter(|&a| members[a].is_some()) {
+                for b in (a + 1..n).filter(|&b| members[b].is_some()) {
+                    if best.is_none_or(|(_, _, s)| sim[a][b] > s) {
+                        best = Some((a, b, sim[a][b]));
+                    }
+                }
+            }
+            let Some((a, b, _)) = best.filter(|(_, _, s)| *s >= threshold) else {
+                break;
+            };
+            let na = members[a].as_ref().map_or(0, Vec::len) as f32;
+            let nb = members[b].as_ref().map_or(0, Vec::len) as f32;
+            for k in (0..n).filter(|&k| k != a && k != b && members[k].is_some()) {
+                let merged = (na * sim[a][k] + nb * sim[b][k]) / (na + nb);
+                sim[a][k] = merged;
+                sim[k][a] = merged;
+            }
+            let moved = members[b].take().unwrap_or_default();
+            members[a].get_or_insert_with(Vec::new).extend(moved);
+        }
+        let mut clusters: Vec<Vec<usize>> = members.into_iter().flatten().collect();
+        clusters.sort_by(|a, b| b.len().cmp(&a.len()).then(a.cmp(b)));
+        clusters
+    }
+
+    #[test]
+    fn clusters_match_scanning_every_pair() {
+        let mut seed: u64 = 7;
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) as f32 / (1u64 << 31) as f32) - 0.5
+        };
+        // Points near a few centres, so pages form clusters of several sizes.
+        let centres: Vec<Vec<f32>> = (0..6).map(|_| (0..8).map(|_| next()).collect()).collect();
+        let vectors: Vec<Vec<f32>> = (0..200)
+            .map(|i| unit(centres[i % 6].iter().map(|c| c + 0.4 * next()).collect()))
+            .collect();
+        for threshold in [0.5, 0.7, 0.9] {
+            assert_eq!(
+                agglomerate(&vectors, threshold),
+                agglomerate_by_scanning(&vectors, threshold),
+                "threshold {threshold}"
+            );
+        }
     }
 
     #[test]

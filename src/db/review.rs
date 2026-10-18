@@ -168,7 +168,7 @@ impl Db {
     pub fn analyzed_pages(&self) -> Result<Vec<AnalyzedPage>> {
         let mut stmt = self.conn.prepare(
             "SELECT p.id, p.title, p.summary,
-                    (SELECT group_concat(t.name, ' ') FROM page_tags x JOIN tags t ON t.id = x.resolved_tag_id
+                    (SELECT group_concat(DISTINCT t.name) FROM page_tags x JOIN tags t ON t.id = x.resolved_tag_id
                      WHERE x.page_id = p.id AND t.name NOT LIKE 'status/%')
              FROM pages p WHERE p.status = 'done' ORDER BY p.id",
         )?;
@@ -179,7 +179,7 @@ impl Db {
                 title: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
                 summary: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
                 tags: tags
-                    .map(|t| t.split(' ').map(str::to_string).collect())
+                    .map(|t| t.split(',').map(str::to_string).collect())
                     .unwrap_or_default(),
             })
         })?;
@@ -205,6 +205,15 @@ impl Db {
             .prepare("SELECT key FROM tag_decisions WHERE substr(key, 1, length(?1)) = ?1")?;
         let rows = stmt.query_map([prefix], |r| r.get(0))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Forgets the decisions whose keys start with `prefix`.
+    pub fn forget_tag_decisions(&self, prefix: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM tag_decisions WHERE substr(key, 1, length(?1)) = ?1",
+            [prefix],
+        )?;
+        Ok(())
     }
 
     pub fn tag_decision(&self, key: &str) -> Result<Option<String>> {
@@ -410,12 +419,13 @@ fn is_below(tx: &Connection, id: i64, ancestor: i64) -> Result<bool> {
     Ok(false)
 }
 
+/// Replaces each page's topic tags. Locked tags stay on their pages.
 fn retag(tx: &Connection, pages: &[PageTags], steps: &mut Vec<Step>) -> Result<()> {
     for PageTags { page, tags } in pages {
         let old: Vec<(String, i64)> = tx
             .prepare(
                 "SELECT x.raw_tag, x.resolved_tag_id FROM page_tags x JOIN tags t ON t.id = x.resolved_tag_id
-                 WHERE x.page_id = ?1 AND t.name NOT LIKE 'status/%'",
+                 WHERE x.page_id = ?1 AND t.name NOT LIKE 'status/%' AND NOT t.locked",
             )?
             .query_map([page], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?;
@@ -427,8 +437,13 @@ fn retag(tx: &Connection, pages: &[PageTags], steps: &mut Vec<Step>) -> Result<(
         }
         let mut new = Vec::new();
         for (name, description) in tags {
+            // A tag, or the tag an alias with this name stands for.
             let existing: Option<i64> = tx
-                .query_row("SELECT id FROM tags WHERE name = ?1", [name], |r| r.get(0))
+                .query_row(
+                    "SELECT id FROM tags WHERE name = ?1 UNION ALL SELECT tag_id FROM tag_aliases WHERE alias = ?1 LIMIT 1",
+                    [name],
+                    |r| r.get(0),
+                )
                 .optional()?;
             let id = match existing {
                 Some(id) => id,
@@ -442,8 +457,17 @@ fn retag(tx: &Connection, pages: &[PageTags], steps: &mut Vec<Step>) -> Result<(
                     id
                 }
             };
+            // A locked tag that stayed on the page, or a tag already given.
+            let present: bool = tx.query_row(
+                "SELECT EXISTS (SELECT 1 FROM page_tags WHERE page_id = ?1 AND resolved_tag_id = ?2)",
+                params![page, id],
+                |r| r.get(0),
+            )?;
+            if present {
+                continue;
+            }
             tx.execute(
-                "INSERT OR IGNORE INTO page_tags (page_id, raw_tag, resolved_tag_id) VALUES (?1, ?2, ?3)",
+                "INSERT INTO page_tags (page_id, raw_tag, resolved_tag_id) VALUES (?1, ?2, ?3)",
                 params![page, name, id],
             )?;
             new.push((name.clone(), id));
@@ -1216,6 +1240,40 @@ mod tests {
         db.undo_last_revision().unwrap();
         assert_eq!(names(&db), before);
         assert_eq!(db.find_tag("bread").unwrap(), None, "the new tag is gone again");
+    }
+
+    #[test]
+    fn retag_keeps_locked_tags_and_uses_aliases() {
+        let (mut db, pages) = archive(&[&["homelab", "servers"], &["machine-learning"]]);
+        db.conn
+            .execute("UPDATE tags SET locked = 1 WHERE name = 'homelab'", [])
+            .unwrap();
+        let ml = id(&db, "machine-learning");
+        db.add_alias("ml", ml, "user").unwrap();
+        let tagged = |page| PageTags {
+            page,
+            tags: vec![("ml".to_string(), "Machine learning.".to_string())],
+        };
+        db.apply_tag_changes(&[TagChange::Retag {
+            pages: vec![tagged(pages[0]), tagged(pages[1])],
+        }])
+        .unwrap();
+        assert_eq!(
+            names(&db),
+            [("homelab".to_string(), 1), ("machine-learning".to_string(), 2)]
+        );
+        assert_eq!(db.tag_named("ml").unwrap(), Some(ml), "no tag shadows the alias");
+    }
+
+    #[test]
+    fn analyzed_pages_list_each_tag_once() {
+        let (mut db, _) = archive(&[&["js", "javascript"]]);
+        db.apply_tag_changes(&[TagChange::Merge {
+            from: id(&db, "js"),
+            into: id(&db, "javascript"),
+        }])
+        .unwrap();
+        assert_eq!(db.analyzed_pages().unwrap()[0].tags, ["javascript"]);
     }
 
     #[test]

@@ -295,7 +295,7 @@ async fn run(cli: Cli) -> Result<()> {
                 );
             }
             let review = if config.reconcile.at_end_of_run && summary.stop.is_none() && !budgeted {
-                let review = review_tags(&mut db, &config, yes, &say).await;
+                let review = review_tags(&mut db, &config, yes, false, &say).await;
                 render::render_all(&db, &cli.out, config.notes.title, config.tags.style)?;
                 Some(review)
             } else {
@@ -340,7 +340,7 @@ async fn run(cli: Cli) -> Result<()> {
                 config.tags.taxonomy = taxonomy;
             }
             let mut db = open_db(&cli.out)?;
-            let review = review_tags(&mut db, &config, yes, &|text: &str| println!("{text}")).await;
+            let review = review_tags(&mut db, &config, yes, true, &|text: &str| println!("{text}")).await;
             finish(&db, &cli.out, &config)?;
             if let Some(error) = &review.error {
                 bail!("the tag review failed: {error}");
@@ -404,7 +404,14 @@ async fn run(cli: Cli) -> Result<()> {
 /// splits, then, with hierarchical tags, where tags go in the tree, which
 /// needs the merged and split tags. A failure is reported, not returned: the
 /// run's pages are saved either way.
-async fn review_tags(db: &mut Db, config: &Config, yes: bool, say: &dyn Fn(&str)) -> report::ReviewReport {
+/// `on_demand`: run by `revise-tags` rather than at the end of an import.
+async fn review_tags(
+    db: &mut Db,
+    config: &Config,
+    yes: bool,
+    on_demand: bool,
+    say: &dyn Fn(&str),
+) -> report::ReviewReport {
     let llm_config = config.reconcile.llm_config(&config.llm);
     let mut outcome = report::ReviewReport {
         model: llm_config.model.clone(),
@@ -438,7 +445,7 @@ async fn review_tags(db: &mut Db, config: &Config, yes: bool, say: &dyn Fn(&str)
         match usable {
             None => say("Building the vocabulary needs embeddings; the tags were left as they are."),
             Some(embedder) => {
-                vocabulary_review(db, config, &reviewer, embedder, yes, say, &mut outcome).await
+                vocabulary_review(db, config, &reviewer, embedder, yes, on_demand, say, &mut outcome).await
             }
         }
     } else {
@@ -531,6 +538,10 @@ async fn review_tags(db: &mut Db, config: &Config, yes: bool, say: &dyn Fn(&str)
     outcome
 }
 
+/// A declined or undone retag is proposed again at the end of an import only
+/// once the archive has grown this much since; `revise-tags` always runs it.
+const RETAG_AGAIN_GROWTH: f64 = 1.5;
+
 /// Builds the vocabulary from the whole archive, shows it, and asks whether
 /// to retag the pages from it.
 #[allow(clippy::too_many_arguments)]
@@ -540,9 +551,38 @@ async fn vocabulary_review(
     reviewer: &llm::OpenAiCompatible,
     embedder: &embed::OpenAiEmbedder,
     yes: bool,
+    on_demand: bool,
     say: &dyn Fn(&str),
     outcome: &mut report::ReviewReport,
 ) {
+    let done = match db.status_counts() {
+        Ok(counts) => counts.done,
+        Err(err) => {
+            outcome.error = Some(format!("{err:#}"));
+            return;
+        }
+    };
+    // Pages in the archive when a retag was last declined or undone.
+    let declined_at = match db.tag_decision_keys("retag:") {
+        Ok(keys) => keys
+            .iter()
+            .filter_map(|k| k.strip_prefix("retag:")?.parse::<usize>().ok())
+            .max(),
+        Err(err) => {
+            outcome.error = Some(format!("{err:#}"));
+            return;
+        }
+    };
+    if let Some(n) = declined_at
+        && !on_demand
+        && (done as f64) < n as f64 * RETAG_AGAIN_GROWTH
+    {
+        say(&format!(
+            "The retag declined at {n} pages is proposed again at {} pages; `tabkeeper revise-tags` runs it now.",
+            (n as f64 * RETAG_AGAIN_GROWTH).ceil()
+        ));
+        return;
+    }
     let r = &config.reconcile;
     let settings = vocab::Settings {
         cluster_similarity: r.cluster_similarity,
@@ -557,13 +597,7 @@ async fn vocabulary_review(
             return;
         }
     };
-    let before: std::collections::HashMap<i64, Vec<String>> = match db.analyzed_pages() {
-        Ok(pages) => pages.into_iter().map(|p| (p.id, p.tags)).collect(),
-        Err(err) => {
-            outcome.error = Some(format!("{err:#}"));
-            return;
-        }
-    };
+    let before = &retag.before;
     // Only pages whose tags change.
     let changed: Vec<db::PageTags> = retag
         .assignments
@@ -597,7 +631,7 @@ async fn vocabulary_review(
     let in_use: std::collections::HashSet<&str> = before.values().flatten().map(String::as_str).collect();
     say(&format!(
         "\nThe vocabulary built from all {} pages:",
-        retag.assignments.len()
+        before.len()
     ));
     for t in &retag.vocabulary {
         say(&format!("  {:>4}  {:<28} {}", t.pages, t.name, t.description));
@@ -622,13 +656,14 @@ async fn vocabulary_review(
         description: format!(
             "retag  {} of {} pages from these {} tags (now {} tags in use)",
             changed.len(),
-            retag.assignments.len(),
+            before.len(),
             retag.vocabulary.len(),
             in_use.len()
         ),
         change: db::TagChange::Retag { pages: changed },
-        decision_keys: Vec::new(),
+        decision_keys: vec![format!("retag:{done}")],
     };
+    let revisions = outcome.revisions.len();
     decide_and_apply(
         db,
         &[proposal],
@@ -638,6 +673,12 @@ async fn vocabulary_review(
         outcome,
         false,
     );
+    // An applied retag replaces any declined one.
+    if outcome.revisions.len() > revisions
+        && let Err(err) = db.forget_tag_decisions("retag:")
+    {
+        say(&format!("Warning: couldn't forget a declined retag: {err:#}"));
+    }
 }
 
 /// Records failed review requests. When they leave nothing to propose, the

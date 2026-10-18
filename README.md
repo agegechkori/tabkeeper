@@ -50,14 +50,14 @@ Each run ends with a report: how many tabs were done, unreachable or failed (by 
 At the end of each import, tabkeeper reviews the tags with the whole archive in view. While pages are processed, each gets a few tags of its own, starting with its broad topic (`bread`, `investing`, `japan`). The review then builds one vocabulary for all pages and retags every page from it:
 
 1. Pages are grouped by what they're about, and the model names each group with one tag that fits most of its pages. Tags already on several pages join the vocabulary too.
-2. A one-word tag used for unrelated things gets a qualified tag per meaning: `python` becomes `python-programming` and `python-snake`. The model confirms each such case, with thinking allowed for those few requests (`think_meanings`).
+2. A one-word tag used for unrelated things is split by meaning, once the model confirms it: the meaning with the most pages keeps the plain word (`python`), and each other meaning gets a qualified tag (`python-snake`).
 3. Each page gets 1 to 3 tags from the vocabulary tags nearest to it. Tags that end up on fewer than 3 pages (`min_support`) are dropped, so every tag gathers several pages.
 
 You see the vocabulary, each tag with its page count and description, and approve the retag in one step:
 
 ```
   15  technology            Technology companies, products and services
-   7  python-programming    Python, the programming language
+   7  python                python: Python, the programming language
    5  python-snake          Pythons, the snakes
    ...
    1. retag  118 of 141 pages from these 32 tags (now 211 tags in use)
@@ -73,7 +73,7 @@ Then it puts tags that aren't in the tag tree yet into it. The model first sorts
 
 Notes then carry the tag's whole path (`#science/chemistry/rust-corrosion`), which Obsidian shows as nested tags, `_tags.md` shows the tree, and `_index.md` lists pages by top-level category. Set `style = "flat"` in `[tags]` for plain tags (`#rust-corrosion`) and no tree; switching back and forth is just `tabkeeper render`. The top-level categories come from your pages; to choose them yourself, list them in a file and pass `--taxonomy taxonomy.toml` (or set `taxonomy` in `[tags]`): see [taxonomy.example.toml](taxonomy.example.toml). With `strict = true` only those are allowed.
 
-Words the model found to have one meaning, and placements you decline, are remembered and not asked about again. With `vocabulary = false` in `[reconcile]`, the review instead only merges duplicate tags and splits ambiguous ones, pair by pair. `--yes` applies everything without asking; without a terminal nothing is applied. `tabkeeper revise-tags` runs the review on its own, and `tabkeeper undo` reverts the last applied set of changes (run it twice to revert both the tree and the retag of one review); its changes then count as declined. The review can use its own model (`[reconcile]` in the config).
+Words the model found to have one meaning, and placements you decline, are remembered and not asked about again. Locked tags stay on their pages through a retag. A retag you decline or undo is proposed again at the end of an import only once the archive has 1.5 times the pages; `tabkeeper revise-tags` proposes it right away. With `vocabulary = false` in `[reconcile]`, the review instead only merges duplicate tags and splits ambiguous ones, pair by pair. `--yes` applies everything without asking; without a terminal nothing is applied. `tabkeeper revise-tags` runs the review on its own, and `tabkeeper undo` reverts the last applied set of changes (run it twice to revert both the tree and the retag of one review); its changes then count as declined. The review can use its own model (`[reconcile]` in the config).
 
 Before a big run, `--dry-run` shows what would be processed and estimates tokens, cost and time (from your last run, once there is one) without fetching or saving anything. `--max-tokens N` and `--max-cost DOLLARS` stop starting new pages once a limit would be reached; the rest stay pending for the next run. With a limit set, the tag review at the end of the run is skipped; run `tabkeeper revise-tags` when you're ready to spend on it. For cloud models, set `price_input_per_mtok` and `price_output_per_mtok` in `[llm]` to see costs.
 
