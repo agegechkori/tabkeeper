@@ -85,9 +85,13 @@ const CLUSTER_SYSTEM: &str = "You build the tag vocabulary of a personal archive
 
 Reply with a JSON object: {\"tag\": \"...\", \"description\": \"one line on what the tag covers\", \"fits\": [1, 2, 3]}.";
 
-const CLASSIFY_SYSTEM: &str = "You tag a page of a personal archive with tags from a fixed list. Choose the tags that describe what the page is about: 1 to {max}, the broadest fitting tag first. Use only names from the list, and choose none if none fits.
+const CLASSIFY_SYSTEM: &str = "You tag a page of a personal archive with tags from a list. Pick the tags that describe what the page is about.
 
-- A tag fits only in its own meaning, as its description says: a tag for the programming language never fits a page about the snake or the island, even if they share a word.
+- Pick 1 to {max} tags, the broadest first. Pick none only if no tag fits at all.
+- A broad tag fits a page about one of its kinds: vehicles fits a page about trucks; sport fits a page about tennis.
+- A tag fits only in its own meaning, as its description says: a tag for the programming language never fits a page about the snake.
+- Never pick two tags that mean the same thing.
+- Use each name exactly as listed, without its description.
 
 Reply with a JSON object: {\"tags\": [\"name\", ...]}.";
 
@@ -502,7 +506,9 @@ pub async fn retag<R: Reviewer, E: Embedder>(
         };
         let mut tags: Vec<String> = Vec::new();
         for raw in picked {
-            if let Some(name) = normalize_name(&raw)
+            // A small model sometimes copies the whole line, "name: description".
+            let raw = raw.split(':').next().unwrap_or_default();
+            if let Some(name) = normalize_name(raw)
                 && offered.contains(&name.as_str())
                 && !tags.contains(&name)
                 && tags.len() < settings.max_tags
@@ -584,7 +590,8 @@ mod tests {
                 {"group": 3, "tag": "python-snake", "description": "Pythons, the snakes."}]}),
             json!({"tags": ["coffee"]}),
             json!({"tags": ["coffee"]}),
-            json!({"tags": ["coffee", "nowhere"]}),
+            // The whole line copied, and a name not offered.
+            json!({"tags": ["coffee: the drink", "nowhere"]}),
             json!({"tags": ["python"]}),
             json!({"tags": ["python"]}),
             json!({"tags": ["python-snake"]}),
