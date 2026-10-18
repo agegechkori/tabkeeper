@@ -755,7 +755,7 @@ struct ResolvedTags {
 /// descriptions.
 fn resolve_tags(db: &Db, summary: &PageSummary, limits: &TagConfig) -> Result<ResolvedTags> {
     let descriptions: HashMap<String, &str> = summary
-        .new_tags
+        .tags
         .iter()
         .filter_map(|t| {
             let desc = t.description.trim();
@@ -769,7 +769,7 @@ fn resolve_tags(db: &Db, summary: &PageSummary, limits: &TagConfig) -> Result<Re
     let mut seen = HashSet::new();
     let mut resolved = Vec::new();
     let mut created = Vec::new();
-    for raw in &summary.tags {
+    for raw in summary.tags.iter().map(|t| &t.name) {
         if resolved.len() >= limits.max_per_page {
             break;
         }
@@ -786,7 +786,7 @@ fn resolve_tags(db: &Db, summary: &PageSummary, limits: &TagConfig) -> Result<Re
                 if created.len() >= limits.max_new_per_page && !resolved.is_empty() {
                     continue;
                 }
-                // Models often leave tags out of new_tags. Naming the page the tag
+                // Without a description from the model, naming the page the tag
                 // was first used for still tells later pages what it means, e.g.
                 // that `rust` was the programming language, not corrosion.
                 let description = match descriptions.get(&name) {
@@ -818,7 +818,7 @@ mod tests {
 
     use super::*;
     use crate::fetch::{FetchError, FetchErrorKind, FetchedPage};
-    use crate::llm::NewTag;
+    use crate::llm::PageTag;
 
     struct FakeFetcher;
 
@@ -974,12 +974,15 @@ mod tests {
             title: title.into(),
             summary: "A summary.".into(),
             language: "EN".into(),
-            tags: tags.iter().map(|t| t.to_string()).collect(),
-            new_tags: new
+            tags: tags
                 .iter()
-                .map(|(n, d)| NewTag {
-                    name: n.to_string(),
-                    description: d.to_string(),
+                .map(|t| PageTag {
+                    name: t.to_string(),
+                    description: new
+                        .iter()
+                        .find(|(n, _)| normalize_name(n) == normalize_name(t))
+                        .map(|(_, d)| d.to_string())
+                        .unwrap_or_default(),
                 })
                 .collect(),
         }
