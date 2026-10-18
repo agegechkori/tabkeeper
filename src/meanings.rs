@@ -32,7 +32,7 @@ Reply with a JSON object: {\"referent\": \"...\"}.";
 
 const COMPARE: &str = "A tag of a personal archive of web pages, \"{word}\", was found on several groups of pages. For each group you get a short phrase saying what the word refers to there.
 
-Give each group a tag for the thing its phrase refers to. Groups that refer to the same thing get the same tag; different things get different tags, each qualified by its meaning (bat-animal, bat-baseball). Groups are the same thing when one is a kind, part or aspect of the other, or both are kinds of what the word names: chairs, tables and beds are all furniture; cars, bikes and ships are all vehicles; painting and sculpture are both art. Groups are different things only when nothing connects them except the word: bat the flying mammal and bat the baseball club; seal the animal and seal the stamp on a document; mouse the animal and mouse the computer device.
+Give each group a tag for the thing its phrase refers to. Groups that refer to the same thing get the same tag; different things get different tags. Each tag is the word, a hyphen and its meaning: bat-animal, bat-baseball. Groups are the same thing when one is a kind, part or aspect of the other, or both are kinds of what the word names: chairs, tables and beds are all furniture; cars, bikes and ships are all vehicles; painting and sculpture are both art. Groups are different things only when nothing connects them except the word: bat the flying mammal and bat the baseball club; seal the animal and seal the stamp on a document; mouse the animal and mouse the computer device.
 
 Reply with a JSON object with one entry per group, in order: {\"groups\": [{\"group\": 1, \"tag\": \"lowercase-kebab-case-name\", \"description\": \"one line\"}]}.";
 
@@ -146,11 +146,10 @@ pub async fn check<R: Reviewer>(
             serde_json::from_value(reply).map_err(|err| format!("the referent reply was unusable: {err}"))?;
         referents.push(referent.referent.trim().to_string());
     }
-    let user: String = referents
-        .iter()
-        .enumerate()
-        .map(|(i, r)| format!("{}. {r}\n", i + 1))
-        .collect();
+    let mut user = format!("Word: {word}\n");
+    for (i, r) in referents.iter().enumerate() {
+        user.push_str(&format!("{}. {r}\n", i + 1));
+    }
     let compare_schema = json!({
         "type": "object", "additionalProperties": false, "required": ["groups"],
         "properties": {"groups": {"type": "array", "items": {"type": "object", "additionalProperties": false,

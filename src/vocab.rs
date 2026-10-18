@@ -78,7 +78,7 @@ pub struct Retag {
 
 const CLUSTER_SYSTEM: &str = "You build the tag vocabulary of a personal archive of web pages. The numbered pages were grouped because they are about similar things. Give the one tag that best describes what most of them have in common: broad enough to fit several of them, specific enough to find them by, like bread, investing, japan, classical-music or rust-programming.
 
-- Use lowercase kebab-case English. If the word has several common meanings, qualify it: python-snake, rust-corrosion, java-island.
+- Use lowercase kebab-case English. If the word has several common meanings, the most common one keeps the plain word (python, rust, java) and only the others are qualified: python-snake, rust-corrosion, java-island.
 - If one of the existing tags fits, use its exact name.
 - fits lists the numbers of the pages the tag describes.
 - If the pages have nothing useful in common, give an empty tag.
@@ -184,6 +184,47 @@ pub fn agglomerate(vectors: &[Vec<f32>], threshold: f32) -> Vec<Vec<usize>> {
     let mut clusters: Vec<Vec<usize>> = members.into_iter().flatten().collect();
     clusters.sort_by(|a, b| b.len().cmp(&a.len()).then(a.cmp(b)));
     clusters
+}
+
+/// The tag for a meaning of `word` other than its most common one: always
+/// `word-…`. A vocabulary tag of that form already made for these pages (a
+/// cluster's name) is reused, so one meaning doesn't get two names. Otherwise
+/// the model's name is used, prefixed with the word if it lacks it; if the
+/// model gave the plain word, the qualifier comes from the description.
+fn qualified_name(
+    word: &str,
+    name: &str,
+    description: &str,
+    pages: &[usize],
+    members: &BTreeMap<String, Vec<usize>>,
+) -> Option<String> {
+    let prefix = format!("{word}-");
+    let existing = members
+        .iter()
+        .filter(|(tag, _)| tag.starts_with(&prefix))
+        .map(|(tag, list)| (pages.iter().filter(|p| list.contains(p)).count(), tag))
+        .filter(|(shared, _)| *shared > 0)
+        .max_by_key(|(shared, _)| *shared);
+    if let Some((_, tag)) = existing {
+        return Some(tag.clone());
+    }
+    if name.starts_with(&prefix) {
+        return Some(name.to_string());
+    }
+    if !name.is_empty() && name != word {
+        return normalize_name(&format!("{prefix}{name}"));
+    }
+    const SKIP: [&str; 9] = ["the", "a", "an", "of", "and", "in", "for", "its", "to"];
+    let qualifier: Vec<String> = description
+        .split(|c: char| !c.is_alphanumeric())
+        .map(str::to_lowercase)
+        .filter(|w| !w.is_empty() && !SKIP.contains(&w.as_str()) && !w.starts_with(word))
+        .take(2)
+        .collect();
+    if qualifier.is_empty() {
+        return None;
+    }
+    normalize_name(&format!("{prefix}{}", qualifier.join("-")))
 }
 
 fn page_line(page: &AnalyzedPage) -> String {
@@ -425,24 +466,38 @@ pub async fn retag<R: Reviewer, E: Embedder>(
             .max_by_key(|&t| pages_of(&things[t]))
             .unwrap_or(0);
         let mut names = vec![word.clone()];
+        for (t, (name, description, member_groups)) in things.iter().enumerate() {
+            if t == main {
+                continue;
+            }
+            let thing_pages: Vec<usize> = member_groups
+                .iter()
+                .flat_map(|&g| groups[g].iter().copied())
+                .collect();
+            let Some(name) = qualified_name(&word, name, description, &thing_pages, &members) else {
+                continue;
+            };
+            if names.contains(&name) {
+                continue;
+            }
+            vocabulary.entry(name.clone()).or_insert(VocabTag {
+                name: name.clone(),
+                description: description.clone(),
+                source: Source::Topic,
+                pages: 0,
+            });
+            names.push(name);
+        }
+        if names.len() < 2 {
+            // No other meaning could be named: the word stays as it was.
+            continue;
+        }
         // The word now names that meaning: its description says so, so a page
         // about another meaning isn't given it.
         if let Some(tag) = vocabulary.get_mut(&word)
             && !things[main].1.is_empty()
         {
             tag.description = format!("{word}: {}", things[main].1);
-        }
-        for (t, (name, description, _)) in things.into_iter().enumerate() {
-            if t == main || name == word || names.contains(&name) {
-                continue;
-            }
-            vocabulary.entry(name.clone()).or_insert(VocabTag {
-                name: name.clone(),
-                description,
-                source: Source::Topic,
-                pages: 0,
-            });
-            names.push(name);
         }
         out.ambiguous.push((word, names));
     }
@@ -724,6 +779,37 @@ mod tests {
                 "threshold {threshold}"
             );
         }
+    }
+
+    #[test]
+    fn other_meanings_get_the_word_as_prefix() {
+        let members: BTreeMap<String, Vec<usize>> = [
+            ("java-indonesia".to_string(), vec![7, 8]),
+            ("java".to_string(), vec![1, 7]),
+        ]
+        .into();
+        let name = |word, name, description, pages: &[usize]| {
+            qualified_name(word, name, description, pages, &members)
+        };
+        // A cluster's name for these pages is reused.
+        assert_eq!(
+            name("java", "java-island", "the island", &[7]).as_deref(),
+            Some("java-indonesia")
+        );
+        assert_eq!(
+            name("python", "python-snake", "the snakes", &[3]).as_deref(),
+            Some("python-snake")
+        );
+        assert_eq!(
+            name("python", "snake", "the snakes", &[3]).as_deref(),
+            Some("python-snake")
+        );
+        // The plain word: the qualifier comes from the description.
+        assert_eq!(
+            name("rust", "rust", "the iron oxide corrosion process", &[3]).as_deref(),
+            Some("rust-iron-oxide")
+        );
+        assert_eq!(name("rust", "", "the rust", &[3]), None);
     }
 
     #[test]
