@@ -28,6 +28,12 @@ With a thinking model such as `qwen3`, turn thinking off in the config file (see
 reasoning_effort = "none"
 ```
 
+tabkeeper sends 4 pages at a time (`--concurrency`), but Ollama answers one request at a time unless it is started with more slots. Starting it with 4 slots made imports about 1.3 times faster on an M1 Pro; more slots than that didn't help. 8,192 tokens per slot is plenty for tabkeeper's prompts:
+
+```sh
+OLLAMA_NUM_PARALLEL=4 OLLAMA_CONTEXT_LENGTH=8192 ollama serve
+```
+
 This writes to `tabkeeper-out/` (change it with `--out`):
 
 - `notes/*.md`: one note per page, with a title, the URL, a short summary and 3–5 tags such as `#technology/programming-languages/rust #technology/memory-safety`. The title is the page's own title (as in the browser tab) followed by the model's in parentheses, e.g. `Saffron - Wikipedia (Saffron: Spice from Saffron Crocus)`; `[notes] title` in the config picks one or the other instead. Pages without a summary still get a short stub note saying why, so no tab is lost: `#status/unreachable` when the page can't be loaded (404, dead domain, timeout, blocked), `#status/failed` when it loads but can't be summarized (a PDF, or the model's reply was unusable).
