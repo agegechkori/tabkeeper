@@ -222,7 +222,10 @@ async fn run(cli: Cli) -> Result<()> {
                 ));
             }
 
-            let fetcher = fetch::HttpFetcher::new(&config.fetch)?;
+            let fetcher = fetch::CachedFetcher::new(
+                fetch::HttpFetcher::new(&config.fetch)?,
+                std::env::var_os(fetch::PAGE_CACHE_VAR).map(Into::into),
+            );
             let llm = llm::OpenAiCompatible::new(&config.llm)?;
             say(&format!(
                 "Using model {} at {}.",

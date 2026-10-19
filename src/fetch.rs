@@ -143,6 +143,61 @@ impl Fetcher for HttpFetcher {
     }
 }
 
+/// Environment variable naming a directory that keeps every fetched page, so
+/// later imports read it from there instead of the web, for experiments.
+pub const PAGE_CACHE_VAR: &str = "TABKEEPER_PAGE_CACHE";
+
+/// Serves pages from a cache directory, if one is given, fetching and keeping
+/// the ones it doesn't have yet. Failed fetches aren't kept.
+pub struct CachedFetcher<F> {
+    inner: F,
+    dir: Option<std::path::PathBuf>,
+}
+
+impl<F: Fetcher> CachedFetcher<F> {
+    pub fn new(inner: F, dir: Option<std::path::PathBuf>) -> Self {
+        Self { inner, dir }
+    }
+
+    fn path(&self, url: &str) -> Option<std::path::PathBuf> {
+        // FNV-1a: the same file name for a URL on every build.
+        let hash = url.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+            (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
+        });
+        Some(self.dir.as_ref()?.join(format!("{hash:016x}.json")))
+    }
+
+    fn read(&self, url: &str) -> Option<FetchedPage> {
+        let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(self.path(url)?).ok()?).ok()?;
+        (saved["url"] == url).then(|| FetchedPage {
+            final_url: saved["final_url"].as_str().unwrap_or(url).to_string(),
+            html: saved["html"].as_str().unwrap_or_default().to_string(),
+        })
+    }
+
+    fn write(&self, url: &str, page: &FetchedPage) {
+        let (Some(dir), Some(path)) = (&self.dir, self.path(url)) else {
+            return;
+        };
+        let saved = serde_json::json!({"url": url, "final_url": page.final_url, "html": page.html});
+        let written = std::fs::create_dir_all(dir).and_then(|()| std::fs::write(path, saved.to_string()));
+        if let Err(err) = written {
+            eprintln!("Warning: couldn't write to the {PAGE_CACHE_VAR} directory: {err}");
+        }
+    }
+}
+
+impl<F: Fetcher> Fetcher for CachedFetcher<F> {
+    async fn fetch(&self, url: &str) -> Result<FetchedPage, FetchError> {
+        if let Some(page) = self.read(url) {
+            return Ok(page);
+        }
+        let page = self.inner.fetch(url).await?;
+        self.write(url, &page);
+        Ok(page)
+    }
+}
+
 /// The charset named in a Content-Type value, e.g. `text/html; charset=utf-8`.
 fn header_charset(content_type: &str) -> Option<&str> {
     let (_, rest) = content_type.split_once("charset=")?;
@@ -350,6 +405,53 @@ mod tests {
             Some("iso-8859-1")
         );
         assert_eq!(header_charset("text/html"), None);
+    }
+
+    /// Fails every URL after the first fetch of it, to show it isn't asked twice.
+    struct Once(std::cell::RefCell<Vec<String>>);
+
+    impl Fetcher for Once {
+        async fn fetch(&self, url: &str) -> Result<FetchedPage, FetchError> {
+            if self.0.borrow().iter().any(|u| u == url) || url.contains("down") {
+                return Err(FetchError {
+                    kind: FetchErrorKind::Timeout,
+                    message: "timed out".into(),
+                });
+            }
+            self.0.borrow_mut().push(url.to_string());
+            Ok(FetchedPage {
+                final_url: format!("{url}/final"),
+                html: format!("<title>{url}</title>"),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn cache_serves_a_page_fetched_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let cached = CachedFetcher::new(Once(Default::default()), Some(dir.path().join("pages")));
+        for _ in 0..2 {
+            let page = cached.fetch("https://a.example").await.unwrap();
+            assert_eq!(page.final_url, "https://a.example/final");
+            assert_eq!(page.html, "<title>https://a.example</title>");
+        }
+        assert!(
+            cached.fetch("https://b.example").await.is_ok(),
+            "another URL is its own entry"
+        );
+        assert!(cached.fetch("https://down.example").await.is_err());
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("pages")).unwrap().count(),
+            2,
+            "failures aren't kept"
+        );
+
+        let uncached = CachedFetcher::new(Once(Default::default()), None);
+        assert!(uncached.fetch("https://a.example").await.is_ok());
+        assert!(
+            uncached.fetch("https://a.example").await.is_err(),
+            "no directory, no cache"
+        );
     }
 
     #[test]

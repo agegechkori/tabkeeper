@@ -16,7 +16,7 @@ model = "llama3.1:8b"
 # preferred), "json_object" (any JSON) or "none" (prompt instructions only).
 structured_output = "json_schema"
 # Page text is cut to this many characters before it is sent to the model.
-max_input_chars = 12000
+max_input_chars = 4000
 temperature = 0.2
 # Local models can be slow on long pages.
 timeout_secs = 300

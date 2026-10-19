@@ -179,7 +179,7 @@ Model
   Speed       2.1 s per page (4 at a time) · 140 output tokens/s
   Time        a summary request took 7.9 s, including any wait in the server's queue · a fetch 0.4 s
   Cost        $0.00 (local)
-  Page limits 412 pages cut to fit max_input_chars (12,000)
+  Page limits 412 pages cut to fit max_input_chars (4,000)
               5 rejected as too long for the model
               9 failed after two invalid replies
   URL-only    0 pages (the model can't fetch pages itself)
@@ -218,7 +218,7 @@ Tokens and cost are shown per stage (summaries, embeddings, tag review) and in t
 **Warnings**, printed only when a problem is detected:
 - **Thinking left on:** "Average 2,100 output tokens per page; the model may be thinking. On Ollama, set `reasoning_effort = "none"`."
 - **Model not fully on the GPU:** "Only 60% of the model is on the GPU; a smaller model or a shorter context would be much faster."
-- **Pages being cut:** "30% of pages were cut to fit `max_input_chars`; consider raising it if your model's context allows."
+- **Pages being cut** (only with `max_input_chars` set below its default of 4,000): "30% of pages were cut to fit `max_input_chars`; consider raising it if your model's context allows."
 - **Model context too small:** "Prompts average 7,900 tokens but the model's context is 8k; some pages may be cut off by the server without an error."
 - **Many retries:** "12% of replies were invalid JSON; try `structured_output = "json_schema"` or a larger model."
 

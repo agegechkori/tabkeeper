@@ -220,6 +220,10 @@ impl LlmConfig {
     }
 }
 
+/// Page text the model reads. Past this, more text slows the model down
+/// (it spends most of a page reading the prompt) without better tags.
+pub const DEFAULT_MAX_INPUT_CHARS: usize = 4_000;
+
 impl Default for LlmConfig {
     fn default() -> Self {
         Self {
@@ -228,7 +232,7 @@ impl Default for LlmConfig {
             model: "llama3.1:8b".into(),
             api_key_env: None,
             structured_output: StructuredOutput::default(),
-            max_input_chars: 12_000,
+            max_input_chars: DEFAULT_MAX_INPUT_CHARS,
             temperature: 0.2,
             timeout_secs: 300,
             extra_body: serde_json::Map::new(),

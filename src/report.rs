@@ -537,7 +537,12 @@ pub fn warnings(report: &Report) -> Vec<String> {
         }
     }
     let done = report.run.done;
-    if done >= 10 && report.model.pages_cut * 10 >= done * 3 {
+    // Pages longer than the default are cut by design; only a lower limit
+    // can cut away too much.
+    if done >= 10
+        && report.model.max_input_chars < crate::config::DEFAULT_MAX_INPUT_CHARS
+        && report.model.pages_cut * 10 >= done * 3
+    {
         out.push(format!(
             "{}% of pages were cut to fit llm.max_input_chars ({}); consider raising it if your model's context allows.",
             report.model.pages_cut * 100 / done,
@@ -1107,6 +1112,13 @@ mod tests {
             "3,000 input tokens fit in 4,096: {joined}"
         );
         assert_eq!(warnings.len(), 3, "{joined}");
+
+        let mut report = sample();
+        report.model.max_input_chars = crate::config::DEFAULT_MAX_INPUT_CHARS;
+        assert!(
+            !super::warnings(&report).join("\n").contains("were cut"),
+            "pages cut at the default limit are no problem"
+        );
     }
 
     #[test]
