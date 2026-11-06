@@ -39,17 +39,14 @@ price_output_per_mtok = 0.0
 # reasoning_effort = "none"
 
 [embeddings]
-# Embeddings pick which existing tags the model sees for each page: the most
-# similar to the page. Without them tabkeeper shows the most used tags, which
-# works less well once there are hundreds of tags.
+# The tag review builds the tag vocabulary from embeddings of tags and pages;
+# without them it leaves the tags as they are.
 # On Ollama: ollama pull nomic-embed-text
 enabled = true
 model = "nomic-embed-text"
 # Server and API key default to the [llm] ones.
 # base_url = "http://localhost:11434/v1"
 # api_key_env = "OPENAI_API_KEY"
-# How much of each page's text is embedded to pick its tags.
-page_chars = 2000
 timeout_secs = 60
 # US dollars per million tokens; 0 for local models.
 price_per_mtok = 0.0
@@ -64,8 +61,6 @@ user_agent = "Mozilla/5.0 (compatible; tabkeeper/0.1; +https://github.com/agegec
 # Maximum tags per page, and how many of them may be new tags.
 max_per_page = 3
 max_new_per_page = 2
-# How many existing tags are shown to the model for each page.
-vocabulary_limit = 50
 # "hierarchical": notes get tags as paths in a tag tree, like
 # #technology/programming-languages/rust. The tag review at the end of a run
 # puts new tags in the tree. "flat": tags only, like #rust, and no tree is

@@ -9,13 +9,13 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::config::{Config, TagConfig};
 use crate::db::{Db, EmbeddingKind, PageResult, PendingPage, page_embedding_text, tag_embedding_text};
-use crate::embed::{BATCH_SIZE, Embedder, TagIndex};
-use crate::extract::{extract, html_title, truncate_chars};
+use crate::embed::{BATCH_SIZE, Embedder};
+use crate::extract::{extract, html_title};
 use crate::fetch::Fetcher;
 use crate::filter::Filter;
 use crate::llm::{LangMode, Llm, PageRejected, PageSummary, SummaryRequest};
 use crate::progress::Progress;
-use crate::tags::{CountedTag, count_tree, format_vocabulary, is_offerable, most_used, normalize_name};
+use crate::tags::normalize_name;
 
 /// Reserved tags for the stub notes of pages without a summary.
 pub const UNREACHABLE_TAG: &str = "status/unreachable";
@@ -89,24 +89,22 @@ enum Outcome {
     FailedAndStop(&'static str, String, anyhow::Error),
 }
 
-/// Embeddings for a run: the client plus every tag's vector in memory.
+/// Embeddings for a run: vectors of new tags and pages, for the tag review.
 pub struct Embeddings<'a, E: Embedder> {
     embedder: &'a E,
-    index: TagIndex,
-    page_chars: usize,
     /// Embedding requests that failed during the run. The next run fills in
     /// any vectors that are still missing.
     pub errors: usize,
     /// (tag id, text) of new tags whose vectors couldn't be stored yet. They
-    /// are retried with the next page, so later pages can still be shown them.
-    unindexed_tags: Vec<(i64, String)>,
+    /// are retried with the next page.
+    unstored_tags: Vec<(i64, String)>,
 }
 
 impl<'a, E: Embedder> Embeddings<'a, E> {
     /// Embeds the tags and pages that have no vector for this model yet (for
     /// example after switching models, or after an interrupted run) and
-    /// loads all tag vectors. Fails if the embeddings server can't be used.
-    pub async fn prepare(db: &Db, embedder: &'a E, page_chars: usize) -> Result<Self> {
+    /// Fails if the embeddings server can't be used.
+    pub async fn prepare(db: &Db, embedder: &'a E) -> Result<Self> {
         let model = embedder.model();
         // Checks the server and model even when there is nothing to backfill.
         embedder.embed(&["tabkeeper".to_string()]).await?;
@@ -122,13 +120,10 @@ impl<'a, E: Embedder> Embeddings<'a, E> {
                 }
             }
         }
-        let index = TagIndex::new(db.embeddings(EmbeddingKind::Tag, model)?);
         Ok(Self {
             embedder,
-            index,
-            page_chars,
             errors: 0,
-            unindexed_tags: Vec::new(),
+            unstored_tags: Vec::new(),
         })
     }
 
@@ -488,14 +483,12 @@ impl<F: Fetcher, L: Llm, E: Embedder> Run<'_, '_, F, L, E> {
             .filter(|info| info.is_reliable())
             .map(|info| info.lang().eng_name());
 
-        let vocabulary = self.vocabulary(title, &extracted.text).await?;
         let request = SummaryRequest {
             url: &page.url,
             title,
             text: &extracted.text,
             lang: self.lang,
             detected_lang,
-            vocabulary: &vocabulary,
             tags: &self.config.tags,
         };
         self.model_pages.set(self.model_pages.get() + 1);
@@ -616,59 +609,6 @@ impl<F: Fetcher, L: Llm, E: Embedder> Run<'_, '_, F, L, E> {
         Ok(())
     }
 
-    /// The existing tags to show the model: the most similar to the page, or
-    /// the most used ones without embeddings.
-    async fn vocabulary(&self, title: &str, text: &str) -> Result<String> {
-        // Tags whose vectors failed on an earlier page go along with this
-        // request, so this page can already be shown them.
-        let request = {
-            let mut embeddings = self.embeddings.borrow_mut();
-            match embeddings.as_deref_mut() {
-                Some(e) if e.index.len() > 0 || !e.unindexed_tags.is_empty() => {
-                    let retried = std::mem::take(&mut e.unindexed_tags);
-                    let mut texts: Vec<String> = retried.iter().map(|(_, text)| text.clone()).collect();
-                    texts.push(format!("{title}\n{}", truncate_chars(text, e.page_chars)));
-                    Some((e.embedder, retried, texts))
-                }
-                _ => None,
-            }
-        };
-        let mut page_vector = None;
-        if let Some((embedder, retried, texts)) = request {
-            let result = embedder.embed(&texts).await;
-            let mut embeddings = self.embeddings.borrow_mut();
-            let e = embeddings.as_deref_mut().expect("embeddings were checked above");
-            match result {
-                Ok(mut vectors) => {
-                    page_vector = vectors.pop();
-                    let db = self.db.borrow();
-                    for ((id, _), vector) in retried.into_iter().zip(vectors) {
-                        db.put_embedding(EmbeddingKind::Tag, id, embedder.model(), &vector)?;
-                        e.index.insert(id, vector);
-                    }
-                }
-                Err(err) => {
-                    e.unindexed_tags.extend(retried);
-                    e.note_error(
-                        self.progress,
-                        "embedding a page",
-                        "that page is shown the most used tags instead of the most relevant ones",
-                        &err,
-                    );
-                }
-            }
-        }
-
-        let db = self.db.borrow();
-        let counted = count_tree(&db.tags()?, &db.tag_links()?);
-        let limit = self.config.tags.vocabulary_limit;
-        let shown = match (&page_vector, self.embeddings.borrow().as_deref()) {
-            (Some(vector), Some(e)) => relevant_tags(&counted, &e.index, vector, limit),
-            _ => most_used(&counted, limit),
-        };
-        Ok(format_vocabulary(&shown))
-    }
-
     /// Stores the page's vector (for the end-of-run tag reconciliation) and
     /// its new tags' vectors, so the next pages can be shown them. The page is
     /// already saved, so a failure only costs vectors: the tags are retried
@@ -685,7 +625,7 @@ impl<F: Fetcher, L: Llm, E: Embedder> Run<'_, '_, F, L, E> {
             let Some(e) = embeddings.as_deref_mut() else {
                 return Ok(());
             };
-            let mut tags = std::mem::take(&mut e.unindexed_tags);
+            let mut tags = std::mem::take(&mut e.unstored_tags);
             tags.extend(created);
             (e.embedder, tags)
         };
@@ -698,7 +638,7 @@ impl<F: Fetcher, L: Llm, E: Embedder> Run<'_, '_, F, L, E> {
         let mut vectors = match result {
             Ok(vectors) => vectors,
             Err(err) => {
-                e.unindexed_tags.extend(tags);
+                e.unstored_tags.extend(tags);
                 e.note_error(
                     self.progress,
                     "storing vectors for new tags",
@@ -718,29 +658,9 @@ impl<F: Fetcher, L: Llm, E: Embedder> Run<'_, '_, F, L, E> {
         )?;
         for ((id, _), vector) in tags.into_iter().zip(vectors) {
             db.put_embedding(EmbeddingKind::Tag, id, model, &vector)?;
-            e.index.insert(id, vector);
         }
         Ok(())
     }
-}
-
-/// The `limit` tags most similar to the page, among tags in use.
-fn relevant_tags<'c>(
-    counted: &'c [CountedTag],
-    index: &TagIndex,
-    page: &[f32],
-    limit: usize,
-) -> Vec<&'c CountedTag> {
-    let by_id: HashMap<i64, &CountedTag> = counted
-        .iter()
-        .filter(|t| is_offerable(t))
-        .map(|t| (t.id, t))
-        .collect();
-    index
-        .nearest(page, limit, |id| by_id.contains_key(&id))
-        .iter()
-        .map(|id| by_id[id])
-        .collect()
 }
 
 struct ResolvedTags {
@@ -856,24 +776,24 @@ mod tests {
         }
     }
 
-    /// Returns queued replies in order and records the vocabulary it was shown.
+    /// Returns queued replies in order and counts the requests.
     struct FakeLlm {
         replies: RefCell<Vec<Result<PageSummary, &'static str>>>,
-        seen_vocab: RefCell<Vec<String>>,
+        requests: std::cell::Cell<u64>,
     }
 
     impl FakeLlm {
         fn new(replies: Vec<Result<PageSummary, &'static str>>) -> Self {
             Self {
                 replies: RefCell::new(replies),
-                seen_vocab: RefCell::default(),
+                requests: Default::default(),
             }
         }
     }
 
     impl Llm for FakeLlm {
-        async fn summarize(&self, request: &SummaryRequest<'_>) -> Result<PageSummary> {
-            self.seen_vocab.borrow_mut().push(request.vocabulary.to_string());
+        async fn summarize(&self, _request: &SummaryRequest<'_>) -> Result<PageSummary> {
+            self.requests.set(self.requests.get() + 1);
             match self.replies.borrow_mut().remove(0) {
                 Ok(s) => Ok(s),
                 Err("reject") => Err(PageRejected::rejected("too long".into()).into()),
@@ -883,7 +803,7 @@ mod tests {
 
         /// 80 input and 20 output tokens per request.
         fn usage(&self) -> crate::usage::StageUsage {
-            let requests = self.seen_vocab.borrow().len() as u64;
+            let requests = self.requests.get();
             crate::usage::StageUsage {
                 requests,
                 input_tokens: 80 * requests,
@@ -928,15 +848,13 @@ mod tests {
     /// finished page's vectors ("store"). Store requests number from 0;
     /// those in `failing_stores` fail.
     struct FlakyEmbedder {
-        fail_query: bool,
         failing_stores: std::ops::Range<usize>,
         stores: std::cell::Cell<usize>,
     }
 
     impl FlakyEmbedder {
-        fn new(fail_query: bool, failing_stores: std::ops::Range<usize>) -> Self {
+        fn new(failing_stores: std::ops::Range<usize>) -> Self {
             Self {
-                fail_query,
                 failing_stores,
                 stores: Default::default(),
             }
@@ -949,14 +867,9 @@ mod tests {
         }
 
         async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-            // The fake fetcher's pages are titled "Page <url>"; a query ends
-            // with the page, after any tags being retried.
-            let is_query = texts.last().is_some_and(|t| t.starts_with("Page "));
             let is_probe = texts.len() == 1 && texts[0] == "tabkeeper";
             let fails = if is_probe {
                 false
-            } else if is_query {
-                self.fail_query
             } else {
                 let n = self.stores.get();
                 self.stores.set(n + 1);
@@ -1017,7 +930,7 @@ mod tests {
     }
 
     async fn run_with_embeddings(db: &mut Db, llm: &FakeLlm, config: &Config) -> Result<Stats> {
-        let mut embeddings = Embeddings::prepare(db, &FakeEmbedder, 2000).await.unwrap();
+        let mut embeddings = Embeddings::prepare(db, &FakeEmbedder).await.unwrap();
         process_pending(
             db,
             &FakeFetcher,
@@ -1050,7 +963,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn processes_pages_and_grows_vocabulary() {
+    async fn processes_pages() {
         let mut db = db_with(&["https://a.com/", "https://broken.com/", "https://b.com/"]);
         let llm = FakeLlm::new(vec![
             Ok(summary(
@@ -1076,17 +989,8 @@ mod tests {
             }
         );
 
-        // The second page was shown the tags the first page created.
-        let seen = llm.seen_vocab.borrow();
-        assert_eq!(seen[0], "");
-        assert_eq!(
-            seen[1],
-            "memory-safety (1) - first used for: Rust intro\nrust-programming (1) - The Rust language"
-        );
-
         // The model's status/ tag was dropped and paths became flat names; the
-        // only status tag is the one tabkeeper put on the unreachable page,
-        // which the model is never offered.
+        // only status tag is the one tabkeeper put on the unreachable page.
         assert_eq!(
             page_tag_names(&db),
             [
@@ -1096,7 +1000,6 @@ mod tests {
                 "status/unreachable"
             ]
         );
-        assert!(!seen[1].contains("status/"));
         let pages = db.note_pages().unwrap();
         assert_eq!(pages[0].lang.as_deref(), Some("en"));
         assert_eq!(db.status_counts().unwrap().unreachable, 1);
@@ -1417,7 +1320,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn embeddings_pick_the_most_relevant_tags() {
+    async fn every_tag_and_page_gets_a_vector() {
         let mut db = db_with(&[
             "https://a.com/rust",
             "https://b.com/bread",
@@ -1439,64 +1342,14 @@ mod tests {
             )),
             Ok(summary("Bread again", &["sourdough"], &[])),
         ]);
-        let config = Config {
-            tags: TagConfig {
-                vocabulary_limit: 1,
-                ..TagConfig::default()
-            },
-            ..Config::default()
-        };
-        run_with_embeddings(&mut db, &llm, &config).await.unwrap();
-
-        // With room for one tag, the bread page was shown sourdough, not a rust tag.
-        let seen = llm.seen_vocab.borrow();
-        assert!(seen[2].starts_with("sourdough (1)"), "{}", seen[2]);
+        run_with_embeddings(&mut db, &llm, &Config::default())
+            .await
+            .unwrap();
 
         // Every tag and every page has a vector now.
         assert!(db.tags_missing_embedding("fake").unwrap().is_empty());
         assert!(db.pages_missing_embedding("fake").unwrap().is_empty());
         assert_eq!(db.embeddings(EmbeddingKind::Page, "fake").unwrap().len(), 3);
-    }
-
-    #[tokio::test]
-    async fn failed_page_embedding_falls_back_to_most_used_tags() {
-        let mut db = db_with(&["https://a.com/", "https://b.com/"]);
-        let llm = FakeLlm::new(vec![
-            Ok(summary("First", &["alpha"], &[])),
-            Ok(summary("Second", &["beta"], &[])),
-        ]);
-        let embedder = FlakyEmbedder::new(true, 0..0);
-        let mut embeddings = Embeddings::prepare(&db, &embedder, 2000).await.unwrap();
-        let stats = process_pending(
-            &mut db,
-            &FakeFetcher,
-            &llm,
-            Some(&mut embeddings),
-            &RunOptions {
-                config: &Config::default(),
-                lang: &LangMode::English,
-                filter: &Filter::default(),
-                limit: None,
-                budget: Budget::default(),
-                progress_to_stderr: false,
-                spent_elsewhere: (0, 0.0),
-            },
-        )
-        .await
-        .unwrap()
-        .into_result()
-        .unwrap();
-        assert_eq!(
-            stats,
-            Stats {
-                done: 2,
-                model_pages: 2,
-                ..Stats::default()
-            }
-        );
-        assert_eq!(embeddings.errors, 1);
-        // The second page couldn't be embedded, so it was shown the most used tags.
-        assert!(llm.seen_vocab.borrow()[1].starts_with("alpha (1)"));
     }
 
     #[tokio::test]
@@ -1506,8 +1359,8 @@ mod tests {
             Ok(summary("First", &["alpha"], &[])),
             Ok(summary("Second", &["beta"], &[])),
         ]);
-        let embedder = FlakyEmbedder::new(false, 0..usize::MAX);
-        let mut embeddings = Embeddings::prepare(&db, &embedder, 2000).await.unwrap();
+        let embedder = FlakyEmbedder::new(0..usize::MAX);
+        let mut embeddings = Embeddings::prepare(&db, &embedder).await.unwrap();
         let stats = process_pending(
             &mut db,
             &FakeFetcher,
@@ -1536,24 +1389,26 @@ mod tests {
             }
         );
         assert_eq!(embeddings.errors, 2);
-        // alpha was retried with the second page's query, which worked; beta's
-        // store failed on the last page, and so did both page vectors.
+        // Every store failed: both tags and both page vectors are missing.
         let missing: Vec<String> = db
             .tags_missing_embedding("fake")
             .unwrap()
             .into_iter()
             .map(|(_, text)| text)
             .collect();
-        assert_eq!(missing, ["beta: first used for: Second"]);
+        assert_eq!(
+            missing,
+            ["alpha: first used for: First", "beta: first used for: Second"]
+        );
         assert_eq!(db.pages_missing_embedding("fake").unwrap().len(), 2);
         // The next run fills in what's missing.
-        Embeddings::prepare(&db, &FakeEmbedder, 2000).await.unwrap();
+        Embeddings::prepare(&db, &FakeEmbedder).await.unwrap();
         assert!(db.tags_missing_embedding("fake").unwrap().is_empty());
         assert!(db.pages_missing_embedding("fake").unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn tags_from_a_failed_store_are_shown_to_the_next_page() {
+    async fn tags_from_a_failed_store_are_stored_with_the_next_page() {
         let mut db = db_with(&[
             "https://a.com/bread",
             "https://b.com/rust",
@@ -1576,15 +1431,9 @@ mod tests {
             Ok(summary("Rust again", &["rust-programming"], &[])),
         ]);
         // The bread page's vectors are stored; the first rust page's store fails.
-        let embedder = FlakyEmbedder::new(false, 1..2);
-        let mut embeddings = Embeddings::prepare(&db, &embedder, 2000).await.unwrap();
-        let config = Config {
-            tags: TagConfig {
-                vocabulary_limit: 1,
-                ..TagConfig::default()
-            },
-            ..Config::default()
-        };
+        let embedder = FlakyEmbedder::new(1..2);
+        let mut embeddings = Embeddings::prepare(&db, &embedder).await.unwrap();
+        let config = Config::default();
         process_pending(
             &mut db,
             &FakeFetcher,
@@ -1605,10 +1454,8 @@ mod tests {
         .into_result()
         .unwrap();
         assert_eq!(embeddings.errors, 1);
-        // With room for one tag, the second rust page was shown rust-programming,
-        // though its vector failed to store on the page that created it.
-        let seen = llm.seen_vocab.borrow();
-        assert!(seen[2].starts_with("rust-programming (1)"), "{}", seen[2]);
+        // rust-programming's vector failed with the second page and was
+        // stored with the third.
         assert!(db.tags_missing_embedding("fake").unwrap().is_empty());
     }
 
@@ -1618,8 +1465,8 @@ mod tests {
         let llm = FakeLlm::new(vec![Ok(summary("T", &["alpha", "beta"], &[]))]);
         run(&mut db, &llm).await.unwrap(); // without embeddings
         assert_eq!(db.tags_missing_embedding("fake").unwrap().len(), 2);
-        let embeddings = Embeddings::prepare(&db, &FakeEmbedder, 2000).await.unwrap();
-        assert_eq!(embeddings.index.len(), 2);
+        Embeddings::prepare(&db, &FakeEmbedder).await.unwrap();
+        assert!(db.tags_missing_embedding("fake").unwrap().is_empty());
         assert!(db.pages_missing_embedding("fake").unwrap().is_empty());
     }
 
@@ -1774,7 +1621,7 @@ mod tests {
                 .collect(),
         );
         // 2,000 tokens already used before the first page, like filling in vectors.
-        llm.seen_vocab.borrow_mut().extend((0..20).map(|_| String::new()));
+        llm.requests.set(20);
         let mut config = Config::default();
         config.run.sequential_start = 1;
         config.run.concurrency = 4;

@@ -6,13 +6,13 @@ Declare tab bankruptcy without losing anything. tabkeeper reads every open tab i
 
 ## Usage
 
-tabkeeper talks to any OpenAI-compatible chat server. By default it uses [Ollama](https://ollama.com) at `http://localhost:11434/v1` with the model `llama3.1:8b`, plus the embedding model `nomic-embed-text` to pick which existing tags the model sees for each page:
+tabkeeper talks to any OpenAI-compatible chat server. By default it uses [Ollama](https://ollama.com) at `http://localhost:11434/v1` with the model `llama3.1:8b`, plus the embedding model `nomic-embed-text`, which the tag review uses to group pages and tags:
 
 ```sh
 ollama pull nomic-embed-text
 ```
 
-Without it tabkeeper still works, showing the model the most used tags instead, and says so when it starts.
+Without it tabkeeper still summarizes and tags pages, but the tag review leaves the tags as they are; it says so when it starts.
 
 ```sh
 cargo build --release
@@ -53,7 +53,7 @@ Each run ends with a report: how many tabs were done, unreachable or failed (by 
 
 ### Tag review
 
-At the end of each import, tabkeeper reviews the tags with the whole archive in view. While pages are processed, each gets a few tags of its own, starting with its broad topic (`bread`, `investing`, `japan`). The review then builds one vocabulary for all pages and retags every page from it:
+At the end of each import, tabkeeper reviews the tags with the whole archive in view. While pages are processed, each gets a few tags of its own, starting with its broad topic (`bread`, `investing`, `japan`); the model sees only the page, not the existing tags. The review then builds one vocabulary for all pages and retags every page from it:
 
 1. Pages are grouped by what they're about, and the model names each group with one tag that fits most of its pages. Tags already on several pages join the vocabulary too.
 2. A one-word tag used for unrelated things is split by meaning, once the model confirms it: the meaning with the most pages keeps the plain word (`python`), and each other meaning gets a qualified tag (`python-snake`).

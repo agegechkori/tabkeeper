@@ -105,10 +105,9 @@ fn per_page(last: Option<&Report>, config: &Config) -> PerPage {
             };
         }
     }
-    // About 4 characters per token: the instructions, the tag list, and a page
-    // filling about half of max_input_chars.
-    let chars =
-        2_000.0 + config.tags.vocabulary_limit as f64 * 60.0 + config.llm.max_input_chars as f64 * 0.5;
+    // About 4 characters per token: the instructions, and a page filling
+    // about half of max_input_chars.
+    let chars = 1_500.0 + config.llm.max_input_chars as f64 * 0.5;
     PerPage {
         input_tokens: chars / 4.0,
         output_tokens: 250.0,

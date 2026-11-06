@@ -154,35 +154,6 @@ pub fn count_tree(tags: &[TagRow], links: &[(i64, i64)]) -> Vec<CountedTag> {
     out
 }
 
-/// One line per tag for the model: `name (pages) - description`, sorted by name.
-pub fn format_vocabulary(tags: &[&CountedTag]) -> String {
-    let mut sorted = tags.to_vec();
-    sorted.sort_by(|a, b| a.name.cmp(&b.name));
-    sorted
-        .iter()
-        .map(|t| match &t.description {
-            Some(d) => format!("{} ({}) - {}", t.name, t.direct, d),
-            None => format!("{} ({})", t.name, t.direct),
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// Tags the model may reuse: used on at least one page, and not reserved.
-pub fn is_offerable(tag: &CountedTag) -> bool {
-    // Pages of its own: a category of the tag tree counts the pages below
-    // it, but pages are tagged with the tags under it.
-    tag.direct > 0 && !tag.name.starts_with(RESERVED_PREFIX)
-}
-
-/// The `limit` most used tags; the fallback when embeddings are unavailable.
-pub fn most_used(counted: &[CountedTag], limit: usize) -> Vec<&CountedTag> {
-    let mut top: Vec<&CountedTag> = counted.iter().filter(|t| is_offerable(t)).collect();
-    top.sort_by(|a, b| b.direct.cmp(&a.direct).then(a.name.cmp(&b.name)));
-    top.truncate(limit);
-    top
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,38 +226,5 @@ mod tests {
                 ("food", 0, 1, 1)
             ]
         );
-    }
-
-    #[test]
-    fn categories_without_pages_of_their_own_are_not_offered() {
-        let tags = vec![row(1, None, "technology"), row(2, Some(1), "rust")];
-        let counted = count_tree(&tags, &[(10, 2), (11, 2)]);
-        assert_eq!(format_vocabulary(&most_used(&counted, 5)), "rust (2)");
-    }
-
-    #[test]
-    fn most_used_skips_unused_and_reserved() {
-        let tags = vec![
-            row(1, None, "b"),
-            row(2, None, "a"),
-            row(3, None, "c"),
-            row(4, None, "status/unreachable"),
-            row(5, None, "unused"),
-        ];
-        let links = vec![
-            (1, 1),
-            (2, 1),
-            (3, 2),
-            (4, 3),
-            (5, 3),
-            (6, 3),
-            (7, 4),
-            (8, 4),
-            (9, 4),
-            (10, 4),
-        ];
-        let counted = count_tree(&tags, &links);
-        let top = most_used(&counted, 2);
-        assert_eq!(format_vocabulary(&top), "b (2)\nc (3)");
     }
 }

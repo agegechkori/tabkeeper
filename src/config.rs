@@ -151,8 +151,9 @@ pub struct EmbeddingsConfig {
     pub base_url: Option<String>,
     /// Defaults to `llm.api_key_env`.
     pub api_key_env: Option<String>,
-    /// How much of a page's text is embedded to pick the tags shown to the model.
-    pub page_chars: usize,
+    /// No longer used; accepted so that older config files still load.
+    #[allow(dead_code)]
+    page_chars: Option<serde::de::IgnoredAny>,
     pub timeout_secs: u64,
     /// US dollars per million tokens.
     pub price_per_mtok: f64,
@@ -165,7 +166,7 @@ impl Default for EmbeddingsConfig {
             model: "nomic-embed-text".into(),
             base_url: None,
             api_key_env: None,
-            page_chars: 2000,
+            page_chars: None,
             timeout_secs: 60,
             price_per_mtok: 0.0,
         }
@@ -285,8 +286,9 @@ pub struct TagConfig {
     pub taxonomy: Option<PathBuf>,
     pub max_per_page: usize,
     pub max_new_per_page: usize,
-    /// How many existing tags are shown to the model for each page.
-    pub vocabulary_limit: usize,
+    /// No longer used; accepted so that older config files still load.
+    #[allow(dead_code)]
+    vocabulary_limit: Option<serde::de::IgnoredAny>,
 }
 
 impl Default for TagConfig {
@@ -297,7 +299,7 @@ impl Default for TagConfig {
             taxonomy: None,
             max_per_page: 3,
             max_new_per_page: 2,
-            vocabulary_limit: 50,
+            vocabulary_limit: None,
         }
     }
 }
@@ -365,7 +367,6 @@ mod tests {
         assert_eq!(parsed.llm.model, defaults.llm.model);
         assert_eq!(parsed.llm.max_input_chars, defaults.llm.max_input_chars);
         assert_eq!(parsed.fetch.user_agent, defaults.fetch.user_agent);
-        assert_eq!(parsed.tags.vocabulary_limit, defaults.tags.vocabulary_limit);
     }
 
     #[test]

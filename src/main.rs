@@ -233,11 +233,11 @@ async fn run(cli: Cli) -> Result<()> {
             ));
 
             // Embeddings are optional: any problem setting them up is a warning,
-            // and the model is shown the most used tags instead.
+            // and the tag review then leaves the tags as they are.
             let unavailable = |err: anyhow::Error| {
                 say(&format!(
                     "Warning: embeddings are unavailable ({err:#}).\n\
-                     The model will be shown the most used tags instead of the most relevant ones. \
+                     The tag review needs them to build the tag vocabulary. \
                      If the embedding model is missing on Ollama, run: ollama pull {}",
                     config.embeddings.model
                 ))
@@ -251,10 +251,10 @@ async fn run(cli: Cli) -> Result<()> {
             };
             let mut embeddings = None;
             if let Some(embedder) = &embedder {
-                match pipeline::Embeddings::prepare(&db, embedder, config.embeddings.page_chars).await {
+                match pipeline::Embeddings::prepare(&db, embedder).await {
                     Ok(e) => {
                         say(&format!(
-                            "Using embedding model {} to pick relevant tags.",
+                            "Using embedding model {} for the tag review.",
                             config.embeddings.model
                         ));
                         embeddings = Some(e);
@@ -436,7 +436,7 @@ async fn review_tags(
     };
     let mut usable = embedder.as_ref();
     if let Some(e) = usable {
-        if let Err(err) = pipeline::Embeddings::prepare(db, e, config.embeddings.page_chars).await {
+        if let Err(err) = pipeline::Embeddings::prepare(db, e).await {
             say(&format!(
                 "Warning: embeddings are unavailable ({err:#}); the review only checks plural/singular pairs."
             ));

@@ -67,7 +67,7 @@ With thousands of tabs, most are discarded or unloaded by the browser, so page c
 - **Server-specific options:** `[llm.extra_body]` merges extra fields into every request. On Ollama, `reasoning_effort = "none"` turns off a thinking model's reasoning; in testing, that took `qwen3:4b` from about 3 minutes to about 10 seconds per page.
 - **Separate models per stage:** per-page summaries, embeddings and the end-of-run tag reconciliation can each use a different model, e.g. a fast model for pages and a stronger one, or thinking turned on, for the one-time reconciliation.
 - **URL-only mode:** each provider has a capability flag saying whether its model can fetch pages itself (Anthropic web fetch, Gemini URL context, OpenAI web search). If the model can't fetch the page, the tool automatically sends the content instead.
-- **Prompt layout:** instructions and the tag vocabulary come first in the prompt, so providers that cache repeated prompt prefixes charge less for them.
+- **Prompt layout:** the instructions come first in the prompt and are the same for every page, so servers that cache repeated prompt prefixes (Ollama, and providers that charge less for them) skip re-reading them.
 - **`--batch` mode:** uses the Anthropic and OpenAI batch APIs, which cost about 50% less and return results asynchronously.
 - **Throughput and cost controls:**
   - a global concurrency limit, with rate limiting via `governor` and `Retry-After` handling
