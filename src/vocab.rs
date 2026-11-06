@@ -236,6 +236,178 @@ fn page_line(page: &AnalyzedPage) -> String {
     }
 }
 
+/// The vocabulary as the classifier sees it: each tag's name, description
+/// and vector.
+struct Offer<'a> {
+    names: &'a [String],
+    descriptions: &'a [String],
+    vectors: &'a [Vec<f32>],
+    system: &'a str,
+    schema: &'a serde_json::Value,
+}
+
+/// The page's tags from the vocabulary tags nearest to it, except `exclude`,
+/// as the model picks them. `Err` says why the request failed.
+async fn classify<R: Reviewer>(
+    reviewer: &R,
+    offer: &Offer<'_>,
+    page: &AnalyzedPage,
+    vector: &[f32],
+    settings: &Settings,
+    exclude: &[String],
+) -> Result<Vec<String>, String> {
+    let mut ranked: Vec<(f32, usize)> = offer
+        .vectors
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !exclude.contains(&offer.names[*i]))
+        .map(|(i, t)| (similarity(vector, t), i))
+        .collect();
+    ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let offered: Vec<usize> = ranked.iter().take(settings.candidates).map(|(_, i)| *i).collect();
+    let mut user = format!(
+        "Page: {}\n{}\n\nTags to choose from:\n",
+        page.title,
+        truncate_chars(&page.summary, SUMMARY_CHARS)
+    );
+    for &i in &offered {
+        user.push_str(&format!("- {}: {}\n", offer.names[i], offer.descriptions[i]));
+    }
+    let reply = reviewer
+        .ask_json(offer.system, &user, "page_tags", offer.schema.clone())
+        .await
+        .map_err(|err| format!("{err:#}"))?;
+    let picked = serde_json::from_value::<ClassifyReply>(reply)
+        .map_err(|_| "a page's tags were unusable".to_string())?
+        .tags;
+    let mut tags: Vec<String> = Vec::new();
+    for raw in picked {
+        // A small model sometimes copies the whole line, "name: description".
+        let raw = raw.split(':').next().unwrap_or_default();
+        if let Some(name) = normalize_name(raw)
+            && offered.iter().any(|&i| offer.names[i] == name)
+            && !tags.contains(&name)
+            && tags.len() < settings.max_tags
+        {
+            tags.push(name);
+        }
+    }
+    Ok(tags)
+}
+
+/// What the model said about a word with several meanings.
+struct Split {
+    /// What the word names in its most common meaning, the one keeping it.
+    main_description: String,
+    /// Each other meaning: its qualified tag, description and pages.
+    others: Vec<(String, String, Vec<usize>)>,
+}
+
+/// Asks whether `word`, on the pages `list` (indexes into `pages`), names
+/// unrelated things. `None` when it doesn't: one meaning (remembered, and
+/// asked again only once the word has twice the pages), all pages in one
+/// cluster, no other meaning that could be named, or a failed request
+/// (recorded in `out`). A one-meaning verdict is remembered only if
+/// `remember`.
+#[allow(clippy::too_many_arguments)]
+async fn check_word<R: Reviewer>(
+    db: &Db,
+    reviewer: &R,
+    word: &str,
+    list: &[usize],
+    cluster_of: &[usize],
+    pages: &[AnalyzedPage],
+    members: &BTreeMap<String, Vec<usize>>,
+    remember: bool,
+    out: &mut Retag,
+) -> Result<Option<Split>> {
+    let key = format!("meanings:{word}");
+    if let Some(n) = db
+        .tag_decision(&key)?
+        .and_then(|d| d.strip_prefix("same:").and_then(|n| n.parse::<usize>().ok()))
+        && list.len() < n * 2
+    {
+        return Ok(None);
+    }
+    let mut groups: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for &i in list {
+        groups.entry(cluster_of[i]).or_default().push(i);
+    }
+    if groups.len() < 2 {
+        return Ok(None);
+    }
+    let mut groups: Vec<Vec<usize>> = groups.into_values().collect();
+    groups.sort_by_key(|g| std::cmp::Reverse(g.len()));
+    // Pages in clusters beyond the first few go with the largest group.
+    while groups.len() > MAX_MEANING_GROUPS {
+        let extra = groups.pop().unwrap_or_default();
+        groups[0].extend(extra);
+    }
+    let shown: Vec<Vec<&AnalyzedPage>> = groups
+        .iter()
+        .map(|g| {
+            g.iter()
+                .take(meanings::PAGES_PER_GROUP)
+                .map(|&i| &pages[i])
+                .collect()
+        })
+        .collect();
+    out.meaning_checks += 1;
+    out.checked.push((
+        word.to_string(),
+        shown
+            .iter()
+            .filter_map(|g| g.first().map(|p| p.title.clone()))
+            .collect(),
+    ));
+    let things = match meanings::check(reviewer, word, &shown).await {
+        Ok(meanings::Verdict::Same) => {
+            if remember {
+                db.set_tag_decision(&key, &format!("same:{}", list.len()), "llm")?;
+            }
+            return Ok(None);
+        }
+        Ok(meanings::Verdict::Several(things)) => things,
+        Err(err) => {
+            out.failed_requests.push(err);
+            return Ok(None);
+        }
+    };
+    // The meaning with the most pages keeps the plain word, so a false
+    // split only takes the word off the other groups' pages; each other
+    // meaning gets its qualified tag.
+    let pages_of =
+        |thing: &(String, String, Vec<usize>)| thing.2.iter().map(|&g| groups[g].len()).sum::<usize>();
+    let main = (0..things.len())
+        .max_by_key(|&t| pages_of(&things[t]))
+        .unwrap_or(0);
+    let mut others: Vec<(String, String, Vec<usize>)> = Vec::new();
+    for (t, (name, description, member_groups)) in things.iter().enumerate() {
+        if t == main {
+            continue;
+        }
+        let thing_pages: Vec<usize> = member_groups
+            .iter()
+            .flat_map(|&g| groups[g].iter().copied())
+            .collect();
+        let Some(name) = qualified_name(word, name, description, &thing_pages, members) else {
+            continue;
+        };
+        match others.iter_mut().find(|(n, _, _)| *n == name) {
+            Some((_, _, list)) => list.extend(thing_pages),
+            None => others.push((name, description.clone(), thing_pages)),
+        }
+    }
+    if others.is_empty() {
+        // No other meaning could be named: the word stays as it was.
+        return Ok(None);
+    }
+    Ok(Some(Split {
+        main_description: things[main].1.clone(),
+        others,
+    }))
+}
+
 /// Builds the vocabulary from the whole archive and tags every done page
 /// from it. Only the model's "one meaning" verdicts are saved, so they aren't
 /// asked again; `Retag::assignments` says which tags to save.
@@ -425,106 +597,49 @@ pub async fn retag<R: Reviewer, E: Embedder>(
         .map(|t| t.name.clone())
         .collect();
     for word in words {
-        let Some(list) = members.get(&word) else { continue };
-        // A word found to have one meaning is asked again only once it has
-        // twice the pages.
-        let key = format!("meanings:{word}");
-        if let Some(n) = db
-            .tag_decision(&key)?
-            .and_then(|d| d.strip_prefix("same:").and_then(|n| n.parse::<usize>().ok()))
-            && list.len() < n * 2
-        {
+        let Some(list) = members.get(&word).cloned() else {
             continue;
-        }
-        let mut groups: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-        for &i in list {
-            groups.entry(cluster_of[i]).or_default().push(i);
-        }
-        if groups.len() < 2 {
-            continue;
-        }
-        let mut groups: Vec<Vec<usize>> = groups.into_values().collect();
-        groups.sort_by_key(|g| std::cmp::Reverse(g.len()));
-        // Pages in clusters beyond the first few go with the largest group.
-        while groups.len() > MAX_MEANING_GROUPS {
-            let extra = groups.pop().unwrap_or_default();
-            groups[0].extend(extra);
-        }
-        let shown: Vec<Vec<&AnalyzedPage>> = groups
-            .iter()
-            .map(|g| {
-                g.iter()
-                    .take(meanings::PAGES_PER_GROUP)
-                    .map(|&i| &pages[i])
-                    .collect()
-            })
-            .collect();
-        out.meaning_checks += 1;
-        out.checked.push((
-            word.clone(),
-            shown
-                .iter()
-                .filter_map(|g| g.first().map(|p| p.title.clone()))
-                .collect(),
-        ));
-        let things = match meanings::check(reviewer, &word, &shown).await {
-            Ok(meanings::Verdict::Same) => {
-                db.set_tag_decision(&key, &format!("same:{}", list.len()), "llm")?;
-                continue;
-            }
-            Ok(meanings::Verdict::Several(things)) => things,
-            Err(err) => {
-                out.failed_requests.push(err);
-                continue;
-            }
         };
-        // The meaning with the most pages keeps the plain word, so a false
-        // split only takes the word off the other groups' pages; each other
-        // meaning gets its qualified tag.
-        let pages_of =
-            |thing: &(String, String, Vec<usize>)| thing.2.iter().map(|&g| groups[g].len()).sum::<usize>();
-        let main = (0..things.len())
-            .max_by_key(|&t| pages_of(&things[t]))
-            .unwrap_or(0);
+        let Some(split) = check_word(
+            db,
+            reviewer,
+            &word,
+            &list,
+            &cluster_of,
+            &pages,
+            &members,
+            true,
+            &mut out,
+        )
+        .await?
+        else {
+            continue;
+        };
         let mut names = vec![word.clone()];
-        for (t, (name, description, member_groups)) in things.iter().enumerate() {
-            if t == main {
-                continue;
-            }
-            let thing_pages: Vec<usize> = member_groups
-                .iter()
-                .flat_map(|&g| groups[g].iter().copied())
-                .collect();
-            let Some(name) = qualified_name(&word, name, description, &thing_pages, &members) else {
-                continue;
-            };
-            if names.contains(&name) {
-                continue;
-            }
+        for (name, description, thing_pages) in split.others {
             vocabulary.entry(name.clone()).or_insert(VocabTag {
                 name: name.clone(),
-                description: description.clone(),
+                description,
                 source: Source::Topic,
                 pages: 0,
             });
+            // So a later check of the word reuses this name for these pages.
+            members.entry(name.clone()).or_default().extend(thing_pages);
             names.push(name);
-        }
-        if names.len() < 2 {
-            // No other meaning could be named: the word stays as it was.
-            continue;
         }
         // The word now names that meaning: its description says so, so a page
         // about another meaning isn't given it.
         if let Some(tag) = vocabulary.get_mut(&word)
-            && !things[main].1.is_empty()
+            && !split.main_description.is_empty()
         {
-            tag.description = format!("{word}: {}", things[main].1);
+            tag.description = format!("{word}: {}", split.main_description);
         }
         out.ambiguous.push((word, names));
     }
 
     // Each page's tags, from the vocabulary tags nearest to it.
     let names: Vec<String> = vocabulary.keys().cloned().collect();
+    let descriptions: Vec<String> = vocabulary.values().map(|t| t.description.clone()).collect();
     let tag_texts: Vec<String> = vocabulary
         .values()
         .map(|t| format!("{}: {}", t.name.replace('-', " "), t.description))
@@ -540,59 +655,111 @@ pub async fn retag<R: Reviewer, E: Embedder>(
         "type": "object", "additionalProperties": false, "required": ["tags"],
         "properties": {"tags": {"type": "array", "items": {"type": "string"}}}
     });
+    let offer = Offer {
+        names: &names,
+        descriptions: &descriptions,
+        vectors: &tag_vectors,
+        system: &system,
+        schema: &classify_schema,
+    };
     // None for a page whose request failed: it keeps its tags.
     let mut chosen: Vec<Option<Vec<String>>> = Vec::with_capacity(pages.len());
     for (page, vector) in pages.iter().zip(&page_vectors) {
-        let mut ranked: Vec<(f32, usize)> = tag_vectors
+        match classify(reviewer, &offer, page, vector, settings, &[]).await {
+            Ok(tags) => chosen.push(Some(tags)),
+            Err(err) => {
+                out.failed_requests.push(err);
+                chosen.push(None);
+            }
+        }
+    }
+
+    // The classifier can give a word's tag to a page about another of its
+    // meanings (rust the language to a page on corrosion), also when the
+    // pages' own tags never showed the word in two meanings. A one-word tag
+    // given to pages in different clusters is checked again with those pages.
+    // A page of another meaning gets its qualified tag instead, if the
+    // vocabulary has it; otherwise it is tagged again without the word (a
+    // tag made for one stray page would be dropped and leave it untagged).
+    // Each page tagged again: its tags before, and the words taken off it.
+    let mut retry: BTreeMap<usize, (Vec<String>, Vec<String>)> = BTreeMap::new();
+    let words: Vec<String> = vocabulary
+        .keys()
+        .filter(|name| !name.contains('-') && !locked.contains(*name))
+        .cloned()
+        .collect();
+    for word in words {
+        let list: Vec<usize> = chosen
             .iter()
             .enumerate()
-            .map(|(i, t)| (similarity(vector, t), i))
+            .filter(|(_, tags)| tags.as_ref().is_some_and(|t| t.contains(&word)))
+            .map(|(i, _)| i)
             .collect();
-        ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
-        let offered: Vec<&str> = ranked
-            .iter()
-            .take(settings.candidates)
-            .map(|(_, i)| names[*i].as_str())
-            .collect();
-        let mut user = format!(
-            "Page: {}\n{}\n\nTags to choose from:\n",
-            page.title,
-            truncate_chars(&page.summary, SUMMARY_CHARS)
-        );
-        for name in &offered {
-            user.push_str(&format!("- {name}: {}\n", vocabulary[*name].description));
-        }
-        let picked: Vec<String> = match reviewer
-            .ask_json(&system, &user, "page_tags", classify_schema.clone())
-            .await
-        {
-            Ok(reply) => match serde_json::from_value::<ClassifyReply>(reply) {
-                Ok(reply) => reply.tags,
-                Err(_) => {
-                    out.failed_requests.push("a page's tags were unusable".into());
-                    chosen.push(None);
-                    continue;
-                }
-            },
-            Err(err) => {
-                out.failed_requests.push(format!("{err:#}"));
-                chosen.push(None);
-                continue;
-            }
+        // A word just found to have several meanings may show only one of
+        // them here; that isn't remembered as the word having one meaning.
+        let split_before = out.ambiguous.iter().any(|(w, _)| *w == word);
+        let Some(split) = check_word(
+            db,
+            reviewer,
+            &word,
+            &list,
+            &cluster_of,
+            &pages,
+            &members,
+            !split_before,
+            &mut out,
+        )
+        .await?
+        else {
+            continue;
         };
-        let mut tags: Vec<String> = Vec::new();
-        for raw in picked {
-            // A small model sometimes copies the whole line, "name: description".
-            let raw = raw.split(':').next().unwrap_or_default();
-            if let Some(name) = normalize_name(raw)
-                && offered.contains(&name.as_str())
-                && !tags.contains(&name)
-                && tags.len() < settings.max_tags
-            {
-                tags.push(name);
+        let mut names = vec![word.clone()];
+        for (name, _, thing_pages) in split.others {
+            let known = vocabulary.contains_key(&name);
+            for i in thing_pages {
+                let Some(Some(tags)) = chosen.get_mut(i) else {
+                    continue;
+                };
+                let Some(at) = tags.iter().position(|t| *t == word) else {
+                    continue;
+                };
+                if known && !tags.contains(&name) {
+                    tags[at] = name.clone();
+                } else {
+                    let before = tags.clone();
+                    tags.remove(at);
+                    if !known {
+                        retry
+                            .entry(i)
+                            .or_insert((before, Vec::new()))
+                            .1
+                            .push(word.clone());
+                    }
+                }
             }
+            names.push(name);
         }
-        chosen.push(Some(tags));
+        match out.ambiguous.iter_mut().find(|(w, _)| *w == word) {
+            Some((_, known)) => {
+                for name in names {
+                    if !known.contains(&name) {
+                        known.push(name);
+                    }
+                }
+            }
+            None => out.ambiguous.push((word, names)),
+        }
+    }
+    // A page loses the word only for another tag that fits: a broad word
+    // wrongly found to have several meanings (running on a page about
+    // sneakers) stays on a page nothing else fits.
+    for (i, (before, exclude)) in retry {
+        match classify(reviewer, &offer, &pages[i], &page_vectors[i], settings, &exclude).await {
+            Ok(tags) if !tags.is_empty() => chosen[i] = Some(tags),
+            Ok(_) => chosen[i] = Some(before),
+            // The page keeps its other tags.
+            Err(err) => out.failed_requests.push(err),
+        }
     }
 
     // Tags too few pages chose are dropped.
@@ -671,6 +838,9 @@ mod tests {
             json!({"tags": ["python"]}),
             json!({"tags": ["python"]}),
             json!({"tags": ["python-snake"]}),
+            // After classification python is checked again, with the two
+            // language pages it was given to.
+            json!({"groups": [], "same_meaning": true}),
         ]);
         let settings = Settings {
             cluster_similarity: 0.8,
@@ -681,7 +851,7 @@ mod tests {
         let out = retag(&db, &reviewer, &no_names(), &settings, |_| {})
             .await
             .unwrap();
-        assert_eq!(out.meaning_checks, 2);
+        assert_eq!(out.meaning_checks, 3);
         // The meaning with the most pages keeps the plain word.
         assert_eq!(
             out.ambiguous,
@@ -709,11 +879,13 @@ mod tests {
         );
         assert_eq!(out.untagged, 1);
         assert_eq!(out.dropped, ["python-snake"]);
-        // The one-meaning verdict is remembered.
+        // The one-meaning verdict is remembered, but not python's second
+        // check, which only saw the language.
         assert_eq!(
             db.tag_decision("meanings:coffee").unwrap().as_deref(),
             Some("same:3")
         );
+        assert_eq!(db.tag_decision("meanings:python").unwrap(), None);
     }
 
     #[tokio::test]
