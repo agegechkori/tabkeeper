@@ -114,7 +114,7 @@ split_similarity = 0.75
 # to it. Tags on fewer than min_support pages are dropped. false: only merge
 # duplicate tags and split ambiguous ones.
 vocabulary = true
-cluster_similarity = 0.80
+cluster_similarity = 0.75
 min_support = 3
 candidates = 8
 # Tag pairs per review request.

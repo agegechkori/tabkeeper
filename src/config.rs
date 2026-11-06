@@ -62,7 +62,7 @@ impl Default for ReconcileConfig {
             similarity: 0.80,
             split_min_pages: 2,
             vocabulary: true,
-            cluster_similarity: 0.80,
+            cluster_similarity: 0.75,
             min_support: 3,
             candidates: 8,
             split_similarity: 0.75,

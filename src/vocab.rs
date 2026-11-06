@@ -76,10 +76,11 @@ pub struct Retag {
     pub ambiguous: Vec<(String, Vec<String>)>,
 }
 
-const CLUSTER_SYSTEM: &str = "You build the tag vocabulary of a personal archive of web pages. The numbered pages were grouped because they are about similar things. Give the one tag that best describes what most of them have in common: broad enough to fit several of them, specific enough to find them by, like bread, investing, japan, classical-music or rust-programming.
+const CLUSTER_SYSTEM: &str = "You name a group of pages from a personal archive. The numbered pages were grouped because they are about similar things. Give the one tag for the topic most of them share: the broad topic someone would file them under, like bread, investing, japan, astronomy or machine-learning.
 
+- The tag names a topic, not an aspect of one: astronomy, not astronomy-history; birds, not bird-species.
 - Use lowercase kebab-case English. If the word has several common meanings, the most common one keeps the plain word (python, rust, java) and only the others are qualified: python-snake, rust-corrosion, java-island.
-- If one of the existing tags fits, use its exact name.
+- If one of the existing tags names that topic, use its exact name.
 - fits lists the numbers of the pages the tag describes.
 - If the pages have nothing useful in common, give an empty tag.
 
