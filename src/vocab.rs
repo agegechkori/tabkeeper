@@ -283,9 +283,16 @@ pub async fn retag<R: Reviewer, E: Embedder>(
         })
         .collect();
     let mut topic_counts: BTreeMap<&str, usize> = BTreeMap::new();
+    // Tags some page has as its broad topic, its first tag. A tag only ever
+    // given after it names an aspect of other topics (history, taxonomy) and
+    // doesn't become a vocabulary tag of its own.
+    let mut first_tags: HashSet<&str> = HashSet::new();
     for page in &pages {
         for tag in &page.tags {
             *topic_counts.entry(tag.as_str()).or_default() += 1;
+        }
+        if let Some(first) = page.tags.first() {
+            first_tags.insert(first.as_str());
         }
     }
     let mut vocabulary: BTreeMap<String, VocabTag> = BTreeMap::new();
@@ -293,9 +300,10 @@ pub async fn retag<R: Reviewer, E: Embedder>(
     let mut members: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for (i, page) in pages.iter().enumerate() {
         for tag in &page.tags {
-            if topic_counts
-                .get(tag.as_str())
-                .is_some_and(|n| *n >= settings.min_support)
+            if first_tags.contains(tag.as_str())
+                && topic_counts
+                    .get(tag.as_str())
+                    .is_some_and(|n| *n >= settings.min_support)
             {
                 members.entry(tag.clone()).or_default().push(i);
             }
@@ -385,12 +393,24 @@ pub async fn retag<R: Reviewer, E: Embedder>(
                 list.push(i);
             }
         }
-        vocabulary.entry(name.clone()).or_insert(VocabTag {
-            name,
-            description: reply.description.trim().to_string(),
-            source: Source::Cluster,
-            pages: 0,
-        });
+        // A cluster's description was written for its pages, so it replaces
+        // the one a topic got from the first page it was used on.
+        let description = reply.description.trim().to_string();
+        match vocabulary.get_mut(&name) {
+            Some(tag) if !description.is_empty() => tag.description = description,
+            Some(_) => {}
+            None => {
+                vocabulary.insert(
+                    name.clone(),
+                    VocabTag {
+                        name,
+                        description,
+                        source: Source::Cluster,
+                        pages: 0,
+                    },
+                );
+            }
+        }
     }
     if vocabulary.is_empty() {
         return Ok(out);
@@ -694,6 +714,37 @@ mod tests {
             db.tag_decision("meanings:coffee").unwrap().as_deref(),
             Some("same:3")
         );
+    }
+
+    #[tokio::test]
+    async fn a_tag_never_given_first_stays_out_of_the_vocabulary() {
+        use crate::reconcile::tests::{FakeReviewer, archive, no_names};
+        // history is on every page, but never as the page's broad topic.
+        let db = archive(&[
+            (&["coffee", "history"], [1.0, 0.0, 0.0]),
+            (&["coffee", "history"], [1.0, 0.0, 0.0]),
+            (&["bread", "history"], [0.0, 1.0, 0.0]),
+            (&["bread", "history"], [0.0, 1.0, 0.0]),
+        ]);
+        let reviewer = FakeReviewer::new(vec![
+            json!({"groups": [], "same_meaning": true}),
+            json!({"groups": [], "same_meaning": true}),
+            json!({"tags": ["coffee"]}),
+            json!({"tags": ["coffee"]}),
+            json!({"tags": ["bread"]}),
+            json!({"tags": ["bread"]}),
+        ]);
+        let settings = Settings {
+            cluster_similarity: 0.8,
+            min_support: 2,
+            candidates: 8,
+            max_tags: 3,
+        };
+        let out = retag(&db, &reviewer, &no_names(), &settings, |_| {})
+            .await
+            .unwrap();
+        let names: Vec<&str> = out.vocabulary.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["bread", "coffee"]);
     }
 
     #[tokio::test]

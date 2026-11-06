@@ -163,27 +163,37 @@ impl Db {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Done pages with their topic tags (not `status/` ones), for building
-    /// the vocabulary from the whole archive.
+    /// Done pages with their topic tags (not `status/` ones) in order, the
+    /// broadest first, for building the vocabulary from the whole archive.
     pub fn analyzed_pages(&self) -> Result<Vec<AnalyzedPage>> {
+        let mut pages: Vec<AnalyzedPage> = self
+            .conn
+            .prepare("SELECT id, title, summary FROM pages WHERE status = 'done' ORDER BY id")?
+            .query_map([], |r| {
+                Ok(AnalyzedPage {
+                    id: r.get(0)?,
+                    title: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    summary: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    tags: Vec::new(),
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        let index: std::collections::HashMap<i64, usize> =
+            pages.iter().enumerate().map(|(i, p)| (p.id, i)).collect();
+        // Two raw tags of a page can resolve to one tag: it keeps its first place.
         let mut stmt = self.conn.prepare(
-            "SELECT p.id, p.title, p.summary,
-                    (SELECT group_concat(DISTINCT t.name) FROM page_tags x JOIN tags t ON t.id = x.resolved_tag_id
-                     WHERE x.page_id = p.id AND t.name NOT LIKE 'status/%')
-             FROM pages p WHERE p.status = 'done' ORDER BY p.id",
+            "SELECT x.page_id, t.name FROM page_tags x JOIN tags t ON t.id = x.resolved_tag_id
+             WHERE t.name NOT LIKE 'status/%'
+             GROUP BY x.page_id, t.id ORDER BY x.page_id, min(x.position), t.name",
         )?;
-        let rows = stmt.query_map([], |r| {
-            let tags: Option<String> = r.get(3)?;
-            Ok(AnalyzedPage {
-                id: r.get(0)?,
-                title: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                summary: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                tags: tags
-                    .map(|t| t.split(',').map(str::to_string).collect())
-                    .unwrap_or_default(),
-            })
-        })?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        for row in rows {
+            let (page, name) = row?;
+            if let Some(&i) = index.get(&page) {
+                pages[i].tags.push(name);
+            }
+        }
+        Ok(pages)
     }
 
     /// The tag that uses `name`, as its name or as an alias.
@@ -425,7 +435,7 @@ fn retag(tx: &Connection, pages: &[PageTags], steps: &mut Vec<Step>) -> Result<(
         let old: Vec<(String, i64)> = tx
             .prepare(
                 "SELECT x.raw_tag, x.resolved_tag_id FROM page_tags x JOIN tags t ON t.id = x.resolved_tag_id
-                 WHERE x.page_id = ?1 AND t.name NOT LIKE 'status/%' AND NOT t.locked",
+                 WHERE x.page_id = ?1 AND t.name NOT LIKE 'status/%' AND NOT t.locked ORDER BY x.position",
             )?
             .query_map([page], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?;
@@ -436,7 +446,7 @@ fn retag(tx: &Connection, pages: &[PageTags], steps: &mut Vec<Step>) -> Result<(
             )?;
         }
         let mut new = Vec::new();
-        for (name, description) in tags {
+        for (position, (name, description)) in tags.iter().enumerate() {
             // A tag, or the tag an alias with this name stands for.
             let existing: Option<i64> = tx
                 .query_row(
@@ -467,8 +477,8 @@ fn retag(tx: &Connection, pages: &[PageTags], steps: &mut Vec<Step>) -> Result<(
                 continue;
             }
             tx.execute(
-                "INSERT INTO page_tags (page_id, raw_tag, resolved_tag_id) VALUES (?1, ?2, ?3)",
-                params![page, name, id],
+                "INSERT INTO page_tags (page_id, raw_tag, resolved_tag_id, position) VALUES (?1, ?2, ?3, ?4)",
+                params![page, name, id, position as i64],
             )?;
             new.push((name.clone(), id));
         }
@@ -841,10 +851,10 @@ fn undo_step(tx: &Connection, step: Step, freed_aliases: &mut Vec<(String, i64)>
                     params![page, raw, tag],
                 )?;
             }
-            for (raw, tag) in old {
+            for (position, (raw, tag)) in old.iter().enumerate() {
                 tx.execute(
-                    "INSERT OR IGNORE INTO page_tags (page_id, raw_tag, resolved_tag_id) VALUES (?1, ?2, ?3)",
-                    params![page, raw, tag],
+                    "INSERT OR IGNORE INTO page_tags (page_id, raw_tag, resolved_tag_id, position) VALUES (?1, ?2, ?3, ?4)",
+                    params![page, raw, tag, position as i64],
                 )?;
             }
         }

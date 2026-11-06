@@ -8,7 +8,7 @@ use crate::tags::TagRow;
 mod review;
 pub use review::{AnalyzedPage, PageTags, SplitPart, TagChange, TagInfo};
 
-const SCHEMA_VERSION: i32 = 7;
+const SCHEMA_VERSION: i32 = 8;
 
 /// Added in version 6: the tag review.
 const REVIEW_TABLES: &str = "
@@ -33,6 +33,11 @@ CREATE TABLE tag_decisions (
     created_at TEXT NOT NULL
 );
 ";
+
+/// Added in version 8: a tag's place in its page's list, the broadest topic
+/// first.
+const PAGE_TAG_POSITION_COLUMN: &str =
+    "ALTER TABLE page_tags ADD COLUMN position INTEGER NOT NULL DEFAULT 0;";
 
 /// Added in version 5: the page's own title, as in the browser tab or its
 /// HTML <title>, shown next to the model's title.
@@ -230,7 +235,7 @@ impl Db {
         let mut version: i32 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
         if version == 0 {
             conn.execute_batch(&format!(
-                "BEGIN; {PAGES_TABLE} {PAGE_TITLE_COLUMN} {SCHEMA} {TREE_COLUMN} {RUNS_TABLE} {REVIEW_TABLES} COMMIT;"
+                "BEGIN; {PAGES_TABLE} {PAGE_TITLE_COLUMN} {SCHEMA} {TREE_COLUMN} {PAGE_TAG_POSITION_COLUMN} {RUNS_TABLE} {REVIEW_TABLES} COMMIT;"
             ))?;
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             version = SCHEMA_VERSION;
@@ -267,6 +272,16 @@ impl Db {
                  PRAGMA user_version = 7; COMMIT;"
             ))?;
             version = 7;
+        }
+        if version == 7 {
+            // Rows were added in the order the tags were given.
+            conn.execute_batch(&format!(
+                "BEGIN; {PAGE_TAG_POSITION_COLUMN}
+                 UPDATE page_tags SET position =
+                     (SELECT count(*) FROM page_tags y WHERE y.page_id = page_tags.page_id AND y.rowid < page_tags.rowid);
+                 PRAGMA user_version = 8; COMMIT;"
+            ))?;
+            version = 8;
         }
         if version != SCHEMA_VERSION {
             bail!(
@@ -393,10 +408,10 @@ impl Db {
             ],
         )?;
         tx.execute("DELETE FROM page_tags WHERE page_id = ?1", [page_id])?;
-        for (raw, tag_id) in result.tags {
+        for (position, (raw, tag_id)) in result.tags.iter().enumerate() {
             tx.execute(
-                "INSERT OR IGNORE INTO page_tags (page_id, raw_tag, resolved_tag_id) VALUES (?1, ?2, ?3)",
-                params![page_id, raw, tag_id],
+                "INSERT OR IGNORE INTO page_tags (page_id, raw_tag, resolved_tag_id, position) VALUES (?1, ?2, ?3, ?4)",
+                params![page_id, raw, tag_id, position as i64],
             )?;
         }
         tx.commit()?;
@@ -896,6 +911,28 @@ mod tests {
             error TEXT, title TEXT, summary TEXT, lang TEXT, note_file TEXT UNIQUE, added_at TEXT NOT NULL,
             processed_at TEXT
         );";
+
+    #[test]
+    fn migrates_version_seven_keeping_the_order_of_page_tags() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        {
+            let conn = Connection::open(file.path()).unwrap();
+            conn.execute_batch(&format!(
+                "{PAGES_TABLE} {PAGE_TITLE_COLUMN} {SCHEMA} {TREE_COLUMN} {RUNS_TABLE} {REVIEW_TABLES}
+                 INSERT INTO pages (id, url, original_url, source, status, title, summary, note_file, added_at,
+                                    processed_at)
+                 VALUES (7, 'https://a.com/', 'https://a.com/', 'import', 'done', 'T', 'S.', 't.md', 'x', 'y');
+                 INSERT INTO tags (id, name, created_at) VALUES (1, 'zeta', 'x'), (2, 'alpha', 'x');
+                 INSERT INTO page_tags VALUES (7, 'zeta', 1);
+                 INSERT INTO page_tags VALUES (7, 'alpha', 2);
+                 PRAGMA user_version = 7;"
+            ))
+            .unwrap();
+        }
+        let db = Db::open(file.path()).unwrap();
+        // The order the tags were added in, not the order of their names.
+        assert_eq!(db.analyzed_pages().unwrap()[0].tags, ["zeta", "alpha"]);
+    }
 
     #[test]
     fn migrates_version_two_keeping_pages_and_tags() {

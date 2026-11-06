@@ -55,7 +55,7 @@ Each run ends with a report: how many tabs were done, unreachable or failed (by 
 
 At the end of each import, tabkeeper reviews the tags with the whole archive in view. While pages are processed, each gets a few tags of its own, starting with its broad topic (`bread`, `investing`, `japan`); the model sees only the page, not the existing tags. The review then builds one vocabulary for all pages and retags every page from it:
 
-1. Pages are grouped by what they're about, and the model names each group with one tag that fits most of its pages. Tags already on several pages join the vocabulary too.
+1. Pages are grouped by what they're about, and the model names each group with one tag that fits most of its pages. Tags already on several pages join the vocabulary too, if at least one page has the tag as its broad topic (its first tag); a tag only ever given after the topic, like `history` on a page about the history of coffee, names an aspect and stays out.
 2. A one-word tag used for unrelated things is split by meaning, once the model confirms it: the meaning with the most pages keeps the plain word (`python`), and each other meaning gets a qualified tag (`python-snake`).
 3. Each page gets 1 to 3 tags from the vocabulary tags nearest to it. Tags that end up on fewer than 3 pages (`min_support`) are dropped, so every tag gathers several pages.
 
