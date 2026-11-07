@@ -363,10 +363,15 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::Undo => {
             let mut db = open_db(&cli.out)?;
-            match db.undo_last_revision()? {
-                Some((revision, changes)) => {
+            match db.undo_last_review()? {
+                Some((revisions, changes)) => {
                     finish(&db, &cli.out, &config)?;
-                    println!("Undid tag review revision {revision} ({changes} changes).");
+                    let ids: Vec<String> = revisions.iter().map(i64::to_string).collect();
+                    println!(
+                        "Undid the last tag review: revision{} {} ({changes} changes).",
+                        if revisions.len() == 1 { "" } else { "s" },
+                        ids.join(" and ")
+                    );
                 }
                 None => println!("No tag review to undo."),
             }
@@ -418,6 +423,8 @@ async fn review_tags(
     let llm_config = config.reconcile.llm_config(&config.llm);
     let mut outcome = report::ReviewReport {
         model: llm_config.model.clone(),
+        // Without one, each revision is undone on its own.
+        review: db.next_review().ok(),
         ..Default::default()
     };
     let reviewer = match llm::OpenAiCompatible::new(&llm_config) {
@@ -821,7 +828,7 @@ fn decide_and_apply(
     if apply.is_empty() {
         return;
     }
-    match db.apply_reviewed_changes(&apply, &keys) {
+    match db.apply_reviewed_changes(&apply, &keys, outcome.review) {
         Ok(applied) => {
             outcome.revisions.extend(applied.revision);
             let failed: HashSet<usize> = applied.failed.iter().map(|(i, _)| *i).collect();

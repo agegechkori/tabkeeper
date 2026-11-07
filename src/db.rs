@@ -8,7 +8,7 @@ use crate::tags::TagRow;
 mod review;
 pub use review::{AnalyzedPage, PageTags, SplitPart, TagChange, TagInfo};
 
-const SCHEMA_VERSION: i32 = 8;
+const SCHEMA_VERSION: i32 = 9;
 
 /// Added in version 6: the tag review.
 const REVIEW_TABLES: &str = "
@@ -38,6 +38,10 @@ CREATE TABLE tag_decisions (
 /// first.
 const PAGE_TAG_POSITION_COLUMN: &str =
     "ALTER TABLE page_tags ADD COLUMN position INTEGER NOT NULL DEFAULT 0;";
+
+/// Added in version 9: the tag review a revision belongs to, so that undo
+/// reverts a whole review (its retag and its tree placements) at once.
+const REVISION_REVIEW_COLUMN: &str = "ALTER TABLE revisions ADD COLUMN review INTEGER;";
 
 /// Added in version 5: the page's own title, as in the browser tab or its
 /// HTML <title>, shown next to the model's title.
@@ -235,7 +239,7 @@ impl Db {
         let mut version: i32 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
         if version == 0 {
             conn.execute_batch(&format!(
-                "BEGIN; {PAGES_TABLE} {PAGE_TITLE_COLUMN} {SCHEMA} {TREE_COLUMN} {PAGE_TAG_POSITION_COLUMN} {RUNS_TABLE} {REVIEW_TABLES} COMMIT;"
+                "BEGIN; {PAGES_TABLE} {PAGE_TITLE_COLUMN} {SCHEMA} {TREE_COLUMN} {PAGE_TAG_POSITION_COLUMN} {RUNS_TABLE} {REVIEW_TABLES} {REVISION_REVIEW_COLUMN} COMMIT;"
             ))?;
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             version = SCHEMA_VERSION;
@@ -282,6 +286,12 @@ impl Db {
                  PRAGMA user_version = 8; COMMIT;"
             ))?;
             version = 8;
+        }
+        if version == 8 {
+            conn.execute_batch(&format!(
+                "BEGIN; {REVISION_REVIEW_COLUMN} PRAGMA user_version = 9; COMMIT;"
+            ))?;
+            version = 9;
         }
         if version != SCHEMA_VERSION {
             bail!(

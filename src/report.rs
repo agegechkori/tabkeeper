@@ -165,8 +165,10 @@ pub struct ReviewReport {
     /// Approved placements held back because their path goes through a tag
     /// whose own placement was declined.
     pub held_back: usize,
-    /// The revisions applied, oldest first; `tabkeeper undo` reverts the last.
+    /// The revisions applied, oldest first; `tabkeeper undo` reverts them all.
     pub revisions: Vec<i64>,
+    /// The number this review's revisions share, so they are undone together.
+    pub review: Option<i64>,
     /// Approved changes that couldn't be applied, with the reason.
     pub failed: Vec<String>,
     /// Review requests that failed; their tags are checked again next time.

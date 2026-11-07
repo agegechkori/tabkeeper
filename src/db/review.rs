@@ -245,16 +245,27 @@ impl Db {
 
     #[cfg(test)]
     pub fn apply_tag_changes(&mut self, changes: &[TagChange]) -> Result<Applied> {
-        self.apply_reviewed_changes(changes, &[])
+        self.apply_reviewed_changes(changes, &[], None)
+    }
+
+    /// A number for a new tag review, shared by the revisions it applies.
+    pub fn next_review(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT coalesce(max(review), 0) + 1 FROM revisions", [], |r| {
+                r.get(0)
+            })?)
     }
 
     /// Applies the changes as one revision. A change that fails is left out,
     /// and the others are still applied. `decision_keys` holds each change's
     /// tag_decisions keys; undoing the revision declines those changes.
+    /// `review` is the tag review the revision belongs to.
     pub fn apply_reviewed_changes(
         &mut self,
         changes: &[TagChange],
         decision_keys: &[Vec<String>],
+        review: Option<i64>,
     ) -> Result<Applied> {
         let mut tx = self.conn.transaction()?;
         let mut steps = Vec::new();
@@ -286,19 +297,55 @@ impl Db {
             None
         } else {
             tx.execute(
-                "INSERT INTO revisions (created_at, status, changes, undo, decision_keys)
-                 VALUES (?1, 'applied', ?2, ?3, ?4)",
+                "INSERT INTO revisions (created_at, status, changes, undo, decision_keys, review)
+                 VALUES (?1, 'applied', ?2, ?3, ?4, ?5)",
                 params![
                     now(),
                     serde_json::to_string(&applied)?,
                     serde_json::to_string(&steps)?,
-                    serde_json::to_string(&keys)?
+                    serde_json::to_string(&keys)?,
+                    review
                 ],
             )?;
             Some(tx.last_insert_rowid())
         };
         tx.commit()?;
         Ok(Applied { revision, failed })
+    }
+
+    /// Undoes the latest tag review: all its applied revisions, the latest
+    /// first (the tree placements before the retag they were made after).
+    /// A revision from before reviews were numbered is undone on its own.
+    /// Returns the revisions undone and how many changes they had, or `None`
+    /// if there is nothing to undo.
+    pub fn undo_last_review(&mut self) -> Result<Option<(Vec<i64>, usize)>> {
+        let latest = |db: &Db| -> Result<Option<Option<i64>>> {
+            Ok(db
+                .conn
+                .query_row(
+                    "SELECT review FROM revisions WHERE status = 'applied' ORDER BY id DESC LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?)
+        };
+        let Some(review) = latest(self)? else {
+            return Ok(None);
+        };
+        let mut undone = Vec::new();
+        let mut changes = 0;
+        loop {
+            let Some((id, n)) = self.undo_last_revision()? else {
+                break;
+            };
+            undone.push(id);
+            changes += n;
+            match (review, latest(self)?) {
+                (Some(r), Some(Some(next))) if next == r => {}
+                _ => break,
+            }
+        }
+        Ok(Some((undone, changes)))
     }
 
     /// Undoes the latest applied revision, and records its changes as
@@ -935,6 +982,27 @@ mod tests {
     }
 
     #[test]
+    fn undo_reverts_a_whole_review() {
+        let (mut db, _) = archive(&[&["a"], &["b"], &["c"], &["d"]]);
+        let before = names(&db);
+        let (a, b, c, d) = (id(&db, "a"), id(&db, "b"), id(&db, "c"), id(&db, "d"));
+        // A revision from before reviews were numbered, then a review of two.
+        db.apply_reviewed_changes(&[TagChange::Merge { from: a, into: b }], &[], None)
+            .unwrap();
+        let review = db.next_review().unwrap();
+        db.apply_reviewed_changes(&[TagChange::Merge { from: c, into: d }], &[], Some(review))
+            .unwrap();
+        db.apply_reviewed_changes(&[TagChange::Merge { from: b, into: d }], &[], Some(review))
+            .unwrap();
+        assert_eq!(db.next_review().unwrap(), review + 1);
+
+        assert_eq!(db.undo_last_review().unwrap(), Some((vec![3, 2], 2)));
+        assert_eq!(db.undo_last_review().unwrap(), Some((vec![1], 1)));
+        assert_eq!(names(&db), before);
+        assert_eq!(db.undo_last_review().unwrap(), None);
+    }
+
+    #[test]
     fn merge_and_undo() {
         let (mut db, _) = archive(&[
             &["ml", "python"],
@@ -1014,8 +1082,12 @@ mod tests {
         let (mut db, _) = archive(&[&["ml"], &["machine-learning"]]);
         let (ml, full) = (id(&db, "ml"), id(&db, "machine-learning"));
         let key = "merge:machine-learning|ml".to_string();
-        db.apply_reviewed_changes(&[TagChange::Merge { from: ml, into: full }], &[vec![key.clone()]])
-            .unwrap();
+        db.apply_reviewed_changes(
+            &[TagChange::Merge { from: ml, into: full }],
+            &[vec![key.clone()]],
+            None,
+        )
+        .unwrap();
         assert_eq!(db.tag_decision(&key).unwrap(), None);
         db.undo_last_revision().unwrap();
         assert_eq!(db.tag_decision(&key).unwrap().as_deref(), Some("declined"));
