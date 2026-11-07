@@ -545,6 +545,11 @@ async fn review_tags(
 /// once the archive has grown this much since; `revise-tags` always runs it.
 const RETAG_AGAIN_GROWTH: f64 = 1.5;
 
+/// A retag that would leave more than this share of the pages without topic
+/// tags isn't proposed: in an archive with few pages per topic, most tags
+/// have fewer than `min_support` pages and would be dropped.
+const RETAG_MAX_UNTAGGED: f64 = 0.2;
+
 /// Builds the vocabulary from the whole archive, shows it, and asks whether
 /// to retag the pages from it.
 #[allow(clippy::too_many_arguments)]
@@ -581,7 +586,7 @@ async fn vocabulary_review(
         && (done as f64) < n as f64 * RETAG_AGAIN_GROWTH
     {
         say(&format!(
-            "The retag declined at {n} pages is proposed again at {} pages; `tabkeeper revise-tags` runs it now.",
+            "The retag declined or skipped at {n} pages is proposed again at {} pages; `tabkeeper revise-tags` runs it now.",
             (n as f64 * RETAG_AGAIN_GROWTH).ceil()
         ));
         return;
@@ -654,6 +659,20 @@ async fn vocabulary_review(
             "  {} pages fit none of these tags and will have no topic tags.",
             retag.untagged
         ));
+    }
+    if retag.untagged as f64 > before.len() as f64 * RETAG_MAX_UNTAGGED {
+        say(&format!(
+            "The retag isn't proposed: it would leave {} of {} pages without topic tags, too few pages share \
+             a topic yet. It is proposed again at {} pages; `tabkeeper revise-tags` tries it now.",
+            retag.untagged,
+            before.len(),
+            (done as f64 * RETAG_AGAIN_GROWTH).ceil()
+        ));
+        // Counts as declined, so the growth rule applies.
+        if let Err(err) = db.set_tag_decision(&format!("retag:{done}"), "too_few_pages", "llm") {
+            say(&format!("Warning: couldn't remember the skipped retag: {err:#}"));
+        }
+        return;
     }
     let proposal = reconcile::Proposed {
         description: format!(
