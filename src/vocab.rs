@@ -190,8 +190,9 @@ pub fn agglomerate(vectors: &[Vec<f32>], threshold: f32) -> Vec<Vec<usize>> {
 /// The tag for a meaning of `word` other than its most common one: always
 /// `word-…`. A vocabulary tag of that form already made for these pages (a
 /// cluster's name) is reused, so one meaning doesn't get two names. Otherwise
-/// the model's name is used, prefixed with the word if it lacks it; if the
-/// model gave the plain word, the qualifier comes from the description.
+/// the qualifier is up to two words of the model's name, or of the
+/// description if the name has none, leaving out the word itself and words
+/// like genus or species that say nothing about the meaning.
 fn qualified_name(
     word: &str,
     name: &str,
@@ -209,19 +210,33 @@ fn qualified_name(
     if let Some((_, tag)) = existing {
         return Some(tag.clone());
     }
-    if name.starts_with(&prefix) {
-        return Some(name.to_string());
-    }
-    if !name.is_empty() && name != word {
-        return normalize_name(&format!("{prefix}{name}"));
-    }
     const SKIP: [&str; 9] = ["the", "a", "an", "of", "and", "in", "for", "its", "to"];
-    let qualifier: Vec<String> = description
-        .split(|c: char| !c.is_alphanumeric())
-        .map(str::to_lowercase)
-        .filter(|w| !w.is_empty() && !SKIP.contains(&w.as_str()) && !w.starts_with(word))
-        .take(2)
-        .collect();
+    const GENERIC: [&str; 8] = [
+        "genus",
+        "species",
+        "family",
+        "classification",
+        "type",
+        "kind",
+        "category",
+        "topic",
+    ];
+    let words_of = |text: &str| -> Vec<String> {
+        text.split(|c: char| !c.is_alphanumeric())
+            .map(str::to_lowercase)
+            .filter(|w| {
+                !w.is_empty()
+                    && !SKIP.contains(&w.as_str())
+                    && !GENERIC.contains(&w.as_str())
+                    && !w.starts_with(word)
+            })
+            .take(2)
+            .collect()
+    };
+    let mut qualifier = words_of(name);
+    if qualifier.is_empty() {
+        qualifier = words_of(description);
+    }
     if qualifier.is_empty() {
         return None;
     }
@@ -271,7 +286,10 @@ async fn classify<R: Reviewer>(
         truncate_chars(&page.summary, SUMMARY_CHARS)
     );
     for &i in &offered {
-        user.push_str(&format!("- {}: {}\n", offer.names[i], offer.descriptions[i]));
+        match offer.descriptions[i].trim() {
+            "" => user.push_str(&format!("- {}\n", offer.names[i])),
+            description => user.push_str(&format!("- {}: {description}\n", offer.names[i])),
+        }
     }
     let reply = reviewer
         .ask_json(offer.system, &user, "page_tags", offer.schema.clone())
@@ -632,7 +650,7 @@ pub async fn retag<R: Reviewer, E: Embedder>(
         if let Some(tag) = vocabulary.get_mut(&word)
             && !split.main_description.is_empty()
         {
-            tag.description = format!("{word}: {}", split.main_description);
+            tag.description = split.main_description.clone();
         }
         out.ambiguous.push((word, names));
     }
@@ -1034,6 +1052,19 @@ mod tests {
             Some("rust-iron-oxide")
         );
         assert_eq!(name("rust", "", "the rust", &[3]), None);
+        // Generic words and repeats of the word say nothing about the meaning.
+        assert_eq!(
+            name("python", "python-snake-genus", "a genus of snakes", &[3]).as_deref(),
+            Some("python-snake")
+        );
+        assert_eq!(
+            name("botany", "botany-botany", "the coffee plant", &[3]).as_deref(),
+            Some("botany-coffee-plant")
+        );
+        assert_eq!(
+            name("taxonomy", "taxonomy-fish-species-classification", "", &[3]).as_deref(),
+            Some("taxonomy-fish")
+        );
     }
 
     #[test]
