@@ -335,6 +335,8 @@ pub async fn place<R: Reviewer, E: Embedder>(
     // seeing a domain's tags together, a model groups them consistently.
     let mut by_domain: BTreeMap<String, Vec<&TagInfo>> = BTreeMap::new();
     let domain_system = DOMAIN_SYSTEM.replace("{taxonomy}", &taxonomy_rules(taxonomy));
+    // The model writes the fields in schema order: the tag's number first, so
+    // each answer says which tag it is for before deciding.
     let domain_schema = json!({
         "type": "object", "additionalProperties": false, "required": ["domains"],
         "properties": {"domains": {"type": "array", "items": {
@@ -422,6 +424,7 @@ pub async fn place<R: Reviewer, E: Embedder>(
         }
     }
 
+    // The tag's number first, as for domains.
     let branch_schema = json!({
         "type": "object", "additionalProperties": false, "required": ["placements"],
         "properties": {"placements": {"type": "array", "items": {

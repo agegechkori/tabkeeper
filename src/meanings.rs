@@ -150,6 +150,7 @@ pub async fn check<R: Reviewer>(
     for (i, r) in referents.iter().enumerate() {
         user.push_str(&format!("{}. {r}\n", i + 1));
     }
+    // The model writes the fields in schema order: the group's number first.
     let compare_schema = json!({
         "type": "object", "additionalProperties": false, "required": ["groups"],
         "properties": {"groups": {"type": "array", "items": {"type": "object", "additionalProperties": false,

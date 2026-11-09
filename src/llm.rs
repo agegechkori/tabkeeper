@@ -428,27 +428,29 @@ fn snippet(s: &str) -> String {
     crate::extract::truncate_chars(s.trim(), 300)
 }
 
+/// The model writes the fields in this order: the summary before the tags,
+/// a tag's description before its name, and the title last.
 pub fn response_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["title", "summary", "language", "tags"],
+        "required": ["language", "summary", "tags", "title"],
         "properties": {
-            "title": {"type": "string"},
-            "summary": {"type": "string"},
             "language": {"type": "string"},
+            "summary": {"type": "string"},
             "tags": {
                 "type": "array",
                 "items": {
                     "type": "object",
                     "additionalProperties": false,
-                    "required": ["name", "description"],
+                    "required": ["description", "name"],
                     "properties": {
-                        "name": {"type": "string"},
-                        "description": {"type": "string"}
+                        "description": {"type": "string"},
+                        "name": {"type": "string"}
                     }
                 }
-            }
+            },
+            "title": {"type": "string"}
         }
     })
 }

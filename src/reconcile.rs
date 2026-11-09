@@ -444,6 +444,7 @@ async fn review_merges<R: Reviewer>(
             describe_tag(db, b)?
         ));
     }
+    // The model writes the fields in schema order: the pair's number first.
     let schema = json!({
         "type": "object", "additionalProperties": false, "required": ["decisions"],
         "properties": {"decisions": {"type": "array", "items": {
@@ -637,6 +638,8 @@ async fn review_split<R: Reviewer>(
             truncate_chars(summary, 200)
         ));
     }
+    // The model writes the fields in schema order: the meanings before the
+    // decision, as the prompt asks.
     let schema = json!({
         "type": "object", "additionalProperties": false, "required": ["meanings", "split", "tags", "assignments"],
         "properties": {

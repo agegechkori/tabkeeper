@@ -528,11 +528,14 @@ pub async fn retag<R: Reviewer, E: Embedder>(
         clusters.len(),
         vocabulary.len()
     ));
+    // The model writes the fields in this order: what the pages share, which
+    // pages, then the name.
     let cluster_schema = json!({
-        "type": "object", "additionalProperties": false, "required": ["tag", "description", "fits"],
+        "type": "object", "additionalProperties": false, "required": ["description", "fits", "tag"],
         "properties": {
-            "tag": {"type": "string"}, "description": {"type": "string"},
-            "fits": {"type": "array", "items": {"type": "integer"}}
+            "description": {"type": "string"},
+            "fits": {"type": "array", "items": {"type": "integer"}},
+            "tag": {"type": "string"}
         }
     });
     for cluster in &clusters {
