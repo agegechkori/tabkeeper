@@ -1,0 +1,220 @@
+# Held-out test set: 150 pages on topics the prompts were never tuned on.
+# "# cluster: name" starts a topic. Topics of 3+ pages are scored for tag
+# sharing; "pair-" topics (2 pages) and "one-" pages are judged by hand,
+# since a tag needs 3 pages. "# ambiguous: a b" names two topics that share
+# a word with different meanings; a tag on pages of both is a collision.
+# ambiguous: swift-language swifts
+# ambiguous: ruby-language gemstones
+# ambiguous: amazon-company amazon-rainforest
+# ambiguous: horses one-ford-mustang
+# ambiguous: bats baseball
+# ambiguous: new-zealand one-kiwifruit
+
+# cluster: swift-language
+https://www.swift.org/
+https://www.hackingwithswift.com/sixty
+https://developer.apple.com/swift/
+https://en.wikipedia.org/wiki/Swift_(programming_language)
+# cluster: swifts
+https://en.wikipedia.org/wiki/Swift_(bird)
+https://en.wikipedia.org/wiki/Common_swift
+https://en.wikipedia.org/wiki/Chimney_swift
+# cluster: ruby-language
+https://www.ruby-lang.org/en/
+https://en.wikipedia.org/wiki/Ruby_(programming_language)
+https://rubyonrails.org/
+https://guides.rubyonrails.org/getting_started.html
+# cluster: gemstones
+https://en.wikipedia.org/wiki/Ruby
+https://en.wikipedia.org/wiki/Sapphire
+https://en.wikipedia.org/wiki/Emerald
+https://en.wikipedia.org/wiki/Opal
+https://en.wikipedia.org/wiki/Gemstone
+# cluster: amazon-company
+https://en.wikipedia.org/wiki/Amazon_(company)
+https://en.wikipedia.org/wiki/Amazon_Web_Services
+https://en.wikipedia.org/wiki/Amazon_Kindle
+https://en.wikipedia.org/wiki/Amazon_Prime
+https://en.wikipedia.org/wiki/Amazon_Alexa
+# cluster: amazon-rainforest
+https://en.wikipedia.org/wiki/Amazon_rainforest
+https://en.wikipedia.org/wiki/Amazon_River
+https://en.wikipedia.org/wiki/Deforestation_of_the_Amazon_rainforest
+https://en.wikipedia.org/wiki/Manaus
+# cluster: horses
+https://en.wikipedia.org/wiki/Horse
+https://en.wikipedia.org/wiki/Mustang
+https://en.wikipedia.org/wiki/Arabian_horse
+https://en.wikipedia.org/wiki/Equestrianism
+# cluster: knitting
+https://en.wikipedia.org/wiki/Knitting
+https://en.wikipedia.org/wiki/Crochet
+https://en.wikipedia.org/wiki/Yarn
+https://en.wikipedia.org/wiki/Knitting_needle
+https://en.wikipedia.org/wiki/Cable_knitting
+# cluster: cycling
+https://en.wikipedia.org/wiki/Bicycle
+https://en.wikipedia.org/wiki/Tour_de_France
+https://en.wikipedia.org/wiki/Road_bicycle_racing
+https://en.wikipedia.org/wiki/Mountain_biking
+https://en.wikipedia.org/wiki/Bicycle_gearing
+https://en.wikipedia.org/wiki/Bicycle_helmet
+# cluster: photography
+https://en.wikipedia.org/wiki/Aperture
+https://en.wikipedia.org/wiki/Shutter_speed
+https://en.wikipedia.org/wiki/Film_speed
+https://en.wikipedia.org/wiki/Depth_of_field
+https://en.wikipedia.org/wiki/Camera_lens
+# cluster: containers
+https://kubernetes.io/docs/concepts/overview/
+https://en.wikipedia.org/wiki/Kubernetes
+https://en.wikipedia.org/wiki/Docker_(software)
+https://docs.docker.com/get-started/docker-overview/
+https://helm.sh/docs/intro/using_helm/
+# cluster: linux
+https://en.wikipedia.org/wiki/Linux
+https://en.wikipedia.org/wiki/Linux_kernel
+https://en.wikipedia.org/wiki/Ubuntu
+https://wiki.archlinux.org/title/Systemd
+https://www.gnu.org/software/bash/manual/bash.html
+# cluster: seashells
+https://en.wikipedia.org/wiki/Seashell
+https://en.wikipedia.org/wiki/Nautilus
+https://en.wikipedia.org/wiki/Conch
+https://en.wikipedia.org/wiki/Cowry
+# cluster: tea
+https://en.wikipedia.org/wiki/Tea
+https://en.wikipedia.org/wiki/Green_tea
+https://en.wikipedia.org/wiki/Matcha
+https://en.wikipedia.org/wiki/Oolong
+https://en.wikipedia.org/wiki/Japanese_tea_ceremony
+# cluster: cheese
+https://en.wikipedia.org/wiki/Cheese
+https://en.wikipedia.org/wiki/Cheddar_cheese
+https://en.wikipedia.org/wiki/Brie
+https://en.wikipedia.org/wiki/Parmigiano_Reggiano
+https://en.wikipedia.org/wiki/Cheesemaking
+# cluster: volcanoes
+https://en.wikipedia.org/wiki/Volcano
+https://en.wikipedia.org/wiki/Mount_Etna
+https://en.wikipedia.org/wiki/Lava
+https://en.wikipedia.org/wiki/Mount_St._Helens
+https://en.wikipedia.org/wiki/Pyroclastic_flow
+# cluster: ancient-rome
+https://en.wikipedia.org/wiki/Roman_Senate
+https://en.wikipedia.org/wiki/Julius_Caesar
+https://en.wikipedia.org/wiki/Colosseum
+https://en.wikipedia.org/wiki/Roman_legion
+https://en.wikipedia.org/wiki/Pompeii
+https://en.wikipedia.org/wiki/Augustus
+# cluster: dogs
+https://en.wikipedia.org/wiki/Dog
+https://en.wikipedia.org/wiki/Labrador_Retriever
+https://en.wikipedia.org/wiki/Border_Collie
+https://en.wikipedia.org/wiki/Dog_training
+https://en.wikipedia.org/wiki/Puppy
+# cluster: bats
+https://en.wikipedia.org/wiki/Bat
+https://en.wikipedia.org/wiki/Vampire_bat
+https://en.wikipedia.org/wiki/Megabat
+https://en.wikipedia.org/wiki/Animal_echolocation
+# cluster: baseball
+https://en.wikipedia.org/wiki/Baseball
+https://en.wikipedia.org/wiki/Baseball_bat
+https://en.wikipedia.org/wiki/Home_run
+https://en.wikipedia.org/wiki/Major_League_Baseball
+https://en.wikipedia.org/wiki/Pitcher
+# cluster: new-zealand
+https://en.wikipedia.org/wiki/New_Zealand
+https://en.wikipedia.org/wiki/Auckland
+https://en.wikipedia.org/wiki/M%C4%81ori_people
+https://en.wikipedia.org/wiki/Kiwi_(bird)
+# cluster: css
+https://developer.mozilla.org/en-US/docs/Web/CSS/CSS_flexible_box_layout/Basic_concepts_of_flexbox
+https://developer.mozilla.org/en-US/docs/Web/CSS/CSS_grid_layout/Basic_concepts_of_grid_layout
+https://css-tricks.com/snippets/css/a-guide-to-flexbox/
+https://en.wikipedia.org/wiki/CSS
+https://web.dev/learn/css/box-model
+# cluster: nutrition
+https://en.wikipedia.org/wiki/Vitamin_D
+https://en.wikipedia.org/wiki/Dietary_fiber
+https://en.wikipedia.org/wiki/Protein_(nutrient)
+https://en.wikipedia.org/wiki/Mediterranean_diet
+# cluster: climbing
+https://en.wikipedia.org/wiki/Rock_climbing
+https://en.wikipedia.org/wiki/Bouldering
+https://en.wikipedia.org/wiki/Climbing_harness
+https://en.wikipedia.org/wiki/Belaying
+
+# cluster: pair-origami
+https://en.wikipedia.org/wiki/Origami
+https://en.wikipedia.org/wiki/Paper_plane
+# cluster: pair-beekeeping
+https://en.wikipedia.org/wiki/Beekeeping
+https://en.wikipedia.org/wiki/Honey
+# cluster: pair-stoicism
+https://en.wikipedia.org/wiki/Stoicism
+https://en.wikipedia.org/wiki/Epictetus
+# cluster: pair-typewriters
+https://en.wikipedia.org/wiki/Typewriter
+https://en.wikipedia.org/wiki/QWERTY
+# cluster: pair-lighthouses
+https://en.wikipedia.org/wiki/Lighthouse
+https://en.wikipedia.org/wiki/Fresnel_lens
+# cluster: pair-esperanto
+https://en.wikipedia.org/wiki/Esperanto
+https://en.wikipedia.org/wiki/Constructed_language
+# cluster: pair-bitcoin
+https://en.wikipedia.org/wiki/Bitcoin
+https://en.wikipedia.org/wiki/Blockchain
+
+# cluster: one-rubiks-cube
+https://en.wikipedia.org/wiki/Rubik%27s_Cube
+# cluster: one-ford-mustang
+https://en.wikipedia.org/wiki/Ford_Mustang
+# cluster: one-kiwifruit
+https://en.wikipedia.org/wiki/Kiwifruit
+# cluster: one-tattoo
+https://en.wikipedia.org/wiki/Tattoo
+# cluster: one-sundial
+https://en.wikipedia.org/wiki/Sundial
+# cluster: one-penicillin
+https://en.wikipedia.org/wiki/Penicillin
+# cluster: one-eiffel-tower
+https://en.wikipedia.org/wiki/Eiffel_Tower
+# cluster: one-bonsai
+https://en.wikipedia.org/wiki/Bonsai
+# cluster: one-sushi
+https://en.wikipedia.org/wiki/Sushi
+# cluster: one-hot-air-balloon
+https://en.wikipedia.org/wiki/Hot_air_balloon
+# cluster: one-fountain-pen
+https://en.wikipedia.org/wiki/Fountain_pen
+# cluster: one-coral-reef
+https://en.wikipedia.org/wiki/Coral_reef
+# cluster: one-ballet
+https://en.wikipedia.org/wiki/Ballet
+# cluster: one-haiku
+https://en.wikipedia.org/wiki/Haiku
+# cluster: one-mosquito
+https://en.wikipedia.org/wiki/Mosquito
+# cluster: one-lego
+https://en.wikipedia.org/wiki/Lego
+# cluster: one-sauna
+https://en.wikipedia.org/wiki/Sauna
+# cluster: one-compass
+https://en.wikipedia.org/wiki/Compass
+# cluster: one-fzf
+https://github.com/junegunn/fzf
+# cluster: one-git-undo
+https://git-scm.com/book/en/v2/Git-Basics-Undoing-Things
+# cluster: one-xkcd-standards
+https://xkcd.com/927/
+# cluster: one-pride-and-prejudice
+https://www.gutenberg.org/ebooks/1342
+# cluster: one-cookie-recipe
+https://en.wikipedia.org/wiki/Chocolate_chip_cookie
+# cluster: one-brezel-de
+https://de.wikipedia.org/wiki/Brezel
+# cluster: one-croissant-fr
+https://fr.wikipedia.org/wiki/Croissant

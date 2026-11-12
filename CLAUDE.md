@@ -24,4 +24,5 @@ Long sessions here run out of context mostly because of shell output. Keep every
   - The imported test archive is `target/experiments/5a/p`. Copy it (`cp -R p <new>`) before running a review on it, because reviews remember their verdicts in the database.
   - Use `scripts/cluster_urls.txt` (141 pages in 27 topic clusters) with `scripts/compare_trees.py --clusters` to measure tag quality.
   - Use `scripts/meanings_bench.py` to benchmark the "several meanings?" check.
+  - Check every tag change on the held-out set too: `scripts/holdout_urls.txt` (150 pages on topics the prompts weren't tuned on, 39 of them on topics of one or two pages) with `scripts/score_holdout.py <archive> [-v]`. Its archives are `target/experiments/h/h1` and `h2`.
 - **Docs:** the design and phase plan are in `docs/PLAN.md`.
