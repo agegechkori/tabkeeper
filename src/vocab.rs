@@ -18,8 +18,13 @@ use crate::tags::normalize_name;
 
 /// Member pages shown to the model when it names a cluster.
 const CLUSTER_SAMPLE: usize = 10;
+/// The classifier's choice for a page about none of the offered tags.
+const NONE: &str = "none";
 /// Summary characters shown for a page when it is tagged.
 const SUMMARY_CHARS: usize = 500;
+/// How much more alike pages must be to form a cluster in the first,
+/// tighter pass of cluster naming than `Settings::cluster_similarity`.
+const TIGHT_STEP: f32 = 0.05;
 
 #[derive(Debug, Clone)]
 pub struct Settings {
@@ -33,20 +38,10 @@ pub struct Settings {
     pub max_tags: usize,
 }
 
-/// Where a vocabulary tag came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Source {
-    /// A topic pages were tagged with that several pages share.
-    Topic,
-    /// The model's name for a cluster of pages.
-    Cluster,
-}
-
 #[derive(Debug, Clone)]
 pub struct VocabTag {
     pub name: String,
     pub description: String,
-    pub source: Source,
     /// Pages tagged with it in the end.
     pub pages: usize,
 }
@@ -88,7 +83,8 @@ Reply with a JSON object: {\"tag\": \"...\", \"description\": \"one line on what
 
 const CLASSIFY_SYSTEM: &str = "You tag a page of a personal archive with tags from a list. Pick the tags that describe what the page is about.
 
-- Pick 1 to {max} tags, the broadest first. Pick none only if no tag fits at all.
+- Pick 1 to {max} tags, the broadest first.
+- If the page is about none of these topics, pick only none.
 - A broad tag fits a page about one of its kinds: vehicles fits a page about trucks; sport fits a page about tennis.
 - A tag fits only in its own meaning, as its description says: a tag for the programming language never fits a page about the snake.
 - Never pick two tags that mean the same thing.
@@ -275,7 +271,7 @@ async fn classify<R: Reviewer>(
         .vectors
         .iter()
         .enumerate()
-        .filter(|(i, _)| !exclude.contains(&offer.names[*i]))
+        .filter(|(i, _)| !exclude.contains(&offer.names[*i]) && offer.names[*i] != NONE)
         .map(|(i, t)| (similarity(vector, t), i))
         .collect();
     ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
@@ -291,6 +287,10 @@ async fn classify<R: Reviewer>(
             description => user.push_str(&format!("- {}: {description}\n", offer.names[i])),
         }
     }
+    // Offered as a choice, none is picked far more readily than when the
+    // prompt only allows an empty reply: a page on a topic the vocabulary
+    // lacks is then left untagged instead of given the nearest tag.
+    user.push_str(&format!("- {NONE}: the page is about none of these topics\n"));
     let reply = reviewer
         .ask_json(offer.system, &user, "page_tags", offer.schema.clone())
         .await
@@ -426,6 +426,111 @@ async fn check_word<R: Reviewer>(
     }))
 }
 
+/// What naming the clusters has done so far, besides the vocabulary.
+#[derive(Default)]
+struct Naming {
+    /// Pages a cluster's name fits, and those past the sample the model saw.
+    named: HashSet<usize>,
+    /// For each tag a cluster described, how many pages that cluster's name
+    /// fit.
+    described: HashMap<String, usize>,
+}
+
+/// Asks the model to name `cluster` (indexes into `pages`) and adds the name
+/// to the vocabulary, with the pages it fits as members.
+#[allow(clippy::too_many_arguments)]
+async fn name_cluster<R: Reviewer>(
+    reviewer: &R,
+    cluster: &[usize],
+    pages: &[AnalyzedPage],
+    schema: &serde_json::Value,
+    settings: &Settings,
+    vocabulary: &mut BTreeMap<String, VocabTag>,
+    members: &mut BTreeMap<String, Vec<usize>>,
+    naming: &mut Naming,
+    out: &mut Retag,
+) {
+    let sample: Vec<&AnalyzedPage> = cluster.iter().take(CLUSTER_SAMPLE).map(|&i| &pages[i]).collect();
+    let existing: Vec<&str> = vocabulary.keys().map(String::as_str).collect();
+    let mut user = format!(
+        "Existing tags: {}\n\nPages:\n",
+        if existing.is_empty() {
+            "(none yet)".to_string()
+        } else {
+            existing.join(", ")
+        }
+    );
+    for (i, page) in sample.iter().enumerate() {
+        user.push_str(&format!("{}. {}\n", i + 1, page_line(page)));
+    }
+    let reply = match reviewer
+        .ask_json(CLUSTER_SYSTEM, &user, "cluster_tag", schema.clone())
+        .await
+    {
+        Ok(reply) => reply,
+        Err(err) => {
+            out.failed_requests.push(format!("{err:#}"));
+            return;
+        }
+    };
+    let Ok(reply) = serde_json::from_value::<ClusterReply>(reply) else {
+        out.failed_requests.push("a cluster name was unusable".into());
+        return;
+    };
+    let Some(name) = normalize_name(&reply.tag) else {
+        return;
+    };
+    let fitting: Vec<usize> = reply
+        .fits
+        .iter()
+        .filter(|&&i| i >= 1 && i <= sample.len())
+        .map(|&i| cluster[i - 1])
+        .collect::<BTreeSet<usize>>()
+        .into_iter()
+        .collect();
+    if fitting.len() < settings.min_support.min(sample.len()) {
+        return;
+    }
+    let fits = fitting.len();
+    naming.named.extend(cluster.iter().skip(sample.len()));
+    let list = members.entry(name.clone()).or_default();
+    for i in fitting {
+        naming.named.insert(i);
+        if !list.contains(&i) {
+            list.push(i);
+        }
+    }
+    // A cluster's description was written for its pages, so it replaces the
+    // one a topic got from the first page it was used on. When two clusters
+    // get the same name, the one the name fits better describes it: the
+    // classifier reads the description, and one written for a few stray
+    // pages (ancient-rome: "landmarks and volcanic activity in sicily")
+    // keeps the tag off pages it should have.
+    let description = reply.description.trim().to_string();
+    if description.is_empty() || naming.described.get(&name).is_some_and(|&n| n >= fits) {
+        vocabulary.entry(name.clone()).or_insert(VocabTag {
+            name,
+            description: String::new(),
+            pages: 0,
+        });
+        return;
+    }
+    naming.described.insert(name.clone(), fits);
+    match vocabulary.get_mut(&name) {
+        Some(tag) => tag.description = description,
+        None => {
+            vocabulary.insert(
+                name.clone(),
+                VocabTag {
+                    name,
+                    description,
+                    pages: 0,
+                },
+            );
+        }
+    }
+}
+
 /// Builds the vocabulary from the whole archive and tags every done page
 /// from it. Only the model's "one meaning" verdicts are saved, so they aren't
 /// asked again; `Retag::assignments` says which tags to save.
@@ -505,13 +610,12 @@ pub async fn retag<R: Reviewer, E: Embedder>(
             VocabTag {
                 name: name.to_string(),
                 description: descriptions.get(name).cloned().unwrap_or_default(),
-                source: Source::Topic,
                 pages: 0,
             },
         );
     }
 
-    // A name for each cluster big enough to deserve a tag.
+    // Which pages are alike, for the meanings check below.
     let all_clusters = agglomerate(&page_vectors, settings.cluster_similarity);
     let mut cluster_of = vec![0; pages.len()];
     for (c, list) in all_clusters.iter().enumerate() {
@@ -519,13 +623,8 @@ pub async fn retag<R: Reviewer, E: Embedder>(
             cluster_of[i] = c;
         }
     }
-    let clusters: Vec<Vec<usize>> = all_clusters
-        .into_iter()
-        .filter(|c| c.len() >= settings.min_support)
-        .collect();
     note(&format!(
-        "Building the vocabulary: {} clusters of pages, {} shared topics.",
-        clusters.len(),
+        "Building the vocabulary: {} shared topics, then names for clusters of pages.",
         vocabulary.len()
     ));
     // The model writes the fields in this order: what the pages share, which
@@ -538,71 +637,37 @@ pub async fn retag<R: Reviewer, E: Embedder>(
             "tag": {"type": "string"}
         }
     });
-    for cluster in &clusters {
-        let sample: Vec<&AnalyzedPage> = cluster.iter().take(CLUSTER_SAMPLE).map(|&i| &pages[i]).collect();
-        let existing: Vec<&str> = vocabulary.keys().map(String::as_str).collect();
-        let mut user = format!(
-            "Existing tags: {}\n\nPages:\n",
-            if existing.is_empty() {
-                "(none yet)".to_string()
-            } else {
-                existing.join(", ")
-            }
-        );
-        for (i, page) in sample.iter().enumerate() {
-            user.push_str(&format!("{}. {}\n", i + 1, page_line(page)));
-        }
-        let reply = match reviewer
-            .ask_json(CLUSTER_SYSTEM, &user, "cluster_tag", cluster_schema.clone())
-            .await
-        {
-            Ok(reply) => reply,
-            Err(err) => {
-                out.failed_requests.push(format!("{err:#}"));
-                continue;
-            }
+    // A name for each cluster big enough to deserve a tag, in two passes.
+    // Clusters of very alike pages come first: at the looser similarity two
+    // neighbouring topics (dogs and horses, fruit and houseplants) fall into
+    // one cluster, which gets named for one of them. The pages no name fits
+    // yet are then clustered again at the looser similarity, which finds the
+    // topics whose pages are less alike (investing, history).
+    let mut naming = Naming::default();
+    for pass in 0..2 {
+        let clusters: Vec<Vec<usize>> = if pass == 0 {
+            agglomerate(&page_vectors, settings.cluster_similarity + TIGHT_STEP)
+        } else {
+            let pool: Vec<usize> = (0..pages.len()).filter(|i| !naming.named.contains(i)).collect();
+            let vectors: Vec<Vec<f32>> = pool.iter().map(|&i| page_vectors[i].clone()).collect();
+            agglomerate(&vectors, settings.cluster_similarity)
+                .into_iter()
+                .map(|c| c.into_iter().map(|j| pool[j]).collect())
+                .collect()
         };
-        let Ok(reply) = serde_json::from_value::<ClusterReply>(reply) else {
-            out.failed_requests.push("a cluster name was unusable".into());
-            continue;
-        };
-        let Some(name) = normalize_name(&reply.tag) else {
-            continue;
-        };
-        let fitting: Vec<usize> = reply
-            .fits
-            .iter()
-            .filter(|&&i| i >= 1 && i <= sample.len())
-            .map(|&i| cluster[i - 1])
-            .collect::<BTreeSet<usize>>()
-            .into_iter()
-            .collect();
-        if fitting.len() < settings.min_support.min(sample.len()) {
-            continue;
-        }
-        let list = members.entry(name.clone()).or_default();
-        for i in fitting {
-            if !list.contains(&i) {
-                list.push(i);
-            }
-        }
-        // A cluster's description was written for its pages, so it replaces
-        // the one a topic got from the first page it was used on.
-        let description = reply.description.trim().to_string();
-        match vocabulary.get_mut(&name) {
-            Some(tag) if !description.is_empty() => tag.description = description,
-            Some(_) => {}
-            None => {
-                vocabulary.insert(
-                    name.clone(),
-                    VocabTag {
-                        name,
-                        description,
-                        source: Source::Cluster,
-                        pages: 0,
-                    },
-                );
-            }
+        for cluster in clusters.iter().filter(|c| c.len() >= settings.min_support) {
+            name_cluster(
+                reviewer,
+                cluster,
+                &pages,
+                &cluster_schema,
+                settings,
+                &mut vocabulary,
+                &mut members,
+                &mut naming,
+                &mut out,
+            )
+            .await;
         }
     }
     if vocabulary.is_empty() {
@@ -611,10 +676,12 @@ pub async fn retag<R: Reviewer, E: Embedder>(
 
     // A one-word topic whose pages fall into different clusters may be one
     // word for unrelated things (python the language and the snake): the
-    // model says whether it is, and each meaning gets a qualified tag.
+    // model says whether it is, and each meaning gets a qualified tag. This
+    // includes a name the model gave two unrelated clusters (amazon for the
+    // company and for the rainforest).
     let words: Vec<String> = vocabulary
         .values()
-        .filter(|t| t.source == Source::Topic && !t.name.contains('-'))
+        .filter(|t| !t.name.contains('-'))
         .map(|t| t.name.clone())
         .collect();
     for word in words {
@@ -641,7 +708,6 @@ pub async fn retag<R: Reviewer, E: Embedder>(
             vocabulary.entry(name.clone()).or_insert(VocabTag {
                 name: name.clone(),
                 description,
-                source: Source::Topic,
                 pages: 0,
             });
             // So a later check of the word reuses this name for these pages.
@@ -796,6 +862,42 @@ pub async fn retag<R: Reviewer, E: Embedder>(
         .map(|(t, _)| t.to_string())
         .collect();
     out.dropped = names.iter().filter(|n| !kept.contains(*n)).cloned().collect();
+    // A page all of whose tags were dropped is tagged again from the tags
+    // kept: a narrow tag (string-instrument on a page about the violin) can
+    // be dropped while a broader one (music) fits the page as well. Its
+    // tags can only gain pages, so no kept tag is dropped by this.
+    let orphans: Vec<usize> = chosen
+        .iter()
+        .enumerate()
+        .filter(|(_, tags)| {
+            tags.as_ref()
+                .is_some_and(|t| !t.is_empty() && t.iter().all(|t| !kept.contains(t)))
+        })
+        .map(|(i, _)| i)
+        .collect();
+    if !kept.is_empty() {
+        for i in orphans {
+            match classify(
+                reviewer,
+                &offer,
+                &pages[i],
+                &page_vectors[i],
+                settings,
+                &out.dropped,
+            )
+            .await
+            {
+                Ok(tags) if !tags.is_empty() => {
+                    for t in &tags {
+                        *counts.entry(t.clone()).or_default() += 1;
+                    }
+                    chosen[i] = Some(tags);
+                }
+                Ok(_) => {}
+                Err(err) => out.failed_requests.push(err),
+            }
+        }
+    }
     for (page, tags) in pages.iter().zip(chosen) {
         let Some(tags) = tags else { continue };
         let tags: Vec<(String, String)> = tags
@@ -862,6 +964,9 @@ mod tests {
             // After classification python is checked again, with the two
             // language pages it was given to.
             json!({"groups": [], "same_meaning": true}),
+            // The snake page lost python-snake, used on it alone, and is
+            // tagged again from coffee and python.
+            json!({"tags": ["none"]}),
         ]);
         let settings = Settings {
             cluster_similarity: 0.8,
@@ -907,6 +1012,304 @@ mod tests {
             Some("same:3")
         );
         assert_eq!(db.tag_decision("meanings:python").unwrap(), None);
+    }
+
+    /// Embeds a page by its first topic, from a fixed table; other texts get
+    /// a vector of their own, unlike any other.
+    struct TopicEmbedder(Vec<(&'static str, [f32; 2])>);
+
+    impl Embedder for TopicEmbedder {
+        fn model(&self) -> &str {
+            "m"
+        }
+
+        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            Ok(texts
+                .iter()
+                .enumerate()
+                .map(|(i, text)| {
+                    let mut out = vec![0.0; 2 + texts.len()];
+                    let first = text
+                        .lines()
+                        .find_map(|l| l.strip_prefix("Topics: "))
+                        .and_then(|t| t.split("; ").next());
+                    match self.0.iter().find(|(topic, _)| Some(*topic) == first) {
+                        Some((_, v)) => out[..2].copy_from_slice(v),
+                        None => out[2 + i] = 1.0,
+                    }
+                    out
+                })
+                .collect())
+        }
+    }
+
+    /// Three dog pages and three horse pages, each with a topic of its own.
+    fn dogs_and_horses() -> Db {
+        use crate::reconcile::tests::archive;
+        archive(&[
+            (&["labrador"], [0.0; 3]),
+            (&["poodle"], [0.0; 3]),
+            (&["beagle"], [0.0; 3]),
+            (&["mustang"], [0.0; 3]),
+            (&["arabian"], [0.0; 3]),
+            (&["pony"], [0.0; 3]),
+        ])
+    }
+
+    fn tags_of(out: &Retag) -> Vec<Vec<&str>> {
+        out.assignments
+            .iter()
+            .map(|(_, t)| t.iter().map(|(n, _)| n.as_str()).collect())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn neighbouring_topics_get_a_name_each() {
+        use crate::reconcile::tests::FakeReviewer;
+        // Dogs and horses are 0.82 alike: one cluster at 0.80, two at 0.85.
+        let embedder = TopicEmbedder(
+            [
+                ("labrador", 1),
+                ("poodle", 1),
+                ("beagle", 1),
+                ("mustang", -1),
+                ("arabian", -1),
+                ("pony", -1),
+            ]
+            .map(|(topic, sign)| (topic, [1.0, sign as f32 * 0.31]))
+            .to_vec(),
+        );
+        let reviewer = FakeReviewer::new(vec![
+            json!({"description": "Dogs.", "fits": [1, 2, 3], "tag": "dogs"}),
+            json!({"description": "Horses.", "fits": [1, 2, 3], "tag": "horses"}),
+            json!({"tags": ["dogs"]}),
+            json!({"tags": ["dogs"]}),
+            json!({"tags": ["dogs"]}),
+            json!({"tags": ["horses"]}),
+            json!({"tags": ["horses"]}),
+            json!({"tags": ["horses"]}),
+        ]);
+        let settings = Settings {
+            cluster_similarity: 0.8,
+            min_support: 3,
+            candidates: 8,
+            max_tags: 3,
+        };
+        let out = retag(&dogs_and_horses(), &reviewer, &embedder, &settings, |_| {})
+            .await
+            .unwrap();
+        let first = &reviewer.prompts.borrow()[0];
+        assert!(
+            first.contains("labrador") && !first.contains("mustang"),
+            "{first}"
+        );
+        assert_eq!(
+            tags_of(&out),
+            [
+                vec!["dogs"],
+                vec!["dogs"],
+                vec!["dogs"],
+                vec!["horses"],
+                vec!["horses"],
+                vec!["horses"]
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn pages_a_cluster_name_leaves_out_are_named_again() {
+        use crate::reconcile::tests::FakeReviewer;
+        // All six pages are alike: one cluster, which the model names for
+        // its dog pages only.
+        let embedder = TopicEmbedder(
+            ["labrador", "poodle", "beagle", "mustang", "arabian", "pony"]
+                .map(|topic| (topic, [1.0, 0.0]))
+                .to_vec(),
+        );
+        let reviewer = FakeReviewer::new(vec![
+            json!({"description": "Dogs.", "fits": [1, 2, 3], "tag": "dogs"}),
+            json!({"description": "Horses.", "fits": [1, 2, 3], "tag": "horses"}),
+            json!({"tags": ["dogs"]}),
+            json!({"tags": ["dogs"]}),
+            json!({"tags": ["dogs"]}),
+            json!({"tags": ["horses"]}),
+            json!({"tags": ["horses"]}),
+            json!({"tags": ["horses"]}),
+        ]);
+        let settings = Settings {
+            cluster_similarity: 0.8,
+            min_support: 3,
+            candidates: 8,
+            max_tags: 3,
+        };
+        let out = retag(&dogs_and_horses(), &reviewer, &embedder, &settings, |_| {})
+            .await
+            .unwrap();
+        // The second request shows only the pages left out, with dogs as an
+        // existing tag.
+        let second = &reviewer.prompts.borrow()[1];
+        assert!(second.starts_with("Existing tags: dogs\n"), "{second}");
+        assert!(
+            second.contains("mustang") && !second.contains("labrador"),
+            "{second}"
+        );
+        let names: Vec<&str> = out.vocabulary.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["dogs", "horses"]);
+    }
+
+    #[tokio::test]
+    async fn a_page_about_none_of_the_tags_is_left_untagged() {
+        use crate::reconcile::tests::FakeReviewer;
+        // The dog pages are alike; the horse pages are unlike anything.
+        let embedder = TopicEmbedder(
+            ["labrador", "poodle", "beagle"]
+                .map(|topic| (topic, [1.0, 0.0]))
+                .to_vec(),
+        );
+        let reviewer = FakeReviewer::new(vec![
+            json!({"description": "Dogs.", "fits": [1, 2, 3], "tag": "dogs"}),
+            json!({"tags": ["dogs"]}),
+            json!({"tags": ["dogs"]}),
+            json!({"tags": ["dogs"]}),
+            json!({"tags": ["none"]}),
+            json!({"tags": ["none"]}),
+            json!({"tags": ["none"]}),
+        ]);
+        let settings = Settings {
+            cluster_similarity: 0.8,
+            min_support: 3,
+            candidates: 8,
+            max_tags: 3,
+        };
+        let out = retag(&dogs_and_horses(), &reviewer, &embedder, &settings, |_| {})
+            .await
+            .unwrap();
+        let last = reviewer.prompts.borrow().last().cloned().unwrap();
+        assert!(
+            last.ends_with("- dogs: Dogs.\n- none: the page is about none of these topics\n"),
+            "{last}"
+        );
+        assert_eq!(
+            tags_of(&out),
+            [vec!["dogs"], vec!["dogs"], vec!["dogs"], vec![], vec![], vec![]]
+        );
+        assert_eq!(out.untagged, 3);
+    }
+
+    /// Four pages about one thing and three about another, unlike each
+    /// other, each page with a topic of its own.
+    fn two_groups() -> (Db, TopicEmbedder) {
+        use crate::reconcile::tests::archive;
+        let db = archive(&[
+            (&["a1"], [0.0; 3]),
+            (&["a2"], [0.0; 3]),
+            (&["a3"], [0.0; 3]),
+            (&["a4"], [0.0; 3]),
+            (&["b1"], [0.0; 3]),
+            (&["b2"], [0.0; 3]),
+            (&["b3"], [0.0; 3]),
+        ]);
+        let embedder = TopicEmbedder(
+            ["a1", "a2", "a3", "a4", "b1", "b2", "b3"]
+                .map(|topic| {
+                    (
+                        topic,
+                        if topic.starts_with('a') {
+                            [1.0, 0.0]
+                        } else {
+                            [0.0, 1.0]
+                        },
+                    )
+                })
+                .to_vec(),
+        );
+        (db, embedder)
+    }
+
+    #[tokio::test]
+    async fn a_name_two_clusters_get_keeps_the_description_it_fits_best() {
+        use crate::reconcile::tests::FakeReviewer;
+        let (db, embedder) = two_groups();
+        let mut replies = vec![
+            json!({"description": "Ancient Rome.", "fits": [1, 2, 3, 4], "tag": "ancient-rome"}),
+            json!({"description": "Roman landmarks and volcanoes.", "fits": [1, 2, 3], "tag": "ancient-rome"}),
+        ];
+        replies.extend((0..7).map(|_| json!({"tags": ["ancient-rome"]})));
+        let reviewer = FakeReviewer::new(replies);
+        let settings = Settings {
+            cluster_similarity: 0.8,
+            min_support: 3,
+            candidates: 8,
+            max_tags: 3,
+        };
+        let out = retag(&db, &reviewer, &embedder, &settings, |_| {}).await.unwrap();
+        // The first name fits four pages, the second three.
+        assert_eq!(out.vocabulary[0].description, "Ancient Rome.");
+    }
+
+    #[tokio::test]
+    async fn a_word_two_unrelated_clusters_are_named_is_split_by_meaning() {
+        use crate::reconcile::tests::FakeReviewer;
+        let (db, embedder) = two_groups();
+        let mut replies = vec![
+            json!({"description": "Amazon, the company.", "fits": [1, 2, 3, 4], "tag": "amazon"}),
+            json!({"description": "The Amazon rainforest.", "fits": [1, 2, 3], "tag": "amazon"}),
+            json!({"groups": [], "same_meaning": false}),
+            json!({"referent": "the company"}),
+            json!({"referent": "the rainforest"}),
+            json!({"groups": [
+                {"group": 1, "tag": "amazon", "description": "Amazon, the company."},
+                {"group": 2, "tag": "amazon-rainforest", "description": "The Amazon rainforest."}]}),
+        ];
+        replies.extend((0..4).map(|_| json!({"tags": ["amazon"]})));
+        replies.extend((0..3).map(|_| json!({"tags": ["amazon-rainforest"]})));
+        let reviewer = FakeReviewer::new(replies);
+        let settings = Settings {
+            cluster_similarity: 0.8,
+            min_support: 3,
+            candidates: 8,
+            max_tags: 3,
+        };
+        let out = retag(&db, &reviewer, &embedder, &settings, |_| {}).await.unwrap();
+        assert_eq!(out.meaning_checks, 1);
+        let mut expected = vec![vec!["amazon"]; 4];
+        expected.extend(vec![vec!["amazon-rainforest"]; 3]);
+        assert_eq!(tags_of(&out), expected);
+    }
+
+    #[tokio::test]
+    async fn a_page_whose_tags_are_all_dropped_is_tagged_again() {
+        use crate::reconcile::tests::FakeReviewer;
+        let (db, embedder) = two_groups();
+        let mut replies = vec![
+            json!({"description": "Music.", "fits": [1, 2, 3, 4], "tag": "music"}),
+            json!({"description": "String instruments.", "fits": [1, 2, 3], "tag": "string-instrument"}),
+        ];
+        replies.extend((0..4).map(|_| json!({"tags": ["music"]})));
+        replies.extend([
+            json!({"tags": ["string-instrument"]}),
+            json!({"tags": ["string-instrument"]}),
+            json!({"tags": ["music"]}),
+            // music, given to pages of both clusters, has one meaning.
+            json!({"groups": [], "same_meaning": true}),
+            // string-instrument, on two pages, is dropped: they are tagged
+            // again without it.
+            json!({"tags": ["music"]}),
+            json!({"tags": ["music"]}),
+        ]);
+        let reviewer = FakeReviewer::new(replies);
+        let settings = Settings {
+            cluster_similarity: 0.8,
+            min_support: 3,
+            candidates: 8,
+            max_tags: 3,
+        };
+        let out = retag(&db, &reviewer, &embedder, &settings, |_| {}).await.unwrap();
+        let last = reviewer.prompts.borrow().last().cloned().unwrap();
+        assert!(!last.contains("string-instrument"), "{last}");
+        assert_eq!(tags_of(&out), vec![vec!["music"]; 7]);
+        assert_eq!(out.dropped, ["string-instrument"]);
+        assert_eq!(out.untagged, 0);
     }
 
     #[tokio::test]

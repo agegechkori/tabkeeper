@@ -554,8 +554,10 @@ const RETAG_AGAIN_GROWTH: f64 = 1.5;
 
 /// A retag that would leave more than this share of the pages without topic
 /// tags isn't proposed: in an archive with few pages per topic, most tags
-/// have fewer than `min_support` pages and would be dropped.
-const RETAG_MAX_UNTAGGED: f64 = 0.2;
+/// have fewer than `min_support` pages and would be dropped. A real archive
+/// has many pages on topics of their own, which rightly stay untagged: on a
+/// test set with a quarter of such pages, a good retag left 23-27% untagged.
+const RETAG_MAX_UNTAGGED: f64 = 0.5;
 
 /// Builds the vocabulary from the whole archive, shows it, and asks whether
 /// to retag the pages from it.
