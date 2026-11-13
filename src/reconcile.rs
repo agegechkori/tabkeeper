@@ -65,7 +65,10 @@ pub async fn review<R: Reviewer, E: Embedder>(
 
     let pairs = merge_candidates(db, &tags, &by_name, &name_vectors, config.similarity)?;
     let splits = match embedder {
-        Some(embedder) => split_candidates(db, &tags, embedder.model(), config)?,
+        Some(embedder) => {
+            store_page_vectors(db, embedder).await?;
+            split_candidates(db, &tags, embedder.model(), config)?
+        }
         None => Vec::new(),
     };
     let mut review = Review {
@@ -268,6 +271,20 @@ struct SplitCandidate<'t> {
     tag: &'t TagInfo,
     sample: Vec<(i64, String, String)>,
     vectors: HashMap<i64, Vec<f32>>,
+}
+
+/// Embeds the pages that have no vector for the embedding model yet: new
+/// pages, or all of them after a switch of models.
+async fn store_page_vectors<E: Embedder>(db: &Db, embedder: &E) -> Result<()> {
+    let model = embedder.model();
+    let missing = db.pages_missing_embedding(model)?;
+    for chunk in missing.chunks(BATCH_SIZE) {
+        let texts: Vec<String> = chunk.iter().map(|(_, text)| text.clone()).collect();
+        for ((id, _), vector) in chunk.iter().zip(embedder.embed(&texts).await?) {
+            db.put_embedding(EmbeddingKind::Page, *id, model, &vector)?;
+        }
+    }
+    Ok(())
 }
 
 /// Tags on enough pages whose page vectors fall into two clearly separate groups.
@@ -1067,6 +1084,34 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(review.merge_candidates, 2);
+    }
+
+    #[tokio::test]
+    async fn pages_without_vectors_are_embedded_for_the_split_check() {
+        /// The vectors of no_names(), under another model's name.
+        struct OtherModel;
+        impl Embedder for OtherModel {
+            fn model(&self) -> &str {
+                "other"
+            }
+
+            async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+                no_names().embed(texts).await
+            }
+        }
+        // The archive has vectors from model "m" only.
+        let db = archive(&[(&["a"], [1.0, 0.0, 0.0]), (&["b"], [0.0, 1.0, 0.0])]);
+        assert_eq!(db.pages_missing_embedding("other").unwrap().len(), 2);
+        review(
+            &db,
+            &FakeReviewer::new(vec![]),
+            Some(&OtherModel),
+            &ReconcileConfig::default(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+        assert!(db.pages_missing_embedding("other").unwrap().is_empty());
     }
 
     #[tokio::test]

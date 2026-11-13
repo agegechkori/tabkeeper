@@ -8,8 +8,7 @@ use futures_util::stream::{self, StreamExt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::config::{Config, TagConfig};
-use crate::db::{Db, EmbeddingKind, PageResult, PendingPage, page_embedding_text, tag_embedding_text};
-use crate::embed::{BATCH_SIZE, Embedder};
+use crate::db::{Db, PageResult, PendingPage};
 use crate::extract::{extract, html_title};
 use crate::fetch::Fetcher;
 use crate::filter::Filter;
@@ -46,7 +45,7 @@ pub struct Stats {
 /// Limits on what a run may spend; it stops starting pages once one is reached.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Budget {
-    /// Input plus output tokens, summaries and embeddings together.
+    /// Input plus output tokens of the summaries.
     pub max_tokens: Option<u64>,
     /// US dollars, using the prices in the config.
     pub max_cost: Option<f64>,
@@ -89,57 +88,6 @@ enum Outcome {
     FailedAndStop(&'static str, String, anyhow::Error),
 }
 
-/// Embeddings for a run: vectors of new tags and pages, for the tag review.
-pub struct Embeddings<'a, E: Embedder> {
-    embedder: &'a E,
-    /// Embedding requests that failed during the run. The next run fills in
-    /// any vectors that are still missing.
-    pub errors: usize,
-    /// (tag id, text) of new tags whose vectors couldn't be stored yet. They
-    /// are retried with the next page.
-    unstored_tags: Vec<(i64, String)>,
-}
-
-impl<'a, E: Embedder> Embeddings<'a, E> {
-    /// Embeds the tags and pages that have no vector for this model yet (for
-    /// example after switching models, or after an interrupted run) and
-    /// Fails if the embeddings server can't be used.
-    pub async fn prepare(db: &Db, embedder: &'a E) -> Result<Self> {
-        let model = embedder.model();
-        // Checks the server and model even when there is nothing to backfill.
-        embedder.embed(&["tabkeeper".to_string()]).await?;
-        for (kind, missing) in [
-            (EmbeddingKind::Tag, db.tags_missing_embedding(model)?),
-            (EmbeddingKind::Page, db.pages_missing_embedding(model)?),
-        ] {
-            for chunk in missing.chunks(BATCH_SIZE) {
-                let texts: Vec<String> = chunk.iter().map(|(_, text)| text.clone()).collect();
-                let vectors = embedder.embed(&texts).await?;
-                for ((id, _), vector) in chunk.iter().zip(vectors) {
-                    db.put_embedding(kind, *id, model, &vector)?;
-                }
-            }
-        }
-        Ok(Self {
-            embedder,
-            errors: 0,
-            unstored_tags: Vec::new(),
-        })
-    }
-
-    /// Records a failed embedding request. Only the first one is printed,
-    /// so a flaky embeddings server doesn't flood the output.
-    fn note_error(&mut self, progress: &Progress, what: &str, consequence: &str, err: &anyhow::Error) {
-        if self.errors == 0 {
-            progress.line(&format!(
-                "Warning: {what} failed ({err:#}). Continuing: {consequence}. \
-                 Further embedding errors are counted, not shown."
-            ));
-        }
-        self.errors += 1;
-    }
-}
-
 /// Limits how many pages are fetched from one domain at the same time.
 struct DomainLimiter {
     per_domain: usize,
@@ -175,9 +123,6 @@ pub struct RunOptions<'a> {
     pub budget: Budget,
     /// Print progress to stderr, keeping stdout for a JSON report.
     pub progress_to_stderr: bool,
-    /// Tokens and cost spent before the run by something it doesn't track,
-    /// e.g. an embeddings setup that failed partway; counted toward the budget.
-    pub spent_elsewhere: (u64, f64),
 }
 
 #[cfg(test)]
@@ -192,14 +137,11 @@ impl RunSummary {
 }
 
 /// Processes pending pages, several at a time. Each page is saved as soon as
-/// it is done, so an interrupted run continues where it stopped. Without
-/// embeddings, the model is shown the most used tags instead of the most
-/// relevant ones.
-pub async fn process_pending<F: Fetcher, L: Llm, E: Embedder>(
+/// it is done, so an interrupted run continues where it stopped.
+pub async fn process_pending<F: Fetcher, L: Llm>(
     db: &mut Db,
     fetcher: &F,
     llm: &L,
-    embeddings: Option<&mut Embeddings<'_, E>>,
     options: &RunOptions<'_>,
 ) -> Result<RunSummary> {
     let RunOptions {
@@ -209,7 +151,6 @@ pub async fn process_pending<F: Fetcher, L: Llm, E: Embedder>(
         limit,
         budget,
         progress_to_stderr,
-        spent_elsewhere,
     } = *options;
     let mut stats = Stats::default();
     let mut pending = db.pending_pages()?;
@@ -227,21 +168,18 @@ pub async fn process_pending<F: Fetcher, L: Llm, E: Embedder>(
         db: RefCell::new(db),
         fetcher,
         llm,
-        embeddings: RefCell::new(embeddings),
         config,
         lang,
         domains: DomainLimiter {
             per_domain: config.run.per_domain,
             semaphores: RefCell::default(),
         },
-        progress: &progress,
         model_failures: Cell::new(0),
         fetch_secs: Cell::new(0.0),
         model_secs: Cell::new(0.0),
         pages_cut: Cell::new(0),
         model_pages: Cell::new(0),
         spent_before: Cell::new((0, 0.0)),
-        spent_elsewhere,
     };
     run.spent_before.set(run.spent());
     let stats = RefCell::new(stats);
@@ -340,26 +278,23 @@ pub async fn process_pending<F: Fetcher, L: Llm, E: Embedder>(
 }
 
 /// Shared state of a run. Pages run concurrently on one task, so the database
-/// and embeddings are only borrowed between awaits, never across one.
-struct Run<'r, 'e, F, L, E: Embedder> {
+/// is only borrowed between awaits, never across one.
+struct Run<'r, F, L> {
     db: RefCell<&'r mut Db>,
     fetcher: &'r F,
     llm: &'r L,
-    embeddings: RefCell<Option<&'r mut Embeddings<'e, E>>>,
     config: &'r Config,
     lang: &'r LangMode,
     domains: DomainLimiter,
-    progress: &'r Progress,
     /// Pages in a row that failed at the model.
     model_failures: Cell<usize>,
     fetch_secs: Cell<f64>,
     model_secs: Cell<f64>,
     pages_cut: Cell<usize>,
     model_pages: Cell<usize>,
-    /// Tokens and cost already spent when the pages started, e.g. on filling
-    /// in missing vectors; not part of what a page costs.
+    /// Tokens and cost already spent when the pages started; not part of
+    /// what a page costs.
     spent_before: Cell<(u64, f64)>,
-    spent_elsewhere: (u64, f64),
 }
 
 /// After this many pages in a row fail at the model, the problem is most
@@ -368,7 +303,7 @@ struct Run<'r, 'e, F, L, E: Embedder> {
 /// really are bad; --retry-failed brings them back after a settings fix.
 const MODEL_FAILURE_STREAK: usize = 5;
 
-impl<F: Fetcher, L: Llm, E: Embedder> Run<'_, '_, F, L, E> {
+impl<F: Fetcher, L: Llm> Run<'_, F, L> {
     /// Whether starting another page could cross a budget limit: the tokens
     /// and cost so far, plus what the `in_flight` pages will likely add at
     /// the average of the `finished` ones.
@@ -409,26 +344,15 @@ impl<F: Fetcher, L: Llm, E: Embedder> Run<'_, '_, F, L, E> {
         None
     }
 
-    /// Tokens and cost of the run so far, summaries and embeddings together.
+    /// Tokens and cost of the run's summaries so far.
     fn spent(&self) -> (u64, f64) {
         let summaries = self.llm.usage();
-        let embeddings = self
-            .embeddings
-            .borrow()
-            .as_deref()
-            .map(|e| e.embedder.usage())
-            .unwrap_or_default();
         let cost = self
             .config
             .llm
             .prices()
-            .cost(summaries.input_tokens, summaries.output_tokens)
-            + embeddings.input_tokens as f64 * self.config.embeddings.price_per_mtok / 1e6;
-        let (other_tokens, other_cost) = self.spent_elsewhere;
-        (
-            summaries.total_tokens() + embeddings.total_tokens() + other_tokens,
-            cost + other_cost,
-        )
+            .cost(summaries.input_tokens, summaries.output_tokens);
+        (summaries.total_tokens(), cost)
     }
 
     async fn process(&self, page: &PendingPage) -> Outcome {
@@ -531,22 +455,17 @@ impl<F: Fetcher, L: Llm, E: Embedder> Run<'_, '_, F, L, E> {
         // Resolving and saving happen without an await in between, so two
         // pages can't create the same tag twice.
         let title = summary.title.trim();
-        let text = summary.summary.trim();
-        let created = {
-            let mut db = self.db.borrow_mut();
-            let ResolvedTags { page_tags, created } = resolve_tags(&db, &summary, &self.config.tags)?;
-            let language = summary.language.trim().to_ascii_lowercase();
-            let result = PageResult {
-                title,
-                summary: text,
-                lang: (!language.is_empty()).then_some(language.as_str()),
-                tags: &page_tags,
-                page_title: page_title.as_deref(),
-            };
-            db.save_result(page.id, &result).context("saving result")?;
-            created
+        let mut db = self.db.borrow_mut();
+        let page_tags = resolve_tags(&db, &summary, &self.config.tags)?;
+        let language = summary.language.trim().to_ascii_lowercase();
+        let result = PageResult {
+            title,
+            summary: summary.summary.trim(),
+            lang: (!language.is_empty()).then_some(language.as_str()),
+            tags: &page_tags,
+            page_title: page_title.as_deref(),
         };
-        self.store_vectors(page.id, title, text, created).await?;
+        db.save_result(page.id, &result).context("saving result")?;
         Ok(Outcome::Done(title.to_string()))
     }
 
@@ -608,72 +527,13 @@ impl<F: Fetcher, L: Llm, E: Embedder> Run<'_, '_, F, L, E> {
         }
         Ok(())
     }
-
-    /// Stores the page's vector (for the end-of-run tag reconciliation) and
-    /// its new tags' vectors, so the next pages can be shown them. The page is
-    /// already saved, so a failure only costs vectors: the tags are retried
-    /// with the next page, and the next run fills in anything still missing.
-    async fn store_vectors(
-        &self,
-        page_id: i64,
-        title: &str,
-        text: &str,
-        created: Vec<(i64, String)>,
-    ) -> Result<()> {
-        let (embedder, tags) = {
-            let mut embeddings = self.embeddings.borrow_mut();
-            let Some(e) = embeddings.as_deref_mut() else {
-                return Ok(());
-            };
-            let mut tags = std::mem::take(&mut e.unstored_tags);
-            tags.extend(created);
-            (e.embedder, tags)
-        };
-        let mut texts: Vec<String> = tags.iter().map(|(_, text)| text.clone()).collect();
-        texts.push(page_embedding_text(title, text));
-        let result = embedder.embed(&texts).await;
-
-        let mut embeddings = self.embeddings.borrow_mut();
-        let e = embeddings.as_deref_mut().expect("embeddings were checked above");
-        let mut vectors = match result {
-            Ok(vectors) => vectors,
-            Err(err) => {
-                e.unstored_tags.extend(tags);
-                e.note_error(
-                    self.progress,
-                    "storing vectors for new tags",
-                    "the tags are retried with the next page, and the next run fills in missing vectors",
-                    &err,
-                );
-                return Ok(());
-            }
-        };
-        let db = self.db.borrow();
-        let model = embedder.model();
-        db.put_embedding(
-            EmbeddingKind::Page,
-            page_id,
-            model,
-            &vectors.pop().expect("one vector per text"),
-        )?;
-        for ((id, _), vector) in tags.into_iter().zip(vectors) {
-            db.put_embedding(EmbeddingKind::Tag, id, model, &vector)?;
-        }
-        Ok(())
-    }
-}
-
-struct ResolvedTags {
-    /// (raw tag as the model wrote it, tag id) for the page.
-    page_tags: Vec<(String, i64)>,
-    /// (tag id, text to embed) for each tag created for this page.
-    created: Vec<(i64, String)>,
 }
 
 /// Normalizes the model's tags, maps spelling variants to existing tags,
 /// enforces the per-page limits, and creates new tags with their
-/// descriptions.
-fn resolve_tags(db: &Db, summary: &PageSummary, limits: &TagConfig) -> Result<ResolvedTags> {
+/// descriptions. Returns (raw tag as the model wrote it, tag id) for each of
+/// the page's tags.
+fn resolve_tags(db: &Db, summary: &PageSummary, limits: &TagConfig) -> Result<Vec<(String, i64)>> {
     let descriptions: HashMap<String, &str> = summary
         .tags
         .iter()
@@ -688,7 +548,7 @@ fn resolve_tags(db: &Db, summary: &PageSummary, limits: &TagConfig) -> Result<Re
 
     let mut seen = HashSet::new();
     let mut resolved = Vec::new();
-    let mut created = Vec::new();
+    let mut created = 0;
     for raw in summary.tags.iter().map(|t| &t.name) {
         if resolved.len() >= limits.max_per_page {
             break;
@@ -703,7 +563,7 @@ fn resolve_tags(db: &Db, summary: &PageSummary, limits: &TagConfig) -> Result<Re
             }
             None => {
                 // Over the new-tag limit: skip, unless the page would end up untagged.
-                if created.len() >= limits.max_new_per_page && !resolved.is_empty() {
+                if created >= limits.max_new_per_page && !resolved.is_empty() {
                     continue;
                 }
                 // Without a description from the model, naming the page the tag
@@ -713,19 +573,15 @@ fn resolve_tags(db: &Db, summary: &PageSummary, limits: &TagConfig) -> Result<Re
                     Some(d) => d.to_string(),
                     None => format!("first used for: {}", summary.title.trim()),
                 };
-                let id = db.create_tag(&name, Some(&description))?;
-                created.push((id, tag_embedding_text(&name, Some(&description))));
-                id
+                created += 1;
+                db.create_tag(&name, Some(&description))?
             }
         };
         if seen.insert(id) {
             resolved.push((raw.clone(), id));
         }
     }
-    Ok(ResolvedTags {
-        page_tags: resolved,
-        created,
-    })
+    Ok(resolved)
 }
 
 #[cfg(test)]
@@ -813,75 +669,6 @@ mod tests {
         }
     }
 
-    /// Bag-of-words vectors: texts sharing words are similar.
-    struct FakeEmbedder;
-
-    impl Embedder for FakeEmbedder {
-        fn model(&self) -> &str {
-            "fake"
-        }
-
-        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-            Ok(texts
-                .iter()
-                .map(|text| {
-                    let mut v = vec![0.0f32; 32];
-                    for word in text
-                        .to_lowercase()
-                        .split(|c: char| !c.is_alphanumeric())
-                        .filter(|w| w.len() > 2)
-                    {
-                        let h = word
-                            .bytes()
-                            .fold(7u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32));
-                        v[h as usize % 32] += 1.0;
-                    }
-                    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
-                    v.into_iter().map(|x| x / norm).collect()
-                })
-                .collect())
-        }
-    }
-
-    /// Works while a run is being prepared, then fails the chosen requests:
-    /// embedding a page before the model call ("query"), or storing a
-    /// finished page's vectors ("store"). Store requests number from 0;
-    /// those in `failing_stores` fail.
-    struct FlakyEmbedder {
-        failing_stores: std::ops::Range<usize>,
-        stores: std::cell::Cell<usize>,
-    }
-
-    impl FlakyEmbedder {
-        fn new(failing_stores: std::ops::Range<usize>) -> Self {
-            Self {
-                failing_stores,
-                stores: Default::default(),
-            }
-        }
-    }
-
-    impl Embedder for FlakyEmbedder {
-        fn model(&self) -> &str {
-            "fake"
-        }
-
-        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-            let is_probe = texts.len() == 1 && texts[0] == "tabkeeper";
-            let fails = if is_probe {
-                false
-            } else {
-                let n = self.stores.get();
-                self.stores.set(n + 1);
-                self.failing_stores.contains(&n)
-            };
-            if fails {
-                bail!("embeddings server returned HTTP 500");
-            }
-            FakeEmbedder.embed(texts).await
-        }
-    }
-
     fn summary(title: &str, tags: &[&str], new: &[(&str, &str)]) -> PageSummary {
         PageSummary {
             title: title.into(),
@@ -914,7 +701,6 @@ mod tests {
             db,
             &FakeFetcher,
             llm,
-            None::<&mut Embeddings<FakeEmbedder>>,
             &RunOptions {
                 config: &Config::default(),
                 lang: &LangMode::English,
@@ -922,28 +708,6 @@ mod tests {
                 limit: None,
                 budget: Budget::default(),
                 progress_to_stderr: false,
-                spent_elsewhere: (0, 0.0),
-            },
-        )
-        .await
-        .and_then(RunSummary::into_result)
-    }
-
-    async fn run_with_embeddings(db: &mut Db, llm: &FakeLlm, config: &Config) -> Result<Stats> {
-        let mut embeddings = Embeddings::prepare(db, &FakeEmbedder).await.unwrap();
-        process_pending(
-            db,
-            &FakeFetcher,
-            llm,
-            Some(&mut embeddings),
-            &RunOptions {
-                config,
-                lang: &LangMode::English,
-                filter: &Filter::default(),
-                limit: None,
-                budget: Budget::default(),
-                progress_to_stderr: false,
-                spent_elsewhere: (0, 0.0),
             },
         )
         .await
@@ -1202,7 +966,6 @@ mod tests {
             &mut db,
             &FakeFetcher,
             &llm,
-            None::<&mut Embeddings<FakeEmbedder>>,
             &RunOptions {
                 config: &Config::default(),
                 lang: &LangMode::English,
@@ -1210,7 +973,6 @@ mod tests {
                 limit: None,
                 budget: Budget::default(),
                 progress_to_stderr: false,
-                spent_elsewhere: (0, 0.0),
             },
         )
         .await
@@ -1250,7 +1012,6 @@ mod tests {
             &mut db,
             &FakeFetcher,
             &llm,
-            None::<&mut Embeddings<FakeEmbedder>>,
             &RunOptions {
                 config: &config,
                 lang: &LangMode::English,
@@ -1258,7 +1019,6 @@ mod tests {
                 limit: None,
                 budget: Budget::default(),
                 progress_to_stderr: false,
-                spent_elsewhere: (0, 0.0),
             },
         )
         .await
@@ -1317,157 +1077,6 @@ mod tests {
         run(&mut db, &llm).await.unwrap();
         // Two new tags per page by default.
         assert_eq!(page_tag_names(&db), ["a", "b"]);
-    }
-
-    #[tokio::test]
-    async fn every_tag_and_page_gets_a_vector() {
-        let mut db = db_with(&[
-            "https://a.com/rust",
-            "https://b.com/bread",
-            "https://c.com/bread-again",
-        ]);
-        let llm = FakeLlm::new(vec![
-            Ok(summary(
-                "Rust",
-                &["rust-programming", "memory-safety", "systems-programming"],
-                &[(
-                    "rust-programming",
-                    "Rust is a systems programming language focused on safety",
-                )],
-            )),
-            Ok(summary(
-                "Bread",
-                &["sourdough", "baking"],
-                &[("sourdough", "Sourdough bread leavened with wild yeast")],
-            )),
-            Ok(summary("Bread again", &["sourdough"], &[])),
-        ]);
-        run_with_embeddings(&mut db, &llm, &Config::default())
-            .await
-            .unwrap();
-
-        // Every tag and every page has a vector now.
-        assert!(db.tags_missing_embedding("fake").unwrap().is_empty());
-        assert!(db.pages_missing_embedding("fake").unwrap().is_empty());
-        assert_eq!(db.embeddings(EmbeddingKind::Page, "fake").unwrap().len(), 3);
-    }
-
-    #[tokio::test]
-    async fn failed_vector_storage_keeps_the_page_and_is_backfilled() {
-        let mut db = db_with(&["https://a.com/", "https://b.com/"]);
-        let llm = FakeLlm::new(vec![
-            Ok(summary("First", &["alpha"], &[])),
-            Ok(summary("Second", &["beta"], &[])),
-        ]);
-        let embedder = FlakyEmbedder::new(0..usize::MAX);
-        let mut embeddings = Embeddings::prepare(&db, &embedder).await.unwrap();
-        let stats = process_pending(
-            &mut db,
-            &FakeFetcher,
-            &llm,
-            Some(&mut embeddings),
-            &RunOptions {
-                config: &Config::default(),
-                lang: &LangMode::English,
-                filter: &Filter::default(),
-                limit: None,
-                budget: Budget::default(),
-                progress_to_stderr: false,
-                spent_elsewhere: (0, 0.0),
-            },
-        )
-        .await
-        .unwrap()
-        .into_result()
-        .unwrap();
-        assert_eq!(
-            stats,
-            Stats {
-                done: 2,
-                model_pages: 2,
-                ..Stats::default()
-            }
-        );
-        assert_eq!(embeddings.errors, 2);
-        // Every store failed: both tags and both page vectors are missing.
-        let missing: Vec<String> = db
-            .tags_missing_embedding("fake")
-            .unwrap()
-            .into_iter()
-            .map(|(_, text)| text)
-            .collect();
-        assert_eq!(
-            missing,
-            ["alpha: first used for: First", "beta: first used for: Second"]
-        );
-        assert_eq!(db.pages_missing_embedding("fake").unwrap().len(), 2);
-        // The next run fills in what's missing.
-        Embeddings::prepare(&db, &FakeEmbedder).await.unwrap();
-        assert!(db.tags_missing_embedding("fake").unwrap().is_empty());
-        assert!(db.pages_missing_embedding("fake").unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn tags_from_a_failed_store_are_stored_with_the_next_page() {
-        let mut db = db_with(&[
-            "https://a.com/bread",
-            "https://b.com/rust",
-            "https://c.com/rust-again",
-        ]);
-        let llm = FakeLlm::new(vec![
-            Ok(summary(
-                "Bread",
-                &["sourdough"],
-                &[("sourdough", "Sourdough bread leavened with wild yeast")],
-            )),
-            Ok(summary(
-                "Rust",
-                &["rust-programming"],
-                &[(
-                    "rust-programming",
-                    "Rust is a systems programming language focused on safety",
-                )],
-            )),
-            Ok(summary("Rust again", &["rust-programming"], &[])),
-        ]);
-        // The bread page's vectors are stored; the first rust page's store fails.
-        let embedder = FlakyEmbedder::new(1..2);
-        let mut embeddings = Embeddings::prepare(&db, &embedder).await.unwrap();
-        let config = Config::default();
-        process_pending(
-            &mut db,
-            &FakeFetcher,
-            &llm,
-            Some(&mut embeddings),
-            &RunOptions {
-                config: &config,
-                lang: &LangMode::English,
-                filter: &Filter::default(),
-                limit: None,
-                budget: Budget::default(),
-                progress_to_stderr: false,
-                spent_elsewhere: (0, 0.0),
-            },
-        )
-        .await
-        .unwrap()
-        .into_result()
-        .unwrap();
-        assert_eq!(embeddings.errors, 1);
-        // rust-programming's vector failed with the second page and was
-        // stored with the third.
-        assert!(db.tags_missing_embedding("fake").unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn prepare_backfills_missing_vectors() {
-        let mut db = db_with(&["https://a.com/"]);
-        let llm = FakeLlm::new(vec![Ok(summary("T", &["alpha", "beta"], &[]))]);
-        run(&mut db, &llm).await.unwrap(); // without embeddings
-        assert_eq!(db.tags_missing_embedding("fake").unwrap().len(), 2);
-        Embeddings::prepare(&db, &FakeEmbedder).await.unwrap();
-        assert!(db.tags_missing_embedding("fake").unwrap().is_empty());
-        assert!(db.pages_missing_embedding("fake").unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1541,17 +1150,10 @@ mod tests {
             limit: None,
             budget,
             progress_to_stderr: false,
-            spent_elsewhere: (0, 0.0),
         };
-        let summary = process_pending(
-            &mut db,
-            &FakeFetcher,
-            &llm,
-            None::<&mut Embeddings<FakeEmbedder>>,
-            &options,
-        )
-        .await
-        .unwrap();
+        let summary = process_pending(&mut db, &FakeFetcher, &llm, &options)
+            .await
+            .unwrap();
         // 100 tokens per page: the third page reaches 300 of 250.
         assert_eq!(summary.stats.done, 3);
         assert!(
@@ -1589,17 +1191,10 @@ mod tests {
                 max_cost: None,
             },
             progress_to_stderr: false,
-            spent_elsewhere: (0, 0.0),
         };
-        let summary = process_pending(
-            &mut db,
-            &FakeFetcher,
-            &llm,
-            None::<&mut Embeddings<FakeEmbedder>>,
-            &options,
-        )
-        .await
-        .unwrap();
+        let summary = process_pending(&mut db, &FakeFetcher, &llm, &options)
+            .await
+            .unwrap();
         // After the first page (100 tokens), pages start while 100 used plus
         // 100 for each page running stays under 350: three more, not seven.
         assert_eq!(summary.stats.done, 4);
@@ -1620,7 +1215,7 @@ mod tests {
                 .map(|i| Ok(summary(&format!("P{i}"), &["t"], &[])))
                 .collect(),
         );
-        // 2,000 tokens already used before the first page, like filling in vectors.
+        // 2,000 tokens already used before the first page.
         llm.requests.set(20);
         let mut config = Config::default();
         config.run.sequential_start = 1;
@@ -1635,59 +1230,12 @@ mod tests {
                 max_cost: None,
             },
             progress_to_stderr: false,
-            spent_elsewhere: (0, 0.0),
         };
-        let summary = process_pending(
-            &mut db,
-            &FakeFetcher,
-            &llm,
-            None::<&mut Embeddings<FakeEmbedder>>,
-            &options,
-        )
-        .await
-        .unwrap();
+        let summary = process_pending(&mut db, &FakeFetcher, &llm, &options)
+            .await
+            .unwrap();
         // Pages cost 100 each, not 2,100: same as without the earlier 2,000.
         assert_eq!(summary.stats.done, 4);
-    }
-
-    #[tokio::test]
-    async fn tokens_spent_elsewhere_count_toward_the_budget() {
-        let urls: Vec<String> = (0..5).map(|i| format!("https://site{i}.com/")).collect();
-        let mut db = db_with(&urls.iter().map(String::as_str).collect::<Vec<_>>());
-        let llm = FakeLlm::new(
-            (0..5)
-                .map(|i| Ok(summary(&format!("P{i}"), &["t"], &[])))
-                .collect(),
-        );
-        let options = RunOptions {
-            config: &Config::default(),
-            lang: &LangMode::English,
-            filter: &Filter::default(),
-            limit: None,
-            budget: Budget {
-                max_tokens: Some(1_150),
-                max_cost: None,
-            },
-            progress_to_stderr: false,
-            // E.g. a failed embeddings setup.
-            spent_elsewhere: (1_000, 0.0),
-        };
-        let summary = process_pending(
-            &mut db,
-            &FakeFetcher,
-            &llm,
-            None::<&mut Embeddings<FakeEmbedder>>,
-            &options,
-        )
-        .await
-        .unwrap();
-        // 1,000 + 100 per page: the second page reaches 1,200 of 1,150.
-        assert_eq!(summary.stats.done, 2);
-        assert!(
-            matches!(&summary.stop, Some(Stop::Budget(reason)) if reason.contains("1200 of 1150")),
-            "{:?}",
-            summary.stop
-        );
     }
 
     #[tokio::test]
@@ -1711,17 +1259,10 @@ mod tests {
                 max_cost: Some(1.5),
             },
             progress_to_stderr: false,
-            spent_elsewhere: (0, 0.0),
         };
-        let summary = process_pending(
-            &mut db,
-            &FakeFetcher,
-            &llm,
-            None::<&mut Embeddings<FakeEmbedder>>,
-            &options,
-        )
-        .await
-        .unwrap();
+        let summary = process_pending(&mut db, &FakeFetcher, &llm, &options)
+            .await
+            .unwrap();
         assert_eq!(summary.stats.done, 2);
         assert!(
             matches!(&summary.stop, Some(Stop::Budget(reason)) if reason.contains("$1.60 of $1.50")),

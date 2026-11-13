@@ -22,6 +22,11 @@ pub trait Embedder {
     }
 }
 
+/// Fails if the embeddings server or model can't be used.
+pub async fn check<E: Embedder>(embedder: &E) -> Result<()> {
+    embedder.embed(&["tabkeeper".to_string()]).await.map(drop)
+}
+
 /// Client for the `/embeddings` endpoint of OpenAI-compatible servers
 /// (Ollama, LM Studio, llama.cpp, vLLM, OpenAI).
 pub struct OpenAiEmbedder {

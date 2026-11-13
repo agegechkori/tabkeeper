@@ -177,16 +177,16 @@ pub struct StatusCounts {
     pub unreachable: usize,
 }
 
+/// What a stored vector is of. Earlier versions also stored tag vectors
+/// ("tag"); nothing reads those.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EmbeddingKind {
-    Tag,
     Page,
 }
 
 impl EmbeddingKind {
     fn as_str(self) -> &'static str {
         match self {
-            Self::Tag => "tag",
             Self::Page => "page",
         }
     }
@@ -683,22 +683,6 @@ impl Db {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Text to embed for every tag that has no vector for `model` yet.
-    pub fn tags_missing_embedding(&self, model: &str) -> Result<Vec<(i64, String)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT t.id, t.name, t.description FROM tags t
-             WHERE NOT EXISTS (SELECT 1 FROM embeddings e WHERE e.kind = 'tag' AND e.ref_id = t.id AND e.model = ?1)
-             ORDER BY t.id",
-        )?;
-        let rows = stmt.query_map([model], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                tag_embedding_text(&r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?.as_deref()),
-            ))
-        })?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
-    }
-
     /// Text to embed for every done page that has no vector for `model` yet.
     pub fn pages_missing_embedding(&self, model: &str) -> Result<Vec<(i64, String)>> {
         let mut stmt = self.conn.prepare(
@@ -771,15 +755,6 @@ fn migrate_v2_to_v3(conn: &Connection) -> Result<()> {
     conn.pragma_update(None, "foreign_keys", "ON")?;
     result.context("upgrading the database to version 3")?;
     Ok(())
-}
-
-/// What is embedded for a tag: its name, which is kebab-case, plus its description.
-pub fn tag_embedding_text(name: &str, description: Option<&str>) -> String {
-    let words = name.replace('-', " ");
-    match description {
-        Some(d) if !d.trim().is_empty() => format!("{words}: {}", d.trim()),
-        _ => words,
-    }
 }
 
 /// What is embedded for a processed page: its title and summary.
@@ -868,26 +843,6 @@ mod tests {
     #[test]
     fn embeddings_round_trip_and_missing_lists() {
         let mut db = Db::open_in_memory().unwrap();
-        let rust = db
-            .create_tag("rust-programming", Some("The Rust language"))
-            .unwrap();
-        let go = db.create_tag("go", None).unwrap();
-        db.put_embedding(EmbeddingKind::Tag, rust, "m", &[0.6, -0.8])
-            .unwrap();
-        assert_eq!(
-            db.embeddings(EmbeddingKind::Tag, "m").unwrap(),
-            [(rust, vec![0.6, -0.8])]
-        );
-        assert_eq!(db.tags_missing_embedding("m").unwrap(), [(go, "go".to_string())]);
-        // A different model needs its own vectors.
-        assert_eq!(
-            db.tags_missing_embedding("other").unwrap(),
-            [
-                (rust, "rust programming: The Rust language".to_string()),
-                (go, "go".to_string())
-            ]
-        );
-
         db.add_page("https://a.com/", "https://a.com/", None, "import")
             .unwrap();
         let page = db.pending_pages().unwrap()[0].id;
@@ -910,6 +865,15 @@ mod tests {
             db.pages_missing_embedding("m").unwrap(),
             [(page, "T\nS.".to_string())]
         );
+        db.put_embedding(EmbeddingKind::Page, page, "m", &[0.6, -0.8])
+            .unwrap();
+        assert_eq!(
+            db.embeddings(EmbeddingKind::Page, "m").unwrap(),
+            [(page, vec![0.6, -0.8])]
+        );
+        assert!(db.pages_missing_embedding("m").unwrap().is_empty());
+        // A different model needs its own vectors.
+        assert_eq!(db.pages_missing_embedding("other").unwrap().len(), 1);
     }
 
     /// The version 2 schema, as released in phase 2a.

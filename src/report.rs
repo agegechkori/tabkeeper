@@ -559,9 +559,9 @@ pub fn warnings(report: &Report) -> Vec<String> {
     }
     if let Some(embeddings) = report.model.embeddings.as_ref().filter(|e| e.errors > 0) {
         out.push(format!(
-            "{} embedding requests failed; affected pages were shown the most used tags. The next run fills in \
-             missing vectors.",
-            embeddings.errors
+            "The embedding model {} didn't work, so the tag review can't build the tag vocabulary and leaves the \
+             tags as they are. If it is missing on Ollama, run: ollama pull {}",
+            embeddings.model, embeddings.model
         ));
     }
     out
@@ -709,8 +709,6 @@ pub fn text(report: &Report) -> String {
             duration(e.usage.request_secs)
         )
         .unwrap();
-    } else {
-        out.push_str("  Embeddings  not used (the model was shown the most used tags)\n");
     }
     let u = &s.usage;
     writeln!(

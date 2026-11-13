@@ -232,8 +232,9 @@ async fn run(cli: Cli) -> Result<()> {
                 config.llm.model, config.llm.base_url
             ));
 
-            // Embeddings are optional: any problem setting them up is a warning,
-            // and the tag review then leaves the tags as they are.
+            // Embeddings are optional: any problem with them is a warning, and
+            // the tag review then leaves the tags as they are. Only the review
+            // uses them; checking them here says so before the pages start.
             let unavailable = |err: anyhow::Error| {
                 say(&format!(
                     "Warning: embeddings are unavailable ({err:#}).\n\
@@ -249,27 +250,21 @@ async fn run(cli: Cli) -> Result<()> {
             } else {
                 None
             };
-            let mut embeddings = None;
+            let mut embed_errors = 0;
             if let Some(embedder) = &embedder {
-                match pipeline::Embeddings::prepare(&db, embedder).await {
-                    Ok(e) => {
-                        say(&format!(
-                            "Using embedding model {} for the tag review.",
-                            config.embeddings.model
-                        ));
-                        embeddings = Some(e);
+                match embed::check(embedder).await {
+                    Ok(()) => say(&format!(
+                        "Using embedding model {} for the tag review.",
+                        config.embeddings.model
+                    )),
+                    Err(err) => {
+                        embed_errors = 1;
+                        unavailable(err);
                     }
-                    Err(err) => unavailable(err),
                 }
             }
 
             let budget = pipeline::Budget { max_tokens, max_cost };
-            // An embeddings setup that failed partway still spent tokens: count
-            // them toward the budget, since the run only tracks working embeddings.
-            let failed_setup = match (&embedder, &embeddings) {
-                (Some(embedder), None) => embed::Embedder::usage(embedder),
-                _ => usage::StageUsage::default(),
-            };
             let options = pipeline::RunOptions {
                 config: &config,
                 lang: &lang,
@@ -277,13 +272,8 @@ async fn run(cli: Cli) -> Result<()> {
                 limit,
                 budget,
                 progress_to_stderr: json,
-                spent_elsewhere: (
-                    failed_setup.total_tokens(),
-                    failed_setup.input_tokens as f64 * config.embeddings.price_per_mtok / 1e6,
-                ),
             };
-            let result =
-                pipeline::process_pending(&mut db, &fetcher, &llm, embeddings.as_mut(), &options).await;
+            let result = pipeline::process_pending(&mut db, &fetcher, &llm, &options).await;
 
             // Render and report whatever was finished, even if the run stopped early.
             render::render_all(&db, &cli.out, config.notes.title, config.tags.style)?;
@@ -304,12 +294,12 @@ async fn run(cli: Cli) -> Result<()> {
             } else {
                 None
             };
-            let embed_usage = match (&embedder, &embeddings) {
-                (Some(embedder), Some(e)) => Some((embed::Embedder::usage(embedder), e.errors)),
-                // The setup failed: report what it used, and count the failure.
-                (Some(_), None) if failed_setup.requests > 0 => Some((failed_setup.clone(), 1)),
-                _ => None,
-            };
+            // The import embeds nothing but the check: the report only
+            // mentions embeddings if they didn't work.
+            let embed_usage = embedder
+                .as_ref()
+                .filter(|_| embed_errors > 0)
+                .map(|e| (embed::Embedder::usage(e), embed_errors));
             let ctx = report::RunContext {
                 started_at: &started_at,
                 started,
@@ -434,8 +424,7 @@ async fn review_tags(
             return outcome;
         }
     };
-    // Without embeddings, only plural/singular pairs are checked. Vectors
-    // missing from earlier runs are filled in first: splits need page vectors.
+    // Without embeddings, only plural/singular pairs are checked.
     let embedder = if config.embeddings.enabled {
         embed::OpenAiEmbedder::new(&config.embeddings, &config.llm).ok()
     } else {
@@ -443,7 +432,7 @@ async fn review_tags(
     };
     let mut usable = embedder.as_ref();
     if let Some(e) = usable {
-        if let Err(err) = pipeline::Embeddings::prepare(db, e).await {
+        if let Err(err) = embed::check(e).await {
             say(&format!(
                 "Warning: embeddings are unavailable ({err:#}); the review only checks plural/singular pairs."
             ));
