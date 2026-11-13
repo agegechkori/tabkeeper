@@ -24,12 +24,15 @@ pub struct Config {
 pub struct ReconcileConfig {
     /// Review the tags at the end of every `import` run.
     pub at_end_of_run: bool,
-    /// Model for the review; defaults to `llm.model`. A stronger model, or
-    /// thinking left on, pays off here: the review is a few requests per run.
+    /// Model for the review; defaults to `llm.model`. The review asks about
+    /// every page once (which tags fit it), with short replies.
     pub model: Option<String>,
     /// Replaces `llm.extra_body` for the review, e.g. `{}` to let a thinking
     /// model think.
     pub extra_body: Option<serde_json::Map<String, serde_json::Value>>,
+    /// Replaces `llm.max_output_tokens` for the review, e.g. for a review
+    /// model that thinks: thinking counts toward the limit.
+    pub max_output_tokens: Option<u32>,
     /// Tags whose embeddings are at least this similar are checked for being
     /// the same tag (cosine similarity, 0 to 1).
     pub similarity: f32,
@@ -59,6 +62,7 @@ impl Default for ReconcileConfig {
             at_end_of_run: true,
             model: None,
             extra_body: None,
+            max_output_tokens: None,
             similarity: 0.80,
             split_min_pages: 2,
             vocabulary: true,
@@ -80,6 +84,9 @@ impl ReconcileConfig {
         }
         if let Some(extra_body) = &self.extra_body {
             config.extra_body = extra_body.clone();
+        }
+        if let Some(cap) = self.max_output_tokens {
+            config.max_output_tokens = cap;
         }
         config
     }
@@ -388,5 +395,14 @@ mod tests {
         assert_eq!(c.llm.model, "qwen3:8b");
         assert_eq!(c.llm.base_url, "http://localhost:11434/v1");
         assert_eq!(c.tags.max_depth, 3);
+    }
+
+    #[test]
+    fn the_review_can_have_its_own_reply_limit() {
+        let c = Config::parse("[llm]\nmax_output_tokens = 800").unwrap();
+        assert_eq!(c.reconcile.llm_config(&c.llm).max_output_tokens, 800);
+        let c = Config::parse("[llm]\nmax_output_tokens = 800\n[reconcile]\nmax_output_tokens = 0").unwrap();
+        assert_eq!(c.llm.max_output_tokens, 800);
+        assert_eq!(c.reconcile.llm_config(&c.llm).max_output_tokens, 0);
     }
 }

@@ -260,7 +260,7 @@ impl OpenAiCompatible {
         if let Ok(value) = serde_json::from_str::<Value>(&text) {
             self.usage.update(|u| u.record_response(&value, elapsed));
         }
-        message_content(&text)
+        message_content(&text, self.config.max_output_tokens)
     }
 }
 
@@ -411,17 +411,30 @@ fn is_model_timeout(err: &reqwest::Error) -> bool {
 }
 
 /// The reply text of a successful chat response. A reply without content,
-/// such as a refusal, is a problem with this page, not with the server.
-fn message_content(body: &str) -> Result<String> {
+/// such as a refusal, is a problem with this page, not with the server. So is
+/// a reply cut off before its JSON is complete: asking again would most
+/// likely cut it off again, so the error says where it was cut off. `cap` is
+/// the request's `max_output_tokens`.
+fn message_content(body: &str, cap: u32) -> Result<String> {
     let value: Value = serde_json::from_str(body).map_err(|_| {
         PageRejected::invalid_reply(format!("the server's reply isn't JSON: {}", snippet(body)))
     })?;
-    value["choices"][0]["message"]["content"]
-        .as_str()
-        .map(str::to_string)
-        .ok_or_else(|| {
-            PageRejected::invalid_reply(format!("the reply has no message content: {}", snippet(body))).into()
-        })
+    let choice = &value["choices"][0];
+    let content = choice["message"]["content"].as_str();
+    if choice["finish_reason"] == "length" && content.is_none_or(|c| parse_json_object(c).is_err()) {
+        let message = if cap > 0 {
+            format!(
+                "the reply was cut off at {cap} tokens (max_output_tokens); raise the limit, or set it to 0, \
+                 if the model thinks before it answers"
+            )
+        } else {
+            "the reply was cut off: the model's context window is full".to_string()
+        };
+        return Err(PageRejected::invalid_reply(message).into());
+    }
+    content.map(str::to_string).ok_or_else(|| {
+        PageRejected::invalid_reply(format!("the reply has no message content: {}", snippet(body))).into()
+    })
 }
 
 fn snippet(s: &str) -> String {
@@ -460,6 +473,18 @@ fn request_body(config: &LlmConfig, messages: &[Value]) -> Value {
 }
 
 fn request_body_with_schema(config: &LlmConfig, messages: &[Value], name: &str, schema: Value) -> Value {
+    let mut messages = messages.to_vec();
+    if config.structured_output != StructuredOutput::JsonSchema {
+        // The server doesn't hold the reply to the schema, so the prompt
+        // spells it out. Without it qwen3:4b, asked for JSON, left out the
+        // tag descriptions or repeated itself until the server stopped it.
+        if let Some(system) = messages.iter_mut().find(|m| m["role"] == "system") {
+            let prompt = system["content"].as_str().unwrap_or_default();
+            system["content"] = json!(format!(
+                "{prompt}\n\nThe JSON object must match this JSON schema: {schema}"
+            ));
+        }
+    }
     let mut body = json!({
         "model": config.model,
         "messages": messages,
@@ -469,7 +494,7 @@ fn request_body_with_schema(config: &LlmConfig, messages: &[Value], name: &str, 
     // context is full) then ends early as an invalid reply, instead of
     // holding the request until it times out and is retried.
     if config.max_output_tokens > 0 {
-        body["max_tokens"] = json!(config.max_output_tokens);
+        body[cap_field(&config.base_url)] = json!(config.max_output_tokens);
     }
     match config.structured_output {
         StructuredOutput::JsonSchema => {
@@ -485,6 +510,22 @@ fn request_body_with_schema(config: &LlmConfig, messages: &[Value], name: &str, 
         body[key] = value.clone();
     }
     body
+}
+
+/// The request field that caps the reply. OpenAI takes
+/// `max_completion_tokens` for every model, and its reasoning models
+/// (o-series, gpt-5) reject `max_tokens`; other servers, Ollama among them,
+/// only know `max_tokens`.
+fn cap_field(base_url: &str) -> &'static str {
+    let host = reqwest::Url::parse(base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase));
+    match host {
+        Some(host) if host == "api.openai.com" || host.ends_with(".openai.azure.com") => {
+            "max_completion_tokens"
+        }
+        _ => "max_tokens",
+    }
 }
 
 fn language_instruction(request: &SummaryRequest) -> String {
@@ -594,14 +635,75 @@ mod tests {
     #[test]
     fn replies_without_content_are_page_problems() {
         let ok = r#"{"choices":[{"message":{"content":"{}"}}]}"#;
-        assert_eq!(message_content(ok).unwrap(), "{}");
+        assert_eq!(message_content(ok, 1_500).unwrap(), "{}");
         for body in [
             r#"{"choices":[{"message":{"content":null,"refusal":"no"}}]}"#,
             "<html>proxy error</html>",
         ] {
-            let err = message_content(body).unwrap_err();
+            let err = message_content(body, 1_500).unwrap_err();
             let rejected = err.downcast_ref::<PageRejected>().expect("a page-level problem");
             assert_eq!(rejected.kind, "invalid_reply");
+        }
+    }
+
+    #[test]
+    fn a_reply_cut_off_at_the_cap_says_so() {
+        let cut = r#"{"choices":[{"message":{"content":"{\"title\": \"Sau"},"finish_reason":"length"}]}"#;
+        let err = message_content(cut, 1_500).unwrap_err();
+        let rejected = err.downcast_ref::<PageRejected>().expect("a page-level problem");
+        assert_eq!(rejected.kind, "invalid_reply");
+        assert!(format!("{err:#}").contains("cut off at 1500 tokens (max_output_tokens)"));
+        // Thinking that filled the cap leaves no content at all.
+        let thought = r#"{"choices":[{"message":{"content":""},"finish_reason":"length"}]}"#;
+        assert!(format!("{:#}", message_content(thought, 1_500).unwrap_err()).contains("max_output_tokens"));
+        assert!(format!("{:#}", message_content(cut, 0).unwrap_err()).contains("context window"));
+        // A complete reply that ran on past its JSON is kept.
+        let complete = r#"{"choices":[{"message":{"content":"{\"a\": 1}\n\n\n"},"finish_reason":"length"}]}"#;
+        assert_eq!(message_content(complete, 1_500).unwrap(), "{\"a\": 1}\n\n\n");
+    }
+
+    #[test]
+    fn openai_gets_its_name_for_the_cap() {
+        let mut config = LlmConfig::default();
+        for url in [
+            "https://api.openai.com/v1",
+            "https://team.openai.azure.com/openai/v1",
+        ] {
+            config.base_url = url.into();
+            let body = request_body(&config, &[]);
+            assert_eq!(body["max_completion_tokens"], 1_500, "{url}");
+            assert!(body.get("max_tokens").is_none(), "{url}");
+        }
+        for url in [
+            "http://localhost:11434/v1",
+            "https://openrouter.ai/api/v1",
+            "not a url",
+        ] {
+            config.base_url = url.into();
+            assert_eq!(request_body(&config, &[])["max_tokens"], 1_500, "{url}");
+        }
+    }
+
+    #[test]
+    fn without_a_strict_schema_the_prompt_carries_it() {
+        let messages = [
+            json!({"role": "system", "content": "Summarize."}),
+            json!({"role": "user", "content": "Page"}),
+        ];
+        let mut config = LlmConfig::default();
+        let body = request_body(&config, &messages);
+        assert_eq!(body["messages"][0]["content"], "Summarize.");
+        for mode in [StructuredOutput::JsonObject, StructuredOutput::None] {
+            config.structured_output = mode;
+            let body = request_body(&config, &messages);
+            assert_eq!(
+                body["messages"][0]["content"],
+                format!(
+                    "Summarize.\n\nThe JSON object must match this JSON schema: {}",
+                    response_schema()
+                )
+            );
+            assert_eq!(body["messages"][1]["content"], "Page");
         }
     }
 
