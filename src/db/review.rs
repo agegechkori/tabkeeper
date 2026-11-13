@@ -315,72 +315,82 @@ impl Db {
 
     /// Undoes the latest tag review: all its applied revisions, the latest
     /// first (the tree placements before the retag they were made after).
+    /// It is one transaction, so if a revision can't be undone, none is.
     /// A revision from before reviews were numbered is undone on its own.
     /// Returns the revisions undone and how many changes they had, or `None`
     /// if there is nothing to undo.
     pub fn undo_last_review(&mut self) -> Result<Option<(Vec<i64>, usize)>> {
-        let latest = |db: &Db| -> Result<Option<Option<i64>>> {
-            Ok(db
-                .conn
-                .query_row(
-                    "SELECT review FROM revisions WHERE status = 'applied' ORDER BY id DESC LIMIT 1",
-                    [],
-                    |r| r.get(0),
-                )
-                .optional()?)
-        };
-        let Some(review) = latest(self)? else {
+        let tx = self.conn.transaction()?;
+        let Some(review) = latest_review(&tx)? else {
             return Ok(None);
         };
         let mut undone = Vec::new();
         let mut changes = 0;
-        loop {
-            let Some((id, n)) = self.undo_last_revision()? else {
-                break;
-            };
+        while let Some((id, n)) = undo_latest_revision(&tx)? {
             undone.push(id);
             changes += n;
-            match (review, latest(self)?) {
+            match (review, latest_review(&tx)?) {
                 (Some(r), Some(Some(next))) if next == r => {}
                 _ => break,
             }
         }
+        tx.commit()?;
         Ok(Some((undone, changes)))
     }
 
-    /// Undoes the latest applied revision, and records its changes as
-    /// declined so the review doesn't propose them again. Returns its id and
-    /// how many changes it had, or `None` if there is nothing to undo.
+    /// Undoes the latest applied revision alone, even if its review has others.
+    #[cfg(test)]
     pub fn undo_last_revision(&mut self) -> Result<Option<(i64, usize)>> {
         let tx = self.conn.transaction()?;
-        let latest: Option<(i64, String, String, String)> = tx
-            .query_row(
-                "SELECT id, changes, undo, decision_keys FROM revisions WHERE status = 'applied' ORDER BY id DESC LIMIT 1",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )
-            .optional()?;
-        let Some((id, changes, undo, keys)) = latest else {
-            return Ok(None);
-        };
-        let changes: Vec<TagChange> = serde_json::from_str(&changes)?;
-        let steps: Vec<Step> = serde_json::from_str(&undo).context("reading the revision's undo record")?;
-        let mut freed_aliases = Vec::new();
-        for step in steps.into_iter().rev() {
-            undo_step(&tx, step, &mut freed_aliases)?;
-        }
-        return_alias_pages(&tx, &freed_aliases)?;
-        let keys: Vec<String> = serde_json::from_str(&keys)?;
-        for key in keys {
-            tx.execute(
-                "INSERT OR REPLACE INTO tag_decisions (key, decision, source, created_at) VALUES (?1, 'declined', 'user', ?2)",
-                params![key, now()],
-            )?;
-        }
-        tx.execute("UPDATE revisions SET status = 'undone' WHERE id = ?1", [id])?;
+        let undone = undo_latest_revision(&tx)?;
         tx.commit()?;
-        Ok(Some((id, changes.len())))
+        Ok(undone)
     }
+}
+
+/// The review of the latest applied revision: `None` if there is no applied
+/// revision, `Some(None)` if it is from before reviews were numbered.
+fn latest_review(tx: &Connection) -> Result<Option<Option<i64>>> {
+    Ok(tx
+        .query_row(
+            "SELECT review FROM revisions WHERE status = 'applied' ORDER BY id DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
+/// Undoes the latest applied revision, and records its changes as declined so
+/// the review doesn't propose them again. Returns its id and how many changes
+/// it had, or `None` if there is nothing to undo.
+fn undo_latest_revision(tx: &Connection) -> Result<Option<(i64, usize)>> {
+    let latest: Option<(i64, String, String, String)> = tx
+        .query_row(
+            "SELECT id, changes, undo, decision_keys FROM revisions WHERE status = 'applied' ORDER BY id DESC LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?;
+    let Some((id, changes, undo, keys)) = latest else {
+        return Ok(None);
+    };
+    let changes: Vec<TagChange> = serde_json::from_str(&changes)?;
+    let steps: Vec<Step> =
+        serde_json::from_str(&undo).with_context(|| format!("reading the undo record of revision {id}"))?;
+    let mut freed_aliases = Vec::new();
+    for step in steps.into_iter().rev() {
+        undo_step(tx, step, &mut freed_aliases)?;
+    }
+    return_alias_pages(tx, &freed_aliases)?;
+    let keys: Vec<String> = serde_json::from_str(&keys)?;
+    for key in keys {
+        tx.execute(
+            "INSERT OR REPLACE INTO tag_decisions (key, decision, source, created_at) VALUES (?1, 'declined', 'user', ?2)",
+            params![key, now()],
+        )?;
+    }
+    tx.execute("UPDATE revisions SET status = 'undone' WHERE id = ?1", [id])?;
+    Ok(Some((id, changes.len())))
 }
 
 fn retarget(tx: &Connection, from: i64, to: i64, page: Option<i64>, steps: &mut Vec<Step>) -> Result<()> {
@@ -1000,6 +1010,36 @@ mod tests {
         assert_eq!(db.undo_last_review().unwrap(), Some((vec![1], 1)));
         assert_eq!(names(&db), before);
         assert_eq!(db.undo_last_review().unwrap(), None);
+    }
+
+    #[test]
+    fn a_review_that_cant_be_undone_whole_stays_applied() {
+        let (mut db, _) = archive(&[&["a"], &["b"], &["c"]]);
+        let (a, b, c) = (id(&db, "a"), id(&db, "b"), id(&db, "c"));
+        let review = db.next_review().unwrap();
+        db.apply_reviewed_changes(&[TagChange::Merge { from: a, into: b }], &[], Some(review))
+            .unwrap();
+        let keys = [vec!["merge:b:c".to_string()]];
+        db.apply_reviewed_changes(&[TagChange::Merge { from: b, into: c }], &keys, Some(review))
+            .unwrap();
+        let applied = names(&db);
+        // The older revision's undo record is unreadable.
+        db.conn
+            .execute("UPDATE revisions SET undo = 'garbled' WHERE id = 1", [])
+            .unwrap();
+
+        assert!(db.undo_last_review().is_err());
+        assert_eq!(names(&db), applied, "the newer revision isn't undone either");
+        assert_eq!(db.tag_decision("merge:b:c").unwrap(), None, "nor declined");
+        let undone: i64 = db
+            .conn
+            .query_row(
+                "SELECT count(*) FROM revisions WHERE status = 'undone'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(undone, 0);
     }
 
     #[test]

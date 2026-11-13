@@ -339,13 +339,13 @@ async fn run(cli: Cli) -> Result<()> {
                 bail!("the tag review failed: {error}");
             }
             println!("Tag review: {}.", review.line());
-            match review.revisions[..] {
-                [] => {}
-                [revision] => println!("To revert it: tabkeeper undo (revision {revision})."),
-                _ => println!(
-                    "To revert it: tabkeeper undo, once for each of the {} revisions (the tree, then the tag changes).",
-                    review.revisions.len()
-                ),
+            if !review.revisions.is_empty() {
+                let ids: Vec<String> = review.revisions.iter().map(i64::to_string).collect();
+                println!(
+                    "To revert it: tabkeeper undo (revision{} {}).",
+                    if ids.len() == 1 { "" } else { "s" },
+                    ids.join(" and ")
+                );
             }
             if let Some(error) = &review.tree_error {
                 bail!("putting tags in the tree failed: {error}");
@@ -353,7 +353,10 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::Undo => {
             let mut db = open_db(&cli.out)?;
-            match db.undo_last_review()? {
+            match db
+                .undo_last_review()
+                .context("the undo failed, so nothing was changed")?
+            {
                 Some((revisions, changes)) => {
                     finish(&db, &cli.out, &config)?;
                     let ids: Vec<String> = revisions.iter().map(i64::to_string).collect();
