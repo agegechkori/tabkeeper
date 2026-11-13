@@ -25,9 +25,12 @@ def tags_of(db_path):
     db = sqlite3.connect(db_path)
     cols = [r[1] for r in db.execute("pragma table_info(page_tags)")]
     order = "pt.position" if "position" in cols else "pt.rowid"
+    # Status tags (status/unreachable) say why a page has no summary; they
+    # aren't topics.
     rows = db.execute(
         "select p.url, t.name from page_tags pt join pages p on p.id = pt.page_id "
-        f"join tags t on t.id = pt.resolved_tag_id order by p.id, {order}"
+        "join tags t on t.id = pt.resolved_tag_id where t.name not like 'status/%' "
+        f"order by p.id, {order}"
     ).fetchall()
     out = collections.defaultdict(list)
     for url, tag in rows:
