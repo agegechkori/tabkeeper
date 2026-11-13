@@ -28,6 +28,8 @@ With a thinking model such as `qwen3`, turn thinking off in the config file (see
 reasoning_effort = "none"
 ```
 
+Replies are capped at 1,500 tokens (`max_output_tokens` in `[llm]`), three times the longest reply tabkeeper needs, so a reply that runs on ends early instead of holding a request until it times out. If you leave thinking on, raise the cap or set it to 0, since thinking counts toward it.
+
 tabkeeper sends 4 pages at a time (`--concurrency`), but Ollama answers one request at a time unless it is started with more slots. Starting it with 4 slots made imports about 1.3 times faster on an M1 Pro; more slots than that didn't help. 8,192 tokens per slot is plenty for tabkeeper's prompts:
 
 ```sh

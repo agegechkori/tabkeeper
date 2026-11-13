@@ -200,6 +200,8 @@ pub struct LlmConfig {
     pub max_input_chars: usize,
     pub temperature: f32,
     pub timeout_secs: u64,
+    /// Most tokens a reply may have; 0 means no limit.
+    pub max_output_tokens: u32,
     /// Extra fields merged into every request body, for server-specific
     /// options such as turning off a model's thinking step.
     pub extra_body: serde_json::Map<String, serde_json::Value>,
@@ -225,6 +227,11 @@ impl LlmConfig {
 /// (it spends most of a page reading the prompt) without better tags.
 pub const DEFAULT_MAX_INPUT_CHARS: usize = 4_000;
 
+/// Room for every reply tabkeeper asks for: the longest seen, a page summary
+/// or a batch of tree placements, is about 450 tokens. A reply that runs on
+/// past this ends early instead of holding the request until it times out.
+pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 1_500;
+
 impl Default for LlmConfig {
     fn default() -> Self {
         Self {
@@ -236,6 +243,7 @@ impl Default for LlmConfig {
             max_input_chars: DEFAULT_MAX_INPUT_CHARS,
             temperature: 0.2,
             timeout_secs: 300,
+            max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             extra_body: serde_json::Map::new(),
             retries: 3,
             requests_per_minute: 0,

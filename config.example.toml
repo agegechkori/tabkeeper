@@ -20,6 +20,10 @@ max_input_chars = 4000
 temperature = 0.2
 # Local models can be slow on long pages.
 timeout_secs = 300
+# Most tokens a reply may have. Replies need under 500; this stops a reply
+# that runs on. Raise it, or set 0 for no limit, if the model thinks before
+# it answers (see extra_body below): thinking counts toward the limit.
+max_output_tokens = 1500
 # Retries after a connection error, timeout, HTTP 429 or server error, with
 # increasing waits (honoring Retry-After). After that the run stops, and
 # running it again continues where it stopped.

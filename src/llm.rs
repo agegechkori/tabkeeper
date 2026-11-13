@@ -465,6 +465,12 @@ fn request_body_with_schema(config: &LlmConfig, messages: &[Value], name: &str, 
         "messages": messages,
         "temperature": config.temperature,
     });
+    // A reply that runs on (a small model can repeat itself until the
+    // context is full) then ends early as an invalid reply, instead of
+    // holding the request until it times out and is retried.
+    if config.max_output_tokens > 0 {
+        body["max_tokens"] = json!(config.max_output_tokens);
+    }
     match config.structured_output {
         StructuredOutput::JsonSchema => {
             body["response_format"] = json!({
@@ -619,6 +625,14 @@ mod tests {
         );
         config.structured_output = StructuredOutput::None;
         assert!(request_body(&config, &[]).get("response_format").is_none());
+    }
+
+    #[test]
+    fn replies_are_capped_unless_the_cap_is_zero() {
+        let mut config = LlmConfig::default();
+        assert_eq!(request_body(&config, &[])["max_tokens"], 1_500);
+        config.max_output_tokens = 0;
+        assert!(request_body(&config, &[]).get("max_tokens").is_none());
     }
 
     #[test]
