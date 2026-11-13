@@ -559,6 +559,13 @@ const RETAG_AGAIN_GROWTH: f64 = 1.5;
 /// test set with a quarter of such pages, a good retag left 23-27% untagged.
 const RETAG_MAX_UNTAGGED: f64 = 0.5;
 
+/// Whether a page's new tags differ from its old ones (`None`: it had none).
+/// Their order counts: the first is the broadest, the page's main topic.
+fn tags_change(new: &[(String, String)], old: Option<&Vec<String>>) -> bool {
+    let old = old.into_iter().flatten().map(String::as_str);
+    !new.iter().map(|(name, _)| name.as_str()).eq(old)
+}
+
 /// Builds the vocabulary from the whole archive, shows it, and asks whether
 /// to retag the pages from it.
 #[allow(clippy::too_many_arguments)]
@@ -619,16 +626,7 @@ async fn vocabulary_review(
     let changed: Vec<db::PageTags> = retag
         .assignments
         .iter()
-        .filter(|(page, tags)| {
-            let mut new: Vec<&str> = tags.iter().map(|(n, _)| n.as_str()).collect();
-            let mut old: Vec<&str> = before
-                .get(page)
-                .map(|t| t.iter().map(String::as_str).collect())
-                .unwrap_or_default();
-            new.sort();
-            old.sort();
-            new != old
-        })
+        .filter(|(page, tags)| tags_change(tags, before.get(page)))
         .map(|(page, tags)| db::PageTags {
             page: *page,
             tags: tags.clone(),
@@ -655,7 +653,9 @@ async fn vocabulary_review(
     }
     for (word, groups) in &retag.checked {
         let verdict = match retag.ambiguous.iter().find(|(w, _)| w == word) {
-            Some((_, names)) => format!("several meanings: {}", names.join(", ")),
+            Some((_, names)) if names.len() > 1 => format!("several meanings: {}", names.join(", ")),
+            // No other meaning had a tag of its own.
+            Some(_) => format!("several meanings; pages of the others were tagged again without {word}"),
             None => "one meaning".into(),
         };
         say(&format!(
@@ -670,18 +670,35 @@ async fn vocabulary_review(
         ));
     }
     if retag.untagged as f64 > before.len() as f64 * RETAG_MAX_UNTAGGED {
-        say(&format!(
-            "The retag isn't proposed: it would leave {} of {} pages without topic tags, too few pages share \
-             a topic yet. It is proposed again at {} pages; `tabkeeper revise-tags` tries it now.",
+        let why = format!(
+            "it would leave {} of {} pages without topic tags, too few pages share a topic yet",
             retag.untagged,
-            before.len(),
-            (done as f64 * RETAG_AGAIN_GROWTH).ceil()
-        ));
-        // Counts as declined, so the growth rule applies.
-        if let Err(err) = db.set_tag_decision(&format!("retag:{done}"), "too_few_pages", "llm") {
-            say(&format!("Warning: couldn't remember the skipped retag: {err:#}"));
+            before.len()
+        );
+        // Run by hand in a terminal, the retag is shown with a warning and
+        // you decide. It isn't applied unseen: with --yes, without a
+        // terminal, or at the end of an import.
+        if on_demand && !yes && std::io::stdin().is_terminal() {
+            say(&format!("Warning: {why}."));
+        } else {
+            say(&if on_demand {
+                format!(
+                    "The retag isn't applied: {why}. Run `tabkeeper revise-tags` in a terminal, without --yes, \
+                     to see it and decide."
+                )
+            } else {
+                format!(
+                    "The retag isn't proposed: {why}. It is proposed again at {} pages; `tabkeeper revise-tags` \
+                     shows it now.",
+                    (done as f64 * RETAG_AGAIN_GROWTH).ceil()
+                )
+            });
+            // Counts as declined, so the growth rule applies.
+            if let Err(err) = db.set_tag_decision(&format!("retag:{done}"), "too_few_pages", "llm") {
+                say(&format!("Warning: couldn't remember the skipped retag: {err:#}"));
+            }
+            return;
         }
-        return;
     }
     let proposal = reconcile::Proposed {
         description: format!(
@@ -927,7 +944,20 @@ fn finish(db: &Db, out: &Path, config: &Config) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_choice;
+    use super::{parse_choice, tags_change};
+
+    #[test]
+    fn reordered_tags_are_a_change() {
+        let new = |names: &[&str]| -> Vec<(String, String)> {
+            names.iter().map(|n| (n.to_string(), String::new())).collect()
+        };
+        let old = vec!["violin".to_string(), "music".to_string()];
+        assert!(!tags_change(&new(&["violin", "music"]), Some(&old)));
+        assert!(tags_change(&new(&["music", "violin"]), Some(&old)));
+        assert!(tags_change(&new(&["violin"]), Some(&old)));
+        assert!(tags_change(&new(&["music"]), None));
+        assert!(!tags_change(&new(&[]), None));
+    }
 
     #[test]
     fn approval_answers() {

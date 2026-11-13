@@ -184,11 +184,13 @@ pub fn agglomerate(vectors: &[Vec<f32>], threshold: f32) -> Vec<Vec<usize>> {
 }
 
 /// The tag for a meaning of `word` other than its most common one: always
-/// `word-…`. A vocabulary tag of that form already made for these pages (a
-/// cluster's name) is reused, so one meaning doesn't get two names. Otherwise
-/// the qualifier is up to two words of the model's name, or of the
-/// description if the name has none, leaving out the word itself and words
-/// like genus or species that say nothing about the meaning.
+/// `word-…`. A vocabulary tag of that form already made for at least half of
+/// these pages (a cluster's name) is reused, so one meaning doesn't get two
+/// names; one made for other pages (machine-learning, for pages about
+/// machine tools) isn't. Otherwise the qualifier is up to two words of the
+/// model's name, or of the description if the name has none, leaving out the
+/// word itself and words like genus or species that say nothing about the
+/// meaning.
 fn qualified_name(
     word: &str,
     name: &str,
@@ -201,7 +203,7 @@ fn qualified_name(
         .iter()
         .filter(|(tag, _)| tag.starts_with(&prefix))
         .map(|(tag, list)| (pages.iter().filter(|p| list.contains(p)).count(), tag))
-        .filter(|(shared, _)| *shared > 0)
+        .filter(|(shared, _)| *shared > 0 && *shared * 2 >= pages.len())
         .max_by_key(|(shared, _)| *shared);
     if let Some((_, tag)) = existing {
         return Some(tag.clone());
@@ -217,14 +219,14 @@ fn qualified_name(
         "category",
         "topic",
     ];
+    // The word and its plural, but not other words it begins (golang, google
+    // for go; carbon for car).
+    let is_word = |w: &str| w == word || [w.strip_suffix('s'), w.strip_suffix("es")].contains(&Some(word));
     let words_of = |text: &str| -> Vec<String> {
         text.split(|c: char| !c.is_alphanumeric())
             .map(str::to_lowercase)
             .filter(|w| {
-                !w.is_empty()
-                    && !SKIP.contains(&w.as_str())
-                    && !GENERIC.contains(&w.as_str())
-                    && !w.starts_with(word)
+                !w.is_empty() && !SKIP.contains(&w.as_str()) && !GENERIC.contains(&w.as_str()) && !is_word(w)
             })
             .take(2)
             .collect()
@@ -371,13 +373,16 @@ async fn check_word<R: Reviewer>(
         })
         .collect();
     out.meaning_checks += 1;
-    out.checked.push((
-        word.to_string(),
-        shown
-            .iter()
-            .filter_map(|g| g.first().map(|p| p.title.clone()))
-            .collect(),
-    ));
+    // A word checked again after classification is listed once.
+    if !out.checked.iter().any(|(w, _)| w == word) {
+        out.checked.push((
+            word.to_string(),
+            shown
+                .iter()
+                .filter_map(|g| g.first().map(|p| p.title.clone()))
+                .collect(),
+        ));
+    }
     let things = match meanings::check(reviewer, word, &shown).await {
         Ok(meanings::Verdict::Same) => {
             if remember {
@@ -824,7 +829,11 @@ pub async fn retag<R: Reviewer, E: Embedder>(
                     }
                 }
             }
-            names.push(name);
+            // A meaning without a tag of its own made none: its pages are
+            // tagged again.
+            if known {
+                names.push(name);
+            }
         }
         match out.ambiguous.iter_mut().find(|(w, _)| *w == word) {
             Some((_, known)) => {
@@ -839,13 +848,20 @@ pub async fn retag<R: Reviewer, E: Embedder>(
     }
     // A page loses the word only for another tag that fits: a broad word
     // wrongly found to have several meanings (running on a page about
-    // sneakers) stays on a page nothing else fits.
+    // sneakers) stays on a page nothing else fits. When the model finds
+    // nothing, or its request fails, the page keeps the tags it has left,
+    // and gets the word back only if it has none.
     for (i, (before, exclude)) in retry {
         match classify(reviewer, &offer, &pages[i], &page_vectors[i], settings, &exclude).await {
             Ok(tags) if !tags.is_empty() => chosen[i] = Some(tags),
-            Ok(_) => chosen[i] = Some(before),
-            // The page keeps its other tags.
-            Err(err) => out.failed_requests.push(err),
+            result => {
+                if let Err(err) = result {
+                    out.failed_requests.push(err);
+                }
+                if chosen[i].as_ref().is_some_and(Vec::is_empty) {
+                    chosen[i] = Some(before);
+                }
+            }
         }
     }
 
@@ -1278,6 +1294,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_page_that_loses_a_wrong_meaning_keeps_its_other_tags() {
+        use crate::reconcile::tests::FakeReviewer;
+        let (db, embedder) = two_groups();
+        let mut replies = vec![
+            json!({"description": "Rust, the programming language.", "fits": [1, 2, 3, 4], "tag": "rust"}),
+            json!({"description": "Chemistry.", "fits": [1, 2, 3], "tag": "chemistry"}),
+        ];
+        // rust is given to the chemistry pages too.
+        replies.extend((0..4).map(|_| json!({"tags": ["rust"]})));
+        replies.extend([
+            json!({"tags": ["rust", "chemistry"]}),
+            json!({"tags": ["rust", "chemistry"]}),
+            json!({"tags": ["rust"]}),
+            // rust, given to pages of both clusters, has two meanings; the
+            // other one has no tag in the vocabulary.
+            json!({"groups": [], "same_meaning": false}),
+            json!({"referent": "the programming language"}),
+            json!({"referent": "iron oxide"}),
+            json!({"groups": [
+                {"group": 1, "tag": "rust", "description": "Rust, the language."},
+                {"group": 2, "tag": "rust-corrosion", "description": "Rust on iron."}]}),
+            // The chemistry pages are tagged again without rust: nothing
+            // fits one, the requests for the other two fail.
+            json!({"tags": ["none"]}),
+            json!({"tags": 5}),
+            json!({"tags": 5}),
+        ]);
+        let reviewer = FakeReviewer::new(replies);
+        let settings = Settings {
+            cluster_similarity: 0.8,
+            min_support: 2,
+            candidates: 8,
+            max_tags: 3,
+        };
+        let out = retag(&db, &reviewer, &embedder, &settings, |_| {}).await.unwrap();
+        // Two pages keep chemistry; the last, with nothing else, keeps rust.
+        let mut expected = vec![vec!["rust"]; 4];
+        expected.extend([vec!["chemistry"], vec!["chemistry"], vec!["rust"]]);
+        assert_eq!(tags_of(&out), expected);
+        assert_eq!(out.failed_requests.len(), 2);
+        // rust-corrosion was never made, so it isn't listed.
+        assert_eq!(out.ambiguous, [("rust".to_string(), vec!["rust".to_string()])]);
+        assert_eq!(out.checked.len(), 1);
+    }
+
+    #[tokio::test]
     async fn a_page_whose_tags_are_all_dropped_is_tagged_again() {
         use crate::reconcile::tests::FakeReviewer;
         let (db, embedder) = two_groups();
@@ -1434,6 +1496,7 @@ mod tests {
         let members: BTreeMap<String, Vec<usize>> = [
             ("java-indonesia".to_string(), vec![7, 8]),
             ("java".to_string(), vec![1, 7]),
+            ("machine-learning".to_string(), vec![20, 21, 22]),
         ]
         .into();
         let name = |word, name, description, pages: &[usize]| {
@@ -1443,6 +1506,28 @@ mod tests {
         assert_eq!(
             name("java", "java-island", "the island", &[7]).as_deref(),
             Some("java-indonesia")
+        );
+        assert_eq!(
+            name("java", "java-island", "the island", &[7, 9]).as_deref(),
+            Some("java-indonesia")
+        );
+        // One made mostly for other pages isn't.
+        assert_eq!(
+            name("machine", "machine-tools", "machine tools", &[22, 30, 31]).as_deref(),
+            Some("machine-tools")
+        );
+        // Only the word and its plural are left out, not words it begins.
+        assert_eq!(
+            name("go", "go-golang", "the language from google", &[3]).as_deref(),
+            Some("go-golang")
+        );
+        assert_eq!(
+            name("go", "go", "a board game", &[3]).as_deref(),
+            Some("go-board-game")
+        );
+        assert_eq!(
+            name("car", "cars", "carbon fibre bodies", &[3]).as_deref(),
+            Some("car-carbon-fibre")
         );
         assert_eq!(
             name("python", "python-snake", "the snakes", &[3]).as_deref(),
