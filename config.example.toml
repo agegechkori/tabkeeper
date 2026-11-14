@@ -107,6 +107,9 @@ at_end_of_run = true
 # table lets a thinking model think. Thinking counts toward the reply limit,
 # which defaults to the [llm] one:
 # max_output_tokens = 8000
+# The review's temperature, instead of the [llm] one. At 0 a review of the
+# same archive gives the same tags; OpenAI's reasoning models only accept 1.
+temperature = 0.0
 # Tags whose names are at least this similar (cosine similarity of their
 # embeddings) are checked for being the same tag.
 similarity = 0.80
@@ -135,8 +138,9 @@ batch_size = 20
 title = "both"
 
 [run]
-# Pages processed at the same time. Local servers such as Ollama handle a
-# few requests at once; more mainly helps with fetching.
+# Pages processed at the same time, in an import and when the tag review
+# tags them. Local servers such as Ollama handle a few requests at once;
+# more mainly helps with fetching.
 concurrency = 4
 # Pages fetched at the same time from one domain.
 per_domain = 2

@@ -33,6 +33,9 @@ pub struct ReconcileConfig {
     /// Replaces `llm.max_output_tokens` for the review, e.g. for a review
     /// model that thinks: thinking counts toward the limit.
     pub max_output_tokens: Option<u32>,
+    /// The review's temperature, instead of `llm.temperature`. At 0 a review
+    /// of the same archive gives the same tags.
+    pub temperature: f32,
     /// Tags whose embeddings are at least this similar are checked for being
     /// the same tag (cosine similarity, 0 to 1).
     pub similarity: f32,
@@ -63,6 +66,7 @@ impl Default for ReconcileConfig {
             model: None,
             extra_body: None,
             max_output_tokens: None,
+            temperature: 0.0,
             similarity: 0.80,
             split_min_pages: 2,
             vocabulary: true,
@@ -88,6 +92,7 @@ impl ReconcileConfig {
         if let Some(cap) = self.max_output_tokens {
             config.max_output_tokens = cap;
         }
+        config.temperature = self.temperature;
         config
     }
 }
@@ -130,7 +135,8 @@ pub struct FilterConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RunConfig {
-    /// Pages processed at the same time.
+    /// Pages processed at the same time, in an import and when the tag
+    /// review tags them.
     pub concurrency: usize,
     /// Pages fetched at the same time from one domain.
     pub per_domain: usize,
@@ -404,5 +410,14 @@ mod tests {
         let c = Config::parse("[llm]\nmax_output_tokens = 800\n[reconcile]\nmax_output_tokens = 0").unwrap();
         assert_eq!(c.llm.max_output_tokens, 800);
         assert_eq!(c.reconcile.llm_config(&c.llm).max_output_tokens, 0);
+    }
+
+    #[test]
+    fn the_review_runs_at_temperature_zero_unless_set() {
+        let c = Config::parse("[llm]\ntemperature = 0.7").unwrap();
+        assert_eq!(c.llm.temperature, 0.7);
+        assert_eq!(c.reconcile.llm_config(&c.llm).temperature, 0.0);
+        let c = Config::parse("[reconcile]\ntemperature = 1.0").unwrap();
+        assert_eq!(c.reconcile.llm_config(&c.llm).temperature, 1.0);
     }
 }

@@ -6,6 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use anyhow::Result;
+use futures_util::stream::{self, StreamExt};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -25,6 +26,8 @@ const SUMMARY_CHARS: usize = 500;
 /// How much more alike pages must be to form a cluster in the first,
 /// tighter pass of cluster naming than `Settings::cluster_similarity`.
 const TIGHT_STEP: f32 = 0.05;
+/// Tags a page left without one is asked about, one at a time.
+const RESCUE_TRIES: usize = 2;
 
 #[derive(Debug, Clone)]
 pub struct Settings {
@@ -36,6 +39,8 @@ pub struct Settings {
     pub candidates: usize,
     /// Most tags a page gets.
     pub max_tags: usize,
+    /// Pages classified at the same time.
+    pub concurrency: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -69,6 +74,10 @@ pub struct Retag {
     /// became: the word itself for the meaning with the most pages, then a
     /// qualified tag for each other meaning.
     pub ambiguous: Vec<(String, Vec<String>)>,
+    /// Pages left without a tag that were asked about a tag of their
+    /// cluster, and how many of them got it.
+    pub rescue_checked: usize,
+    pub rescued: usize,
 }
 
 const CLUSTER_SYSTEM: &str = "You name a group of pages from a personal archive. The numbered pages were grouped because they are about similar things. Give the one tag for the topic most of them share: the broad topic someone would file them under, like bread, investing, japan, astronomy or machine-learning.
@@ -91,6 +100,19 @@ const CLASSIFY_SYSTEM: &str = "You tag a page of a personal archive with tags fr
 - Use each name exactly as listed, without its description.
 
 Reply with a JSON object: {\"tags\": [\"name\", ...]}.";
+
+const CHECK_SYSTEM: &str = "You check one tag of a personal archive of web pages against one page. Say whether the tag fits the page.
+
+- The tag fits if the page is about its topic, or about one kind or part of it: vehicles fits a page about trucks; sport fits a page about tennis.
+- The tag fits only in its own meaning, as its description says: a tag for the programming language never fits a page about the snake.
+- It doesn't fit a page that only mentions its topic in passing.
+
+Reply with a JSON object: {\"fits\": true}.";
+
+#[derive(Deserialize)]
+struct CheckReply {
+    fits: bool,
+}
 
 #[derive(Deserialize)]
 struct ClusterReply {
@@ -315,6 +337,78 @@ async fn classify<R: Reviewer>(
     Ok(tags)
 }
 
+/// Pages of `word` found to be about another of its meanings: its name no
+/// longer fits them, the tag `to` of that meaning does (if it has one).
+fn move_fit(fit: &mut BTreeMap<String, Vec<usize>>, word: &str, to: Option<&str>, pages: &[usize]) {
+    if let Some(list) = fit.get_mut(word) {
+        list.retain(|p| !pages.contains(p));
+    }
+    if let Some(to) = to {
+        let list = fit.entry(to.to_string()).or_default();
+        for &p in pages {
+            if !list.contains(&p) {
+                list.push(p);
+            }
+        }
+    }
+}
+
+/// The tags to ask a page left without one about, best first: the tag of
+/// its cluster, which the naming judged it about, then tags it chose that
+/// were dropped for too few pages.
+fn rescue_tags(
+    page: usize,
+    chosen: &[String],
+    fit: &BTreeMap<String, Vec<usize>>,
+    vocabulary: &BTreeMap<String, VocabTag>,
+    locked: &HashSet<String>,
+) -> Vec<String> {
+    let mut names: Vec<String> = fit
+        .iter()
+        .filter(|(_, pages)| pages.contains(&page))
+        .map(|(name, _)| name.clone())
+        .collect();
+    for name in chosen {
+        if !names.contains(name) {
+            names.push(name.clone());
+        }
+    }
+    names.retain(|n| vocabulary.contains_key(n) && !locked.contains(n));
+    names.truncate(RESCUE_TRIES);
+    names
+}
+
+/// Whether the tag fits the page, asked about it alone.
+async fn check_tag<R: Reviewer>(
+    reviewer: &R,
+    page: &AnalyzedPage,
+    name: &str,
+    description: &str,
+) -> Result<bool, String> {
+    let tag = match description.trim() {
+        "" => name.to_string(),
+        description => format!("{name}: {description}"),
+    };
+    let user = format!(
+        "Tag: {tag}\n\nPage: {}\n{}",
+        page.title,
+        truncate_chars(&page.summary, SUMMARY_CHARS)
+    );
+    // A field for what the page is about, before the verdict, made no
+    // difference on 100 hard cases.
+    let schema = json!({
+        "type": "object", "additionalProperties": false, "required": ["fits"],
+        "properties": {"fits": {"type": "boolean"}}
+    });
+    let reply = reviewer
+        .ask_json(CHECK_SYSTEM, &user, "tag_check", schema)
+        .await
+        .map_err(|err| format!("{err:#}"))?;
+    serde_json::from_value::<CheckReply>(reply)
+        .map(|r| r.fits)
+        .map_err(|_| "a tag check was unusable".to_string())
+}
+
 /// What the model said about a word with several meanings.
 struct Split {
     /// What the word names in its most common meaning, the one keeping it.
@@ -439,6 +533,9 @@ struct Naming {
     /// For each tag a cluster described, how many pages that cluster's name
     /// fit.
     described: HashMap<String, usize>,
+    /// For each name, the pages of its clusters that it fit, and those past
+    /// the sample the model saw: a page left without a tag is asked about it.
+    fit: BTreeMap<String, Vec<usize>>,
 }
 
 /// Asks the model to name `cluster` (indexes into `pages`) and adds the name
@@ -498,6 +595,12 @@ async fn name_cluster<R: Reviewer>(
     }
     let fits = fitting.len();
     naming.named.extend(cluster.iter().skip(sample.len()));
+    let fit = naming.fit.entry(name.clone()).or_default();
+    for &i in fitting.iter().chain(cluster.iter().skip(sample.len())) {
+        if !fit.contains(&i) {
+            fit.push(i);
+        }
+    }
     let list = members.entry(name.clone()).or_default();
     for i in fitting {
         naming.named.insert(i);
@@ -715,6 +818,7 @@ pub async fn retag<R: Reviewer, E: Embedder>(
                 description,
                 pages: 0,
             });
+            move_fit(&mut naming.fit, &word, Some(&name), &thing_pages);
             // So a later check of the word reuses this name for these pages.
             members.entry(name.clone()).or_default().extend(thing_pages);
             names.push(name);
@@ -754,10 +858,16 @@ pub async fn retag<R: Reviewer, E: Embedder>(
         system: &system,
         schema: &classify_schema,
     };
-    // None for a page whose request failed: it keeps its tags.
+    // None for a page whose request failed: it keeps its tags. The pages
+    // are independent of each other, so several are asked at once.
+    let replies: Vec<Result<Vec<String>, String>> = stream::iter(pages.iter().zip(&page_vectors))
+        .map(|(page, vector)| classify(reviewer, &offer, page, vector, settings, &[]))
+        .buffered(settings.concurrency.max(1))
+        .collect()
+        .await;
     let mut chosen: Vec<Option<Vec<String>>> = Vec::with_capacity(pages.len());
-    for (page, vector) in pages.iter().zip(&page_vectors) {
-        match classify(reviewer, &offer, page, vector, settings, &[]).await {
+    for reply in replies {
+        match reply {
             Ok(tags) => chosen.push(Some(tags)),
             Err(err) => {
                 out.failed_requests.push(err);
@@ -808,6 +918,12 @@ pub async fn retag<R: Reviewer, E: Embedder>(
         let mut names = vec![word.clone()];
         for (name, _, thing_pages) in split.others {
             let known = vocabulary.contains_key(&name);
+            move_fit(
+                &mut naming.fit,
+                &word,
+                known.then_some(name.as_str()),
+                &thing_pages,
+            );
             for i in thing_pages {
                 let Some(Some(tags)) = chosen.get_mut(i) else {
                     continue;
@@ -872,7 +988,7 @@ pub async fn retag<R: Reviewer, E: Embedder>(
             *counts.entry(t.clone()).or_default() += 1;
         }
     }
-    let kept: HashSet<String> = counts
+    let mut kept: HashSet<String> = counts
         .iter()
         .filter(|(_, n)| **n >= settings.min_support)
         .map(|(t, _)| t.to_string())
@@ -914,6 +1030,98 @@ pub async fn retag<R: Reviewer, E: Embedder>(
             }
         }
     }
+
+    // A page still without a tag is asked, yes or no, about a tag its cluster's
+    // name fit, or one it chose that was dropped. Picking from a list, the
+    // model answers none even when that tag comes first; when several pages
+    // of a topic do, its tag falls under min_support and the topic vanishes.
+    // One tag at a time is an easier question. A dropped tag comes back if
+    // enough pages say yes.
+    let candidates: Vec<(usize, Vec<String>)> = chosen
+        .iter()
+        .enumerate()
+        .filter_map(|(i, tags)| {
+            let tags = tags.as_ref()?;
+            if tags.iter().any(|t| kept.contains(t)) || pages[i].tags.iter().any(|t| locked.contains(t)) {
+                return None;
+            }
+            let names = rescue_tags(i, tags, &naming.fit, &vocabulary, &locked);
+            (!names.is_empty()).then_some((i, names))
+        })
+        .collect();
+    // A dropped tag too few of these pages could say yes to can't come back.
+    let mut could_say_yes: HashMap<&str, usize> = HashMap::new();
+    for (_, names) in &candidates {
+        for name in names {
+            *could_say_yes.entry(name.as_str()).or_default() += 1;
+        }
+    }
+    let worth_asking: HashSet<String> = could_say_yes
+        .into_iter()
+        .filter(|(name, n)| kept.contains(*name) || *n >= settings.min_support)
+        .map(|(name, _)| name.to_string())
+        .collect();
+    let candidates: Vec<(usize, Vec<String>)> = candidates
+        .into_iter()
+        .map(|(i, names)| {
+            (
+                i,
+                names.into_iter().filter(|n| worth_asking.contains(n)).collect(),
+            )
+        })
+        .filter(|(_, names): &(usize, Vec<String>)| !names.is_empty())
+        .collect();
+    out.rescue_checked = candidates.len();
+    let answers: Vec<(usize, Option<String>, Vec<String>)> = stream::iter(candidates)
+        .map(|(i, names)| {
+            let (page, vocabulary) = (&pages[i], &vocabulary);
+            async move {
+                let mut errors = Vec::new();
+                for name in names {
+                    match check_tag(reviewer, page, &name, &vocabulary[&name].description).await {
+                        Ok(true) => return (i, Some(name), errors),
+                        Ok(false) => {}
+                        Err(err) => errors.push(err),
+                    }
+                }
+                (i, None, errors)
+            }
+        })
+        .buffered(settings.concurrency.max(1))
+        .collect()
+        .await;
+    let mut said_yes: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (i, name, errors) in answers {
+        out.failed_requests.extend(errors);
+        if let Some(name) = name {
+            said_yes.entry(name).or_default().push(i);
+        }
+    }
+    for (name, list) in said_yes {
+        if !kept.contains(&name) && list.len() < settings.min_support {
+            continue;
+        }
+        kept.insert(name.clone());
+        for i in list {
+            chosen[i] = Some(vec![name.clone()]);
+            out.rescued += 1;
+        }
+    }
+    if out.rescue_checked > 0 {
+        note(&format!(
+            "Asked {} pages left without a tag about their cluster's tag: {} got it.",
+            out.rescue_checked, out.rescued
+        ));
+    }
+    out.dropped = names.iter().filter(|n| !kept.contains(*n)).cloned().collect();
+    // Pages per tag, as assigned.
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for tags in chosen.iter().flatten() {
+        for t in tags.iter().filter(|t| kept.contains(*t)) {
+            *counts.entry(t.clone()).or_default() += 1;
+        }
+    }
+
     for (page, tags) in pages.iter().zip(chosen) {
         let Some(tags) = tags else { continue };
         let tags: Vec<(String, String)> = tags
@@ -989,6 +1197,7 @@ mod tests {
             min_support: 2,
             candidates: 8,
             max_tags: 3,
+            concurrency: 1,
         };
         let out = retag(&db, &reviewer, &no_names(), &settings, |_| {})
             .await
@@ -1110,6 +1319,7 @@ mod tests {
             min_support: 3,
             candidates: 8,
             max_tags: 3,
+            concurrency: 1,
         };
         let out = retag(&dogs_and_horses(), &reviewer, &embedder, &settings, |_| {})
             .await
@@ -1130,6 +1340,125 @@ mod tests {
                 vec!["horses"]
             ]
         );
+    }
+
+    /// Dog pages and horse pages, 0.82 alike: a cluster each at 0.85.
+    fn dogs_apart_from_horses() -> TopicEmbedder {
+        TopicEmbedder(
+            [
+                ("labrador", 1),
+                ("poodle", 1),
+                ("beagle", 1),
+                ("mustang", -1),
+                ("arabian", -1),
+                ("pony", -1),
+            ]
+            .map(|(topic, sign)| (topic, [1.0, sign as f32 * 0.31]))
+            .to_vec(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_topic_whose_pages_answer_none_comes_back_if_they_say_yes_to_its_tag() {
+        use crate::reconcile::tests::FakeReviewer;
+        let fits = |yes: bool| json!({"fits": yes});
+        let reviewer = FakeReviewer::new(vec![
+            json!({"description": "Dogs.", "fits": [1, 2, 3], "tag": "dogs"}),
+            json!({"description": "Horses.", "fits": [1, 2, 3], "tag": "horses"}),
+            json!({"tags": ["dogs"]}),
+            json!({"tags": ["dogs"]}),
+            json!({"tags": ["dogs"]}),
+            // Two horse pages answer none, so horses has one page and is
+            // dropped; the page that chose it finds nothing else.
+            json!({"tags": ["horses"]}),
+            json!({"tags": ["none"]}),
+            json!({"tags": ["none"]}),
+            json!({"tags": ["none"]}),
+            // Each horse page is asked about the horses tag alone.
+            fits(true),
+            fits(true),
+            fits(true),
+        ]);
+        let settings = Settings {
+            cluster_similarity: 0.8,
+            min_support: 3,
+            candidates: 8,
+            max_tags: 3,
+            concurrency: 1,
+        };
+        let out = retag(
+            &dogs_and_horses(),
+            &reviewer,
+            &dogs_apart_from_horses(),
+            &settings,
+            |_| {},
+        )
+        .await
+        .unwrap();
+        let last = reviewer.prompts.borrow().last().cloned().unwrap();
+        assert!(last.starts_with("Tag: horses: Horses.\n\nPage: "), "{last}");
+        assert_eq!(
+            tags_of(&out),
+            [
+                vec!["dogs"],
+                vec!["dogs"],
+                vec!["dogs"],
+                vec!["horses"],
+                vec!["horses"],
+                vec!["horses"]
+            ]
+        );
+        assert_eq!((out.rescue_checked, out.rescued), (3, 3));
+        assert!(out.dropped.is_empty());
+        assert_eq!(out.untagged, 0);
+    }
+
+    #[tokio::test]
+    async fn a_page_that_answers_none_gets_its_cluster_tag_if_it_fits_and_too_few_yeses_keep_none() {
+        use crate::reconcile::tests::FakeReviewer;
+        let fits = |yes: bool| json!({"fits": yes});
+        let reviewer = FakeReviewer::new(vec![
+            json!({"description": "Dogs.", "fits": [1, 2, 3], "tag": "dogs"}),
+            json!({"description": "Horses.", "fits": [1, 2, 3], "tag": "horses"}),
+            // dogs keeps 2 pages, enough; horses has 1 and is dropped.
+            json!({"tags": ["dogs"]}),
+            json!({"tags": ["dogs"]}),
+            json!({"tags": ["none"]}),
+            json!({"tags": ["horses"]}),
+            json!({"tags": ["none"]}),
+            json!({"tags": ["none"]}),
+            // The page that chose horses finds nothing else.
+            json!({"tags": ["none"]}),
+            // The dog page gets dogs; of the horse pages only one says yes,
+            // too few to bring horses back.
+            fits(true),
+            fits(true),
+            fits(false),
+            fits(false),
+        ]);
+        let settings = Settings {
+            cluster_similarity: 0.8,
+            min_support: 2,
+            candidates: 8,
+            max_tags: 3,
+            concurrency: 1,
+        };
+        let out = retag(
+            &dogs_and_horses(),
+            &reviewer,
+            &dogs_apart_from_horses(),
+            &settings,
+            |_| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            tags_of(&out),
+            [vec!["dogs"], vec!["dogs"], vec!["dogs"], vec![], vec![], vec![]]
+        );
+        assert_eq!((out.rescue_checked, out.rescued), (4, 1));
+        assert_eq!(out.dropped, ["horses"]);
+        assert_eq!(out.untagged, 3);
     }
 
     #[tokio::test]
@@ -1157,6 +1486,7 @@ mod tests {
             min_support: 3,
             candidates: 8,
             max_tags: 3,
+            concurrency: 1,
         };
         let out = retag(&dogs_and_horses(), &reviewer, &embedder, &settings, |_| {})
             .await
@@ -1196,6 +1526,7 @@ mod tests {
             min_support: 3,
             candidates: 8,
             max_tags: 3,
+            concurrency: 1,
         };
         let out = retag(&dogs_and_horses(), &reviewer, &embedder, &settings, |_| {})
             .await
@@ -1257,6 +1588,7 @@ mod tests {
             min_support: 3,
             candidates: 8,
             max_tags: 3,
+            concurrency: 1,
         };
         let out = retag(&db, &reviewer, &embedder, &settings, |_| {}).await.unwrap();
         // The first name fits four pages, the second three.
@@ -1285,6 +1617,7 @@ mod tests {
             min_support: 3,
             candidates: 8,
             max_tags: 3,
+            concurrency: 1,
         };
         let out = retag(&db, &reviewer, &embedder, &settings, |_| {}).await.unwrap();
         assert_eq!(out.meaning_checks, 1);
@@ -1327,6 +1660,7 @@ mod tests {
             min_support: 2,
             candidates: 8,
             max_tags: 3,
+            concurrency: 1,
         };
         let out = retag(&db, &reviewer, &embedder, &settings, |_| {}).await.unwrap();
         // Two pages keep chemistry; the last, with nothing else, keeps rust.
@@ -1365,6 +1699,7 @@ mod tests {
             min_support: 3,
             candidates: 8,
             max_tags: 3,
+            concurrency: 1,
         };
         let out = retag(&db, &reviewer, &embedder, &settings, |_| {}).await.unwrap();
         let last = reviewer.prompts.borrow().last().cloned().unwrap();
@@ -1397,6 +1732,7 @@ mod tests {
             min_support: 2,
             candidates: 8,
             max_tags: 3,
+            concurrency: 1,
         };
         let out = retag(&db, &reviewer, &no_names(), &settings, |_| {})
             .await
@@ -1424,6 +1760,7 @@ mod tests {
             min_support: 2,
             candidates: 8,
             max_tags: 3,
+            concurrency: 1,
         };
         let out = retag(&db, &reviewer, &no_names(), &settings, |_| {})
             .await

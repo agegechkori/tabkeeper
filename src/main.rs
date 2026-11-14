@@ -605,6 +605,7 @@ async fn vocabulary_review(
         min_support: r.min_support,
         candidates: r.candidates,
         max_tags: config.tags.max_per_page,
+        concurrency: config.run.concurrency,
     };
     let retag = match vocab::retag(db, reviewer, embedder, &settings, say).await {
         Ok(retag) => retag,
