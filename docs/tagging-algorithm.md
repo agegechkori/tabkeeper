@@ -1,6 +1,6 @@
 # How tabkeeper tags pages
 
-The design, the algorithm, and every prompt the model sees, as of commit `16c53a1` on branch `consolidate-tags`, with `qwen3:4b` on Ollama and `nomic-embed-text` for embeddings. It ends with a look at where the errors come from today, and with notes on what could bring a real improvement over this baseline.
+The design, the algorithm, and every prompt the model sees, as of commit `84c7c09` on branch `consolidate-tags`, with `qwen3:4b` on Ollama and `nomic-embed-text` for embeddings. It ends with a look at where the errors come from today, and with notes on what could bring a real improvement over this baseline.
 
 > [!NOTE]
 > The prompts below are copied from the source (`src/llm.rs`, `src/vocab.rs`, `src/meanings.rs`, `src/tree.rs`, `src/reconcile.rs`). Text in `{braces}` is filled in by the code. The real examples come from the traces (`TABKEEPER_TRACE`) of the test runs in `target/experiments/`. To read this as a web page with the diagrams drawn, run `python3 scripts/build_doc.py --serve` and open http://127.0.0.1:8787/.
@@ -28,7 +28,7 @@ The key design decision: **the tags a page gets when it is imported are only hin
 | Model requests per review | ~215 | ~200–210 |
 | Review time | 3–4 min | 3 min |
 
-The ranges are over 4 reviews per set (2 imports × 2 reviews each); section 9 explains the metrics.
+The ranges are over 4 reviews per set (2 imports × 2 reviews each); section 9 explains the metrics. These are the numbers before the changes made since; section 12 has the numbers after them.
 
 ## 2. The pipeline in one picture
 
@@ -227,7 +227,7 @@ Reply:
 
 ## 5. Stage 2: the tag review
 
-The review (`vocab::retag` in `src/vocab.rs`) runs in eight steps:
+The review (`vocab::retag` in `src/vocab.rs`) runs in nine steps. It asks at temperature 0 (`[reconcile] temperature`), so reviewing the same archive twice gives the same tags.
 
 ```mermaid
 flowchart LR
@@ -242,10 +242,11 @@ flowchart LR
     direction TB
     cl["5 · Classify: 1–3 of the<br/>8 nearest tags, or none<br/>(Prompt 4)"] --> mc2["6 · Meanings check<br/>on the tags chosen"]
     mc2 --> sup["7 · Drop tags on fewer<br/>than 3 pages; retry<br/>pages left without tags"]
+    sup --> res["8 · Ask pages still<br/>without a tag about<br/>their cluster's tag<br/>(Prompt 4b)"]
   end
   subgraph decide["Propose"]
     direction TB
-    g{"8 · Over half<br/>untagged?"} -->|"yes"| stop["Not proposed<br/>(a warning in<br/>revise-tags)"]
+    g{"9 · Over half<br/>untagged?"} -->|"yes"| stop["Not proposed<br/>(a warning in<br/>revise-tags)"]
     g -->|"no"| ap{"Approve?"}
     ap -->|"yes"| done["Applied as<br/>one revision"]
     ap -->|"no"| dec["Proposed again<br/>at 1.5 × the pages"]
@@ -439,7 +440,7 @@ Both designs say "several". The company group had more pages, so it keeps `amazo
 
 ### 5.5 Classifying every page
 
-Each vocabulary tag is embedded as `"{name with spaces}: {description}"`. For each page, the 8 tags most similar to the page vector (`candidates = 8`) are offered, plus `none`.
+Each vocabulary tag is embedded as `"{name with spaces}: {description}"`. For each page, the 8 tags most similar to the page vector (`candidates = 8`) are offered, plus `none`. Pages are asked 4 at a time (`[run] concurrency`), since one page's answer doesn't depend on another's.
 
 #### Prompt 4: a page's tags (`page_tags`)
 
@@ -510,14 +511,34 @@ flowchart TD
   again --> sup
   sup{"Tag chosen by<br/>fewer than 3 pages?"} -->|"yes"| drop["Dropped from the vocabulary"]
   drop --> orph["Pages left with none of their tags:<br/>classified again without<br/>the dropped tags"]
-  sup -->|"no"| out["The retag"]
-  orph --> out
+  sup -->|"no"| res
+  orph --> res["Pages still without a tag: yes/no<br/>about their cluster's tag (Prompt 4b).<br/>A dropped tag returns with 3+ yes"]
+  res --> out["The retag"]
 ```
 
 1. **Second meanings check.** The classifier can give a word's tag to a page about another of its meanings, also when the import tags never showed the word in two meanings (`rust` the language on a corrosion page). So every one-word tag that isn't locked is checked again on the pages that chose it.
 2. **Support.** A tag chosen by fewer than 3 pages is dropped. A narrow tag (`string-instrument` on a violin page) can fall while a broader one (`music`) still fits, so pages left with none of their tags are classified once more without the dropped tags.
-3. **Guard.** A retag that would leave more than half the pages untagged isn't proposed at the end of an import: the archive is too young for shared topics. `revise-tags` run by hand in a terminal shows it with a warning and asks.
-4. **Approval.** Only pages whose tags change are part of the retag. Order counts, since the first tag is the page's main topic. Locked tags stay where they are. The vocabulary's descriptions go with the retag, so tags that already exist take them too (11.1).
+3. **Rescue.** Picking from a list, the model answers `none` even when the page's own tag comes first. When several pages of a topic do that, the tag falls under 3 pages and the whole topic vanishes. So a page still without a tag gets a yes/no question (Prompt 4b) about its cluster's tag, which the naming judged it fits. If the answer is no, it is asked about a dropped tag it chose, so two questions at most. A dropped tag comes back if 3 or more pages say yes. A dropped tag isn't asked about when too few pages could say yes to it. When the meanings check moved a page to another meaning, the page is asked about that meaning's tag, not the word.
+4. **Guard.** A retag that would leave more than half the pages untagged isn't proposed at the end of an import: the archive is too young for shared topics. `revise-tags` run by hand in a terminal shows it with a warning and asks.
+5. **Approval.** Only pages whose tags change are part of the retag. Order counts, since the first tag is the page's main topic. Locked tags stay where they are. The vocabulary's descriptions go with the retag, so tags that already exist take them too (11.1).
+
+#### Prompt 4b: one tag, yes or no (`tag_check`)
+
+One request per page still without a tag, if one of its tags is worth asking about: 0–8 per review on the test sets.
+
+```text
+You check one tag of a personal archive of web pages against one page. Say whether the tag fits the page.
+
+- The tag fits if the page is about its topic, or about one kind or part of it: vehicles fits a page about trucks; sport fits a page about tennis.
+- The tag fits only in its own meaning, as its description says: a tag for the programming language never fits a page about the snake.
+- It doesn't fit a page that only mentions its topic in passing.
+
+Reply with a JSON object: {"fits": true}.
+```
+
+User message: `Tag: {name}: {description}`, a blank line, then `Page: {title}` and the summary, cut to 500 characters. Schema: `{"fits": boolean}`.
+
+The prompt was chosen on 100 hard cases from the baseline reviews: 48 pages the classifier had left untagged although their topic's tag was in the vocabulary, and 52 plausible wrong tags for the same pages. It said yes to 23 of the 48 and wrongly said yes to only 3 of the 52. A variant that first writes what the page is about scored the same and took a third longer. Most of the no answers to right tags are names narrower than the topic: `index-funds` for a page on bonds, `houseplants` for compost, `knitting` for crochet. Rejecting those is right, and section 11.8 is about them.
 
 ## 6. Stage 3: the tag tree
 
@@ -643,8 +664,8 @@ User message: `Tag: {tag}`, then `Pages with this tag:` and `- page {id}: {title
 
 - **Structured output.** Every request sends a strict JSON schema (`response_format: json_schema`). The model writes the fields in the schema's order, and the schemas use that order on purpose: reasons before verdicts, descriptions before names, item numbers first. With `structured_output = "json_object"` or `"none"`, the schema is appended to the system prompt, because without it `qwen3:4b` dropped fields or repeated itself until Ollama stopped it.
 - **One retry.** An unreadable reply is answered with `That response was invalid: {error}. Reply again with only the JSON object.`
-- **Model settings.** `reasoning_effort = "none"` turns off the thinking step. Replies are capped at 1,500 tokens, and the longest reply seen is about 450. Temperature is 0.2.
-- **Concurrency.** Import runs 4 pages at a time; Ollama runs with `OLLAMA_NUM_PARALLEL=4`. The review sends its requests one at a time.
+- **Model settings.** `reasoning_effort = "none"` turns off the thinking step. Replies are capped at 1,500 tokens, and the longest reply seen is about 450. Temperature is 0.2 for import and 0 for the review. At 0, two reviews of one archive gave identical tags on all four test imports. At 0.2, they agreed on 0.94–0.97 of first-tag pairs, and quality was the same.
+- **Concurrency.** Import runs 4 pages at a time; Ollama runs with `OLLAMA_NUM_PARALLEL=4`. The review classifies pages and asks the yes/no questions 4 at a time. Its other requests go one at a time, because each cluster name sees the names before it.
 - **Trace.** With `TABKEEPER_TRACE=file.jsonl`, each request is logged with its prompt and reply. `target/experiments/replay_server.py` replays an import's page replies, so two import settings can be compared on identical model output.
 
 ## 9. How it's measured
@@ -660,16 +681,16 @@ User message: `Tag: {tag}`, then `Pages with this tag:` and `- page {id}: {title
 - **Untagged** counts pages left without a topic tag.
 - **Collisions** count tags found on both topics of an ambiguous word.
 
-Scripts: `scripts/score_holdout.py`, `scripts/compare_trees.py --clusters`, `scripts/meanings_bench.py`, and `scripts/score_tree.py` for the tree (not committed yet; it waits for `scripts/tree_domains.txt` to be agreed).
+Scripts: `scripts/score_holdout.py`, `scripts/compare_trees.py --clusters`, `scripts/meanings_bench.py`, and `scripts/score_tree.py` for the tree (not committed yet; it waits for `scripts/tree_domains.txt` to be agreed). `scripts/diagnose.py --labels holdout|old ARCHIVE…` reports all of these on topics of 3+ pages: F1, first tags from another topic, untagged pages by cause, lost topics and coverage. With the review's trace next to the archive, it also says whether the topic's tag was offered and whether the model answered `none` anyway. `--stability` compares reviews.
 
 > [!WARNING]
-> **The noise is about as large as the effects.** Two reviews of one import differ by up to 0.02 F1, and reviews of two imports of the same pages by up to 0.04. The model runs at temperature 0.2, and small changes cascade through the clustering. Untagged pages vary even more: 12 and 18 in two reviews of one import. A change needs about 4 reviews per arm before a difference of 0.03 means anything.
+> **Imports differ; reviews don't any more.** Reviews of two imports of the same pages differ by up to 0.04 F1, because each import tags the pages a little differently. At temperature 0.2, two reviews of one import also differed: by up to 0.02 F1, and 12 against 18 untagged pages. The review now runs at temperature 0 and gives the same tags every time. So one review per import measures a change, and all four imports (h1, h2, t1, t2) are needed to see past the imports' differences.
 >
 > **F1 alone can hide lost topics.** The old-set review with the best F1 (0.91, precision 1.00) is the one that left 18 pages untagged. Pages that lose their tag drop out of the pairs, and precision goes up. Read F1 together with the untagged count.
 
 ## 10. Where the errors come from today
 
-To find which step to improve, I traced every scored page through 8 recent reviews (4 per test set) and asked one question per page: was its topic's tag offered to the classifier, and was it picked? A topic's tag is the tag most of its pages got first, if that tag is mostly used on this topic. The script is in the session scratchpad and could become `scripts/diagnose.py`.
+To find which step to improve, I traced every scored page through 8 recent reviews (4 per test set) and asked one question per page: was its topic's tag offered to the classifier, and was it picked? A topic's tag is the tag most of its pages got first, if that tag is mostly used on this topic. The analysis is now `scripts/diagnose.py`. These are the reviews from before the changes in section 11; section 12 has the numbers after them.
 
 | What happened to a page on a topic of 3+ pages | Held-out (4 × 111) | Old set (4 × 141) |
 |---|---|---|
@@ -738,6 +759,15 @@ flowchart TD
 
 *Measure:* untagged pages on real topics (old set about 9 per review, target ≤ 3), lost topics (target 0), F1 and first tags from another topic (no regression), by reviewing copies of the same imported archives.
 
+> [!NOTE]
+> **Done** in `84c7c09`, as step 8 of the review: see 5.6 and Prompt 4b. Measured with one temperature-0 review per import, against the same reviews without it:
+> - The old set's second import got back both topics it had lost, `houseplants` and `indonesia-islands`. Its untagged pages went from 12 to 6, coverage from 91% to 96%, and F1 from 0.92 to 0.93.
+> - On the held-out imports, untagged pages went from 2 to 1 and from 6 to 4, and F1 from 0.96 to 0.97 and from 0.94 to 0.96.
+> - The old set's first import had nothing to rescue and is unchanged.
+> - No new first tags from another topic, and no new collisions.
+>
+> Before building it, a simulation on the traces showed the cluster's evidence was sound. Giving untagged pages their cluster's tag would have been right in 27 of 32 cases, and all 5 wrong ones came from one meaning split, which the rescue now handles. What it can't fix are names narrower than their topic (11.8).
+
 ### 11.3 Give every page a place: a domain layer built from the pages
 
 Make the vocabulary two levels deep, and build the tree from pages instead of from tag names:
@@ -768,12 +798,25 @@ Imports no longer embed anything, so existing archives can be reviewed again wit
 
 *Measure:* first offline, with no model requests, by comparing the clusters at 0.75 and 0.80 with the labeled topics; this takes seconds. Then run full reviews. Thresholds may need retuning for another model.
 
+> [!NOTE]
+> **Tried; not adopted.**
+> - **Clustering alone got better with the prefix.** Against the labeled topics, the clusters' pairwise F1 was 0.87 with `clustering: ` and 0.83 without, each at its best threshold, and the prefix won on all four imports. It also kept each page's tag among those offered (495 of 495) and put it first more often (463 against 449).
+> - **`qwen3-embedding:0.6b` clustered worse:** 0.71–0.73.
+> - **Full reviews got worse with the prefix.** The thresholds were raised to 0.80 and 0.85 to match, and the rescue was on in both arms. Held-out F1 fell from 0.97 to 0.91 and from 0.96 to 0.93. The old set's second import fell from 0.93 to 0.85 and lost two topics again. The vocabulary grew from 25–29 tags to 30–33 narrower ones.
+>
+> Better clusters in isolation didn't make better tags, so the code stays without a prefix.
+
 ### 11.5 Make reviews repeatable and faster
 
 - **Temperature 0 and a fixed `seed` for review requests.** Two reviews of one import differ today; in the old set's second import, one lost 9 pages and the other 16. Re-running `revise-tags` shouldn't reshuffle tags, and a deterministic review would also need fewer runs per A/B arm.
 - **Classify 4 pages at a time.** The review sends its ~200 requests one at a time while Ollama has 4 slots. Classification requests are independent of each other, so the review could take about half as long. Parallel slots on one machine share its compute, so it won't be 4 times faster. Cluster naming stays in order, because each name sees the names before it.
 
 *Measure:* the spread of F1 over 3 reviews of one archive, agreement of the assignments between runs, and review time.
+
+> [!NOTE]
+> **Done** in `84c7c09`.
+> - **Temperature.** `[reconcile] temperature` defaults to 0. Two reviews of each of the four imports gave identical tags on every page; at 0.2 they agreed on 0.94–0.97 of first-tag pairs. Quality held: held-out F1 0.95 against 0.95, old set 0.90 against 0.89, and no more collisions. No seed was needed.
+> - **4 pages at a time.** On this machine a review took 214 s instead of 236 s, with the same tags. Ollama's 4 slots share one machine's compute, so classification got only about 1.4 times faster, and the rest of the review asks one request at a time. A cloud model that serves requests in parallel gains more.
 
 ### 11.6 Incremental reviews for large archives
 
@@ -789,9 +832,21 @@ Every review classifies every page again, about one request per page, plus clust
 
 On the held-out set's topics of 3+ pages the review already gets 96% of pages right, and the differences between versions sit within the noise between reviews. To see a real improvement:
 
-1. Add the cause analysis above as `scripts/diagnose.py`, and report lost topics and `none` answers alongside F1. F1 alone can rank the worst review best (section 9).
+1. Add the cause analysis above as `scripts/diagnose.py`, and report lost topics and `none` answers alongside F1. F1 alone can rank the worst review best (section 9). **Done** in `3c0e8aa`, with coverage and stability too.
 2. Score what users see: coverage, the tree (`score_tree.py`), and stability between runs.
 3. Build a third test set closer to real tabs: 300 to 1,000 URLs, with a long tail, near-duplicate topics, non-English pages, and pages that fail to load.
+
+### 11.8 Broaden a cluster's name when its pages reject it
+
+*Found while measuring 11.2.* After the rescue, most pages left untagged on real topics sit under a name narrower than their topic:
+- compost and pruning under `houseplants`;
+- Jakarta under `indonesia-islands`;
+- inflation and mortgages under `investing`;
+- sneakers under `running`.
+
+The naming judged them to fit, but neither the classifier nor the yes/no check accepts the name, and rightly. Proposal: when several of a cluster's pages reject its name, ask once for a broader name that fits them all, such as `gardening`, `indonesia` or `personal-finance`. Then ask those pages yes/no about it, and keep it if 3 or more say yes. It can replace the narrow tag, or sit above it in the tree. The risk is a broad name that swallows a neighbouring topic, such as `gardening` and `fruit`; the yes/no check limits that.
+
+*Measure:* untagged pages on topics of 3+ pages (after the rescue, 3 and 6 on the old set's imports), F1, and first tags from another topic.
 
 ### Already tried, and not worth repeating
 
@@ -805,6 +860,23 @@ These were measured on the test sets and didn't help, or made things worse:
 - Reasoning-first fields in the cluster-naming and classification prompts: 0.95 → 0.85. They help yes/no judgments, not matching tasks.
 - Replies that map ids to assignments in one JSON object: the 4B model garbles them. Use one entry per item.
 - A third import tag per page (section 4).
+- `nomic-embed-text`'s `clustering: ` prefix, and `qwen3-embedding:0.6b` (11.4).
+
+## 12. Results after the changes
+
+*Before*: the 8 reviews of section 10, at temperature 0.2, two per import. *Now*: the review at temperature 0 with the rescue (11.2, 11.5), one review per import, since a second gives the same tags. All counts are for the pages on topics of 3+ pages, per review, except coverage, which counts all pages.
+
+| | Held-out before | Held-out now | Old set before | Old set now |
+|---|---|---|---|---|
+| First-tag pairwise F1 | 0.95 (0.93–0.97) | **0.965** (0.97, 0.96) | 0.89 (0.88–0.91) | **0.905** (0.88, 0.93) |
+| First tag from another topic | 1.0 | 0.5 | 2.2 | 2.5 |
+| Pages untagged | 3.8 (1–8) | **2.5** (1, 4) | 9.2 (3–18) | **4.5** (3, 6) |
+| Topics lost | 0.2 (0–1) | **0** | 1.2 (0–3) | **0** |
+| Coverage, all pages | 75% | 76% | 93% | **97%** |
+| Two reviews of one import | agree on 0.95–0.96 | **identical** | agree on 0.94–0.97 | **identical** |
+| Collisions on ambiguous words | 0–1 | 0 | 0–1 | 0–1 |
+
+The worst case improved most. Before, one of the old set's reviews lost three topics and left 18 pages untagged. Now no import loses a topic, and the most pages left untagged is 6. The remaining gaps are pages whose cluster got a name narrower than their topic (11.8), and the held-out set's long tail of topics with 1 or 2 pages (11.3).
 
 ## Appendix: settings and constants
 
@@ -820,15 +892,17 @@ These were measured on the test sets and didn't help, or made things worse:
 | `[reconcile] similarity` | 0.80 | Merge candidates (merge/split mode) |
 | `[reconcile] split_similarity` | 0.75 | Split candidates (merge/split mode) |
 | `[reconcile] batch_size` | 20 | Pairs per merge request |
-| `[llm] temperature` | 0.2 | All requests |
+| `[llm] temperature` | 0.2 | Import requests |
+| `[reconcile] temperature` | 0 | Review requests: the same tags on every review |
 | `[llm] max_output_tokens` | 1,500 | Reply cap (`[reconcile] max_output_tokens` for the review) |
 | `[llm] max_input_chars` | 4,000 | Page text the model reads |
-| `[run] concurrency` / `sequential_start` | 4 / 20 | Import |
+| `[run] concurrency` / `sequential_start` | 4 / 20 | Import; the review classifies and checks 4 pages at a time |
 | `CLUSTER_SAMPLE` | 10 | Pages shown when naming a cluster |
 | `SUMMARY_CHARS` | 500 | Summary shown when classifying |
 | `MAX_MEANING_GROUPS` / `PAGES_PER_GROUP` | 4 / 5 | Meanings check |
 | `DOMAIN_BATCH` / `BRANCH_BATCH` | 10 / 15 | Tree requests |
 | `RETAG_MAX_UNTAGGED` | 0.5 | The guard |
 | `RETAG_AGAIN_GROWTH` | 1.5 | When a declined retag is proposed again |
+| `RESCUE_TRIES` | 2 | Tags a page left without one is asked about |
 
-Requests in one review of about 150 pages: `page_tags` 146–155, `cluster_tag` 27–31, `tag_meanings` 2–9, `tag_referent` 4–12, `tag_things` 2–6, `tag_domains` 3, `tag_branch` 7–9.
+Requests in one review of about 150 pages: `page_tags` 146–155, `cluster_tag` 27–31, `tag_meanings` 2–9, `tag_referent` 4–12, `tag_things` 2–6, `tag_domains` 3, `tag_branch` 7–9, `tag_check` 0–8.
