@@ -1,0 +1,13 @@
+# Markdown to HTML for scripts/build_doc.py: GitHub-flavoured tables,
+# alerts and footnotes, without Python packages. Its own workspace, so it
+# stays out of tabkeeper's build.
+[package]
+name = "md2html"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+pulldown-cmark = { version = "=0.13.5", default-features = false, features = ["html"] }
+
+[workspace]
