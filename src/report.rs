@@ -190,7 +190,7 @@ impl ReviewReport {
             TagChange::Merge { .. } => self.merges += 1,
             TagChange::Rename { .. } => self.renames += 1,
             TagChange::Split { .. } => self.splits += 1,
-            TagChange::Retag { pages } => {
+            TagChange::Retag { pages, .. } => {
                 self.retags += 1;
                 self.retagged_pages += pages.len();
             }

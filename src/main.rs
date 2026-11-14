@@ -700,7 +700,14 @@ async fn vocabulary_review(
             retag.vocabulary.len(),
             in_use.len()
         ),
-        change: db::TagChange::Retag { pages: changed },
+        change: db::TagChange::Retag {
+            pages: changed,
+            descriptions: retag
+                .vocabulary
+                .iter()
+                .map(|t| (t.name.clone(), t.description.clone()))
+                .collect(),
+        },
         decision_keys: vec![format!("retag:{done}")],
     };
     let revisions = outcome.revisions.len();

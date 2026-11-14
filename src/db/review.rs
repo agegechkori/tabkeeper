@@ -36,7 +36,14 @@ pub enum TagChange {
     /// Every listed page gets these topic tags instead of its current ones:
     /// the tags chosen from a vocabulary built from the whole archive. Tags
     /// that don't exist yet are created with the given descriptions.
-    Retag { pages: Vec<PageTags> },
+    Retag {
+        pages: Vec<PageTags>,
+        /// Each vocabulary tag's description, as (name, description). Tags
+        /// that exist take it too, except locked ones, also when none of
+        /// their pages is listed. Empty in retags from before this was kept.
+        #[serde(default)]
+        descriptions: Vec<(String, String)>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -127,6 +134,11 @@ enum Step {
     Renamed {
         id: i64,
         old_name: String,
+    },
+    /// The tag's description before a retag replaced it.
+    Described {
+        id: i64,
+        old: Option<String>,
     },
 }
 
@@ -280,7 +292,9 @@ impl Db {
                 TagChange::Rename { tag, name } => rename(&sp, *tag, name, &mut change_steps),
                 TagChange::Split { tag, into } => split(&sp, *tag, into, &mut change_steps),
                 TagChange::Place { parent, tags } => place(&sp, parent, tags, &mut change_steps),
-                TagChange::Retag { pages } => retag(&sp, pages, &mut change_steps),
+                TagChange::Retag { pages, descriptions } => {
+                    retag(&sp, pages, descriptions, &mut change_steps)
+                }
             };
             match result {
                 Ok(()) => {
@@ -486,8 +500,14 @@ fn is_below(tx: &Connection, id: i64, ancestor: i64) -> Result<bool> {
     Ok(false)
 }
 
-/// Replaces each page's topic tags. Locked tags stay on their pages.
-fn retag(tx: &Connection, pages: &[PageTags], steps: &mut Vec<Step>) -> Result<()> {
+/// Replaces each page's topic tags, and gives the tags the vocabulary's
+/// descriptions. Locked tags stay on their pages, with their descriptions.
+fn retag(
+    tx: &Connection,
+    pages: &[PageTags],
+    descriptions: &[(String, String)],
+    steps: &mut Vec<Step>,
+) -> Result<()> {
     for PageTags { page, tags } in pages {
         let old: Vec<(String, i64)> = tx
             .prepare(
@@ -544,6 +564,34 @@ fn retag(tx: &Connection, pages: &[PageTags], steps: &mut Vec<Step>) -> Result<(
             old,
             new,
         });
+    }
+    // A tag that existed keeps the description written for the first page
+    // it was used on ("The largest rainforest" for amazon, now the company's
+    // tag) unless it takes the vocabulary's: the tree and the next review
+    // read it.
+    for (name, description) in descriptions {
+        let description = description.trim();
+        if description.is_empty() {
+            continue;
+        }
+        let tag: Option<(i64, Option<String>, bool)> = tx
+            .query_row(
+                "SELECT id, description, locked FROM tags WHERE name = ?1
+                 UNION ALL SELECT t.id, t.description, t.locked FROM tag_aliases a JOIN tags t ON t.id = a.tag_id
+                 WHERE a.alias = ?1 LIMIT 1",
+                [name],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let Some((id, old, locked)) = tag else { continue };
+        if locked || old.as_deref() == Some(description) {
+            continue;
+        }
+        tx.execute(
+            "UPDATE tags SET description = ?2 WHERE id = ?1",
+            params![id, description],
+        )?;
+        steps.push(Step::Described { id, old });
     }
     Ok(())
 }
@@ -924,6 +972,9 @@ fn undo_step(tx: &Connection, step: Step, freed_aliases: &mut Vec<(String, i64)>
         Step::Renamed { id, old_name } => {
             tx.execute("UPDATE tags SET name = ?2 WHERE id = ?1", params![id, old_name])?;
             tx.execute("DELETE FROM embeddings WHERE kind = 'tag' AND ref_id = ?1", [id])?;
+        }
+        Step::Described { id, old } => {
+            tx.execute("UPDATE tags SET description = ?2 WHERE id = ?1", params![id, old])?;
         }
     }
     Ok(())
@@ -1356,12 +1407,81 @@ mod tests {
         };
         db.apply_tag_changes(&[TagChange::Retag {
             pages: vec![bread(pages[0]), bread(pages[1])],
+            descriptions: vec![],
         }])
         .unwrap();
         assert_eq!(names(&db), [("bread".to_string(), 2)]);
         db.undo_last_revision().unwrap();
         assert_eq!(names(&db), before);
         assert_eq!(db.find_tag("bread").unwrap(), None, "the new tag is gone again");
+    }
+
+    fn description(db: &Db, name: &str) -> Option<String> {
+        db.conn
+            .query_row("SELECT description FROM tags WHERE name = ?1", [name], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn retag_gives_existing_tags_the_vocabulary_descriptions_and_undo_restores_them() {
+        let (mut db, pages) = archive(&[&["amazon"], &["amazon"], &["homelab"], &["rust"]]);
+        let set = |name: &str, text: &str| {
+            db.conn
+                .execute(
+                    "UPDATE tags SET description = ?2 WHERE name = ?1",
+                    params![name, text],
+                )
+                .unwrap();
+        };
+        set("amazon", "The largest rainforest in the world");
+        set("homelab", "Servers at home");
+        set("rust", "The programming language");
+        db.conn
+            .execute("UPDATE tags SET locked = 1 WHERE name = 'homelab'", [])
+            .unwrap();
+        let described = |name: &str, text: &str| (name.to_string(), text.to_string());
+        db.apply_tag_changes(&[TagChange::Retag {
+            // Only the first page's tags change; rust's pages aren't listed.
+            pages: vec![PageTags {
+                page: pages[0],
+                tags: vec![
+                    described("amazon", "the company"),
+                    described("aws", "Cloud services."),
+                ],
+            }],
+            descriptions: vec![
+                described("amazon", "the company"),
+                described("aws", "Cloud services."),
+                described("homelab", "Home servers"),
+                described("rust", "  the programming language for safe systems "),
+            ],
+        }])
+        .unwrap();
+        assert_eq!(description(&db, "amazon").as_deref(), Some("the company"));
+        assert_eq!(description(&db, "aws").as_deref(), Some("Cloud services."));
+        assert_eq!(
+            description(&db, "homelab").as_deref(),
+            Some("Servers at home"),
+            "a locked tag keeps its description"
+        );
+        assert_eq!(
+            description(&db, "rust").as_deref(),
+            Some("the programming language for safe systems"),
+            "a tag none of whose pages changed takes it too"
+        );
+
+        db.undo_last_revision().unwrap();
+        assert_eq!(
+            description(&db, "amazon").as_deref(),
+            Some("The largest rainforest in the world")
+        );
+        assert_eq!(
+            description(&db, "rust").as_deref(),
+            Some("The programming language")
+        );
+        assert_eq!(db.find_tag("aws").unwrap(), None);
     }
 
     #[test]
@@ -1378,6 +1498,7 @@ mod tests {
         };
         db.apply_tag_changes(&[TagChange::Retag {
             pages: vec![tagged(pages[0]), tagged(pages[1])],
+            descriptions: vec![],
         }])
         .unwrap();
         assert_eq!(
