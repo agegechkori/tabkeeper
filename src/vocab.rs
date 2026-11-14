@@ -264,10 +264,11 @@ fn qualified_name(
 }
 
 fn page_line(page: &AnalyzedPage) -> String {
-    if page.tags.is_empty() {
+    if page.topics.is_empty() {
         page.title.clone()
     } else {
-        format!("{} (topics: {})", page.title, page.tags.join(", "))
+        let names: Vec<&str> = page.topics.iter().map(|(name, _)| name.as_str()).collect();
+        format!("{} (topics: {})", page.title, names.join(", "))
     }
 }
 
@@ -650,6 +651,9 @@ pub async fn retag<R: Reviewer, E: Embedder>(
     note: impl Fn(&str),
 ) -> Result<Retag> {
     let mut out = Retag::default();
+    // The review reads what each page had when a review first saw it, not
+    // the tags an earlier review gave it: reviewing again gives the same tags.
+    db.freeze_review_topics()?;
     let pages = db.analyzed_pages()?;
     if pages.is_empty() {
         return Ok(out);
@@ -657,26 +661,32 @@ pub async fn retag<R: Reviewer, E: Embedder>(
     let texts: Vec<String> = pages
         .iter()
         .map(|p| {
+            let topics: Vec<&str> = p.topics.iter().map(|(name, _)| name.as_str()).collect();
             format!(
                 "Title: {}\nSummary: {}\nTopics: {}",
                 p.title,
                 p.summary,
-                p.tags.join("; ")
+                topics.join("; ")
             )
         })
         .collect();
     let page_vectors = embed_all(embedder, &texts).await?;
 
-    // Topics several pages already share.
-    let topics = db.topic_tags()?;
-    let descriptions: HashMap<String, String> = topics
-        .iter()
-        .map(|t| (t.name.clone(), t.description.clone().unwrap_or_default()))
-        .collect();
-    let locked: HashSet<String> = topics
-        .iter()
+    // Topics several pages already share, with the description each had.
+    let mut descriptions: HashMap<&str, &str> = HashMap::new();
+    for page in &pages {
+        for (name, description) in &page.topics {
+            let known = descriptions.entry(name.as_str()).or_default();
+            if known.is_empty() {
+                *known = description.as_str();
+            }
+        }
+    }
+    let locked: HashSet<String> = db
+        .topic_tags()?
+        .into_iter()
         .filter(|t| t.locked)
-        .map(|t| t.name.clone())
+        .map(|t| t.name)
         .collect();
     out.before = pages
         .iter()
@@ -691,10 +701,10 @@ pub async fn retag<R: Reviewer, E: Embedder>(
     // doesn't become a vocabulary tag of its own.
     let mut first_tags: HashSet<&str> = HashSet::new();
     for page in &pages {
-        for tag in &page.tags {
+        for (tag, _) in &page.topics {
             *topic_counts.entry(tag.as_str()).or_default() += 1;
         }
-        if let Some(first) = page.tags.first() {
+        if let Some((first, _)) = page.topics.first() {
             first_tags.insert(first.as_str());
         }
     }
@@ -702,7 +712,7 @@ pub async fn retag<R: Reviewer, E: Embedder>(
     // Pages each vocabulary tag was made for, by index.
     let mut members: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for (i, page) in pages.iter().enumerate() {
-        for tag in &page.tags {
+        for (tag, _) in &page.topics {
             if first_tags.contains(tag.as_str())
                 && topic_counts
                     .get(tag.as_str())
@@ -717,7 +727,11 @@ pub async fn retag<R: Reviewer, E: Embedder>(
             name.to_string(),
             VocabTag {
                 name: name.to_string(),
-                description: descriptions.get(name).cloned().unwrap_or_default(),
+                description: descriptions
+                    .get(name.as_str())
+                    .copied()
+                    .unwrap_or_default()
+                    .to_string(),
                 pages: 0,
             },
         );

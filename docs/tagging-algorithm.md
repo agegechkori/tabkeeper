@@ -76,6 +76,7 @@ erDiagram
     text title "the model's"
     text summary
     text status
+    text review_topics "frozen review input"
   }
   page_tags {
     int page_id
@@ -264,11 +265,11 @@ Summary: {summary}
 Topics: {tag}; {tag}; …
 ```
 
-The vectors are normalized to unit length, so cosine similarity is a dot product. The `Topics` are the page's current tags: after import those are the import tags, and on later reviews they are the tags the previous review left.
+The vectors are normalized to unit length, so cosine similarity is a dot product. The `Topics` are the tags the page had when a review first saw it, normally its import tags. They are frozen with their descriptions in `pages.review_topics`. Later reviews read the same topics, not the tags an earlier review gave the page, so reviewing an unchanged archive again changes nothing (11.9). The current tags only decide what a retag changes, and which tags are locked.
 
 ### 5.2 Seeds: topics already shared
 
-A tag joins the vocabulary as a seed if it is the **first** tag of at least one page and is on at least `min_support = 3` pages. The rule about first tags keeps out tags that only ever name an aspect of something else (`history`, `taxonomy` as second tags). A seed keeps its stored description, and its member pages are all pages that have it.
+A tag joins the vocabulary as a seed if it is the **first** tag of at least one page and is on at least `min_support = 3` pages. The rule about first tags keeps out tags that only ever name an aspect of something else (`history`, `taxonomy` as second tags). A seed keeps the description frozen with it, and its member pages are all pages whose topics include it.
 
 ### 5.3 Clustering, in two passes
 
@@ -848,6 +849,17 @@ The naming judged them to fit, but neither the classifier nor the yes/no check a
 
 *Measure:* untagged pages on topics of 3+ pages (after the rescue, 3 and 6 on the old set's imports), F1, and first tags from another topic.
 
+### 11.9 A review doesn't read its own output
+
+*Found while measuring 11.5.* A review runs at the end of every import and on every `revise-tags`, and it read the archive's current tags, its own earlier output. So a second review of an unchanged archive differed from the first, and it was worse. It changed 7–20 pages and lost a topic on three of the four imports: `amazon-rainforest` came back as `amazon-river`, and `houseplants` fell apart. Untagged pages went from 14 to 23.
+
+> [!NOTE]
+> **Done** (not committed yet). The first time a review sees a page, it freezes the page's tags and their descriptions in `pages.review_topics`. Every later review reads those frozen topics: for the page vectors, the seeds and their descriptions, and the cluster-naming lines. A review is now a function of the pages' import data, and at temperature 0 the same pages give the same tags.
+> - First reviews of the four imports gave exactly the same tags as before.
+> - Second reviews of those archives: "no changes needed" on all four.
+> - Archives reviewed by older code get their current tags frozen at their next review, and are stable from then on.
+> - Adding pages still rebuilds the vocabulary from all of them, so some earlier pages can change tags. 11.6 is about that.
+
 ### Already tried, and not worth repeating
 
 These were measured on the test sets and didn't help, or made things worse:
@@ -875,6 +887,7 @@ These were measured on the test sets and didn't help, or made things worse:
 | Coverage, all pages | 75% | 76% | 93% | **97%** |
 | Two reviews of one import | agree on 0.95–0.96 | **identical** | agree on 0.94–0.97 | **identical** |
 | Collisions on ambiguous words | 0–1 | 0 | 0–1 | 0–1 |
+| A second review of the same archive | changed 7–20 pages; lost a topic in 3 of 4 | **no changes** | same | **no changes** |
 
 The worst case improved most. Before, one of the old set's reviews lost three topics and left 18 pages untagged. Now no import loses a topic, and the most pages left untagged is 6. The remaining gaps are pages whose cluster got a name narrower than their topic (11.8), and the held-out set's long tail of topics with 1 or 2 pages (11.3).
 

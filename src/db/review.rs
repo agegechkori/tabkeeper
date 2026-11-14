@@ -66,7 +66,11 @@ pub struct AnalyzedPage {
     pub id: i64,
     pub title: String,
     pub summary: String,
+    /// The page's topic tags now, the broadest first.
     pub tags: Vec<String>,
+    /// What the tag review reads: the topic tags the page had when a review
+    /// first saw it, as (name, description), or its tags now if none has.
+    pub topics: Vec<(String, String)>,
 }
 
 /// A topic tag with the number of pages it's on.
@@ -176,36 +180,77 @@ impl Db {
     }
 
     /// Done pages with their topic tags (not `status/` ones) in order, the
-    /// broadest first, for building the vocabulary from the whole archive.
+    /// broadest first, and the topics the tag review reads for them, for
+    /// building the vocabulary from the whole archive.
     pub fn analyzed_pages(&self) -> Result<Vec<AnalyzedPage>> {
-        let mut pages: Vec<AnalyzedPage> = self
-            .conn
-            .prepare("SELECT id, title, summary FROM pages WHERE status = 'done' ORDER BY id")?
-            .query_map([], |r| {
-                Ok(AnalyzedPage {
+        let mut frozen: Vec<Option<String>> = Vec::new();
+        let mut pages: Vec<AnalyzedPage> = Vec::new();
+        let mut stmt = self.conn.prepare(
+            "SELECT id, title, summary, review_topics FROM pages WHERE status = 'done' ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                AnalyzedPage {
                     id: r.get(0)?,
                     title: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
                     summary: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
                     tags: Vec::new(),
-                })
-            })?
-            .collect::<rusqlite::Result<_>>()?;
+                    topics: Vec::new(),
+                },
+                r.get::<_, Option<String>>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (page, topics) = row?;
+            pages.push(page);
+            frozen.push(topics);
+        }
         let index: std::collections::HashMap<i64, usize> =
             pages.iter().enumerate().map(|(i, p)| (p.id, i)).collect();
         // Two raw tags of a page can resolve to one tag: it keeps its first place.
         let mut stmt = self.conn.prepare(
-            "SELECT x.page_id, t.name FROM page_tags x JOIN tags t ON t.id = x.resolved_tag_id
+            "SELECT x.page_id, t.name, ifnull(t.description, '') FROM page_tags x
+             JOIN tags t ON t.id = x.resolved_tag_id
              WHERE t.name NOT LIKE 'status/%'
              GROUP BY x.page_id, t.id ORDER BY x.page_id, min(x.position), t.name",
         )?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
         for row in rows {
-            let (page, name) = row?;
+            let (page, name, description) = row?;
             if let Some(&i) = index.get(&page) {
-                pages[i].tags.push(name);
+                pages[i].tags.push(name.clone());
+                pages[i].topics.push((name, description));
+            }
+        }
+        for (page, frozen) in pages.iter_mut().zip(frozen) {
+            if let Some(json) = frozen {
+                page.topics = serde_json::from_str(&json).context("reading a page's review topics")?;
             }
         }
         Ok(pages)
+    }
+
+    /// Freezes the topics the tag review reads for each done page that has
+    /// none yet: its topic tags now, with their descriptions. A page's first
+    /// review reads its import tags; later reviews read the same, not the
+    /// tags an earlier review gave it. Returns how many pages were frozen.
+    pub fn freeze_review_topics(&self) -> Result<usize> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut frozen = 0;
+        for page in self.analyzed_pages()? {
+            frozen += tx.execute(
+                "UPDATE pages SET review_topics = ?2 WHERE id = ?1 AND review_topics IS NULL",
+                params![page.id, serde_json::to_string(&page.topics)?],
+            )?;
+        }
+        tx.commit()?;
+        Ok(frozen)
     }
 
     /// The tag that uses `name`, as its name or as an alias.
@@ -1414,6 +1459,38 @@ mod tests {
         db.undo_last_revision().unwrap();
         assert_eq!(names(&db), before);
         assert_eq!(db.find_tag("bread").unwrap(), None, "the new tag is gone again");
+    }
+
+    #[test]
+    fn the_review_reads_the_topics_a_page_had_when_first_reviewed() {
+        let (mut db, pages) = archive(&[&["sourdough", "baguette"], &["rye-bread"]]);
+        db.conn
+            .execute(
+                "UPDATE tags SET description = 'Sourdough bread.' WHERE name = 'sourdough'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(db.freeze_review_topics().unwrap(), 2);
+        let bread = |page| PageTags {
+            page,
+            tags: vec![("bread".to_string(), "Bread and baking.".to_string())],
+        };
+        db.apply_tag_changes(&[TagChange::Retag {
+            pages: vec![bread(pages[0]), bread(pages[1])],
+            descriptions: vec![],
+        }])
+        .unwrap();
+        let analyzed = db.analyzed_pages().unwrap();
+        assert_eq!(analyzed[0].tags, ["bread"], "the tags now");
+        assert_eq!(
+            analyzed[0].topics,
+            [
+                ("sourdough".to_string(), "Sourdough bread.".to_string()),
+                ("baguette".to_string(), String::new())
+            ],
+            "what the review reads"
+        );
+        assert_eq!(db.freeze_review_topics().unwrap(), 0, "frozen once");
     }
 
     fn description(db: &Db, name: &str) -> Option<String> {

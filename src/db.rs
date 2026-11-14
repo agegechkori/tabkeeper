@@ -8,7 +8,7 @@ use crate::tags::TagRow;
 mod review;
 pub use review::{AnalyzedPage, PageTags, SplitPart, TagChange, TagInfo};
 
-const SCHEMA_VERSION: i32 = 9;
+const SCHEMA_VERSION: i32 = 10;
 
 /// Added in version 6: the tag review.
 const REVIEW_TABLES: &str = "
@@ -42,6 +42,12 @@ const PAGE_TAG_POSITION_COLUMN: &str =
 /// Added in version 9: the tag review a revision belongs to, so that undo
 /// reverts a whole review (its retag and its tree placements) at once.
 const REVISION_REVIEW_COLUMN: &str = "ALTER TABLE revisions ADD COLUMN review INTEGER;";
+
+/// Added in version 10: the topics the tag review reads for a page, as JSON
+/// [[name, description], ...], frozen the first time a review sees the page.
+/// A review then never reads its own earlier output, so reviewing again
+/// gives the same tags.
+const REVIEW_TOPICS_COLUMN: &str = "ALTER TABLE pages ADD COLUMN review_topics TEXT;";
 
 /// Added in version 5: the page's own title, as in the browser tab or its
 /// HTML <title>, shown next to the model's title.
@@ -239,7 +245,7 @@ impl Db {
         let mut version: i32 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
         if version == 0 {
             conn.execute_batch(&format!(
-                "BEGIN; {PAGES_TABLE} {PAGE_TITLE_COLUMN} {SCHEMA} {TREE_COLUMN} {PAGE_TAG_POSITION_COLUMN} {RUNS_TABLE} {REVIEW_TABLES} {REVISION_REVIEW_COLUMN} COMMIT;"
+                "BEGIN; {PAGES_TABLE} {PAGE_TITLE_COLUMN} {SCHEMA} {TREE_COLUMN} {PAGE_TAG_POSITION_COLUMN} {RUNS_TABLE} {REVIEW_TABLES} {REVISION_REVIEW_COLUMN} {REVIEW_TOPICS_COLUMN} COMMIT;"
             ))?;
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             version = SCHEMA_VERSION;
@@ -292,6 +298,12 @@ impl Db {
                 "BEGIN; {REVISION_REVIEW_COLUMN} PRAGMA user_version = 9; COMMIT;"
             ))?;
             version = 9;
+        }
+        if version == 9 {
+            conn.execute_batch(&format!(
+                "BEGIN; {REVIEW_TOPICS_COLUMN} PRAGMA user_version = 10; COMMIT;"
+            ))?;
+            version = 10;
         }
         if version != SCHEMA_VERSION {
             bail!(

@@ -210,6 +210,7 @@ mod tests {
             title: title.into(),
             summary: "First sentence. Second sentence.".into(),
             tags: vec![],
+            topics: vec![],
         }
     }
 
