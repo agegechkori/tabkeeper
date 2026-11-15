@@ -1,6 +1,6 @@
 """Where a review's tagging goes wrong, and how much reviews agree.
 
-    python3 scripts/diagnose.py --labels holdout|old|FILE ARCHIVE... [--stability] [-v]
+    python3 scripts/diagnose.py --labels holdout|old|realistic|FILE ARCHIVE... [--stability] [-v]
 
 For each archive, on the topics of 3+ pages: first-tag pairwise F1, first
 tags from another topic, untagged pages by cause, and topics lost
@@ -23,7 +23,7 @@ import sqlite3
 import statistics
 
 SCRIPTS = os.path.dirname(os.path.abspath(__file__))
-LABELS = {"holdout": "holdout_urls.txt", "old": "cluster_urls.txt"}
+LABELS = {"holdout": "holdout_urls.txt", "old": "cluster_urls.txt", "realistic": "realistic_urls.txt"}
 
 
 def read_labels(path):
@@ -32,9 +32,43 @@ def read_labels(path):
         line = line.strip()
         if line.startswith("# cluster:"):
             cur = line.split(":", 1)[1].strip()
+        elif line.startswith("# repeats"):
+            cur = None
         elif line.startswith("http") and cur:
             clusters.setdefault(cur, []).append(line.split()[0])
     return clusters
+
+
+def read_meta(path):
+    """The labels file's other lines: groups, ambiguous topics, pages expected
+    to fail or to load thin, and repeated URLs (realistic_urls.txt)."""
+    meta = {"groups": {}, "ambiguous": [], "fails": {}, "thin": set(), "repeats": []}
+    repeats = False
+    for line in open(path):
+        line = line.strip()
+        if line.startswith("# group:"):
+            name, topics = line[len("# group:"):].split(":", 1)
+            meta["groups"][name.strip()] = topics.split()
+        elif line.startswith("# ambiguous:"):
+            meta["ambiguous"].append(line[len("# ambiguous:"):].split())
+        elif line.startswith("# fails:"):
+            url, *reason = line[len("# fails:"):].split()
+            meta["fails"][url] = " ".join(reason)
+        elif line.startswith("# thin:"):
+            meta["thin"].add(line[len("# thin:"):].split()[0])
+        elif line.startswith("# repeats"):
+            repeats = True
+        elif line.startswith("# cluster:"):
+            repeats = False
+        elif line.startswith("http") and repeats:
+            meta["repeats"].append(line.split()[0])
+    return meta
+
+
+def read_status(path):
+    """Each page by the address it was imported with: (stored address, status, language)."""
+    db = sqlite3.connect(f"file:{path}/tabkeeper.db?mode=ro", uri=True)
+    return {o: (u, s, lang or "") for o, u, s, lang in db.execute("select original_url, url, status, lang from pages")}
 
 
 def read_archive(path):
@@ -75,8 +109,17 @@ def first_tag_pairs(urls, first):
     return {(a, b) for a, b in itertools.combinations(sorted(urls), 2) if first.get(a) and first.get(a) == first.get(b)}
 
 
-def diagnose(path, clusters):
+def diagnose(path, clusters, meta=None):
     tags, pages = read_archive(path)
+    # Labels name pages by the address they were imported with; pages that
+    # didn't load can't be tagged, so they are left out and counted.
+    status = read_status(path)
+    stored = {o: u for o, (u, _, _) in status.items()}
+    loaded = {u for u, s, _ in status.values() if s == "done"}
+    labeled = clusters
+    clusters = {c: [stored.get(u, u) for u in us if stored.get(u, u) in loaded] for c, us in labeled.items()}
+    clusters = {c: us for c, us in clusters.items() if us}
+    not_loaded = [u for us in labeled.values() for u in us if stored.get(u, u) not in loaded]
     topic_of = {u: c for c, us in clusters.items() for u in us}
     scored = {c: us for c, us in clusters.items() if len(us) >= 3}
     scored_pages = [u for us in scored.values() for u in us]
@@ -129,7 +172,37 @@ def diagnose(path, clusters):
             out["untagged: other"] += 1
     lost = sorted(c for c in scored if home[c] is None)
     all_pages = list(topic_of)
+    extra = {"not_loaded": (len(not_loaded), 0)}
+    if meta:
+        in_scored = set(scored_pages)
+        right = lambda u: bool(first.get(u)) and majority.get(first[u]) == topic_of[u]
+        extra["not_loaded"] = (len(not_loaded), sum(1 for u in not_loaded if u in meta["fails"]))
+        thin = [u for u in (stored.get(t, t) for t in meta["thin"]) if u in in_scored]
+        extra["thin"] = (sum(right(u) for u in thin), sum(1 for u in thin if not first[u]), len(thin))
+        if meta["groups"]:
+            group_of = {t: g for g, ts in meta["groups"].items() for t in ts}
+            coarse = {u: group_of.get(c, c) for u, c in topic_of.items()}
+            same_c = sum(1 for a, b in itertools.combinations(scored_pages, 2) if coarse[a] == coarse[b])
+            tp_c = sum(1 for a, b in shared if coarse[a] == coarse[b])
+            p_c, r_c = (tp_c / len(shared) if shared else 0), (tp_c / same_c if same_c else 0)
+            extra["coarse_f1"] = 2 * p_c * r_c / (p_c + r_c) if p_c + r_c else 0
+        # Languages as the import detected them.
+        lang_of = {u: lang for u, _, lang in status.values()}
+        other = [u for u in scored_pages if lang_of.get(u, "en") not in ("", "en")]
+        english = [u for u in scored_pages if lang_of.get(u, "en") in ("", "en")]
+        extra["languages"] = (sum(right(u) for u in other), len(other), sum(right(u) for u in english), len(english))
+        # A first tag on pages of two topics that use one word in different meanings.
+        collisions = []
+        for group in meta["ambiguous"]:
+            topics_of_tag = collections.defaultdict(set)
+            for u, c in topic_of.items():
+                if c in group and first.get(u):
+                    topics_of_tag[first[u]].add(c)
+            collisions += [f"{t} ({', '.join(sorted(cs))})" for t, cs in topics_of_tag.items() if len(cs) > 1]
+        extra["collisions"] = collisions
+        extra["repeats"] = (sum(1 for u in meta["repeats"] if u not in status), len(meta["repeats"]))
     return {
+        **extra,
         "f1": f1,
         "precision": precision,
         "recall": recall,
@@ -161,17 +234,19 @@ def spread(values, fmt):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--labels", required=True, help="holdout, old, or a labels file")
+    parser.add_argument("--labels", required=True, help="holdout, old, realistic, or a labels file")
     parser.add_argument("archives", nargs="+")
     parser.add_argument("--stability", action="store_true")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
     path = os.path.join(SCRIPTS, LABELS[args.labels]) if args.labels in LABELS else args.labels
     clusters = read_labels(path)
+    meta = read_meta(path)
+    has_meta = any(meta[k] for k in ("groups", "fails", "thin", "repeats"))
 
     results = []
     for archive in args.archives:
-        r = diagnose(archive, clusters)
+        r = diagnose(archive, clusters, meta if has_meta else None)
         results.append(r)
         o = r["outcomes"]
         untagged = sum(n for k, n in o.items() if k.startswith("untagged"))
@@ -182,6 +257,17 @@ def main():
             offered, ranked_first, with_home = r["retrieval"]
             line += f", tag offered {offered}/{with_home}"
         print(line)
+        if has_meta:
+            failed, expected = r["not_loaded"]
+            right_o, n_o, right_e, n_e = r["languages"]
+            thin_right, thin_none, thin_n = r["thin"]
+            folded, repeats = r["repeats"]
+            print(f"    didn't load {failed} ({expected} expected); coarse F1 {r.get('coarse_f1', 0):.2f}; "
+                  f"right first tag: other languages {right_o}/{n_o}, English {right_e}/{n_e}, "
+                  f"thin pages {thin_right}/{thin_n} ({thin_none} untagged); "
+                  f"collisions {len(r['collisions'])}; repeats folded {folded}/{repeats}")
+            if args.verbose and r["collisions"]:
+                print(f"    collisions: {'; '.join(r['collisions'])}")
         if args.verbose:
             for k, n in sorted(o.items()):
                 print(f"    {k}: {n}")

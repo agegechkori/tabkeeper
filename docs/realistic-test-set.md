@@ -140,6 +140,108 @@ Expected time:
 - each import: about 40 minutes;
 - each review: about 15 minutes.
 
+## As gathered
+
+`scripts/realistic_urls.txt` has 501 pages in 152 topics:
+- 26 topics of 5–44 pages;
+- 25 pairs;
+- 101 single pages;
+- 13 repeated URLs.
+
+The pages come from 334 domains:
+- 93 from Wikipedia (19%);
+- 22 documentation pages;
+- 18 Stack Overflow and Stack Exchange pages;
+- 13 GitHub repositories;
+- 344 blogs, guides, news, shops and other sites;
+- 40 pages in 9 languages besides English.
+
+The pages were fetched once with tabkeeper's own fetcher, through an import whose model was a stand-in, into a page cache (`target/experiments/r500/pages`). Where the result differs from the plan:
+- **53 pages are expected to fail, not about 30.**
+  - Stack Overflow answers every request from tabkeeper's fetcher with 403. The fetcher names itself as a bot, and several other sites refuse it or rate-limit it too (403, 429, 418, dropped connections).
+  - These pages stay in the set, marked `# fails:`, since real tabs would fail the same way.
+  - Three dead links stay, as planned.
+  - The other 23 dead links (old pages linked from Hacker News) were replaced by the next fitting result.
+- **YouTube, Reddit, Notion, Spotify, Google Maps and paywalled pages don't fail: they load thin.** tabkeeper counts them as loaded, with a title and little else. The 20 pages that load with under 500 characters of text are marked `# thin:`.
+- **The import folds 5 of the 13 repeated URLs**: tracking parameters, fragments and a trailing slash. It keeps the other 8 as pages of their own:
+  - `http://` and `https://` forms of one address;
+  - `www.` and the bare domain;
+  - mobile Wikipedia;
+  - AMP and print views;
+  - a country path;
+  - a second address for one post.
+
+## Baseline
+
+Two imports of the set with the code of 95cce6f, each reviewed once at temperature 0. An import took 32 minutes and a review 10–11. The scores are for the 314 loaded pages on the 26 topics of 5–44 pages. The other two sets' numbers are from section 12 of `tagging-algorithm.md`.
+
+| | This set | Held-out set | Old set |
+|---|---|---|---|
+| First-tag pairwise F1 | **0.47** (0.51, 0.44) | 0.965 (0.97, 0.96) | 0.905 (0.88, 0.93) |
+| Precision | 0.97 (0.99, 0.95) | 0.99 (0.98, 1.00) | 0.97 (0.95, 0.99) |
+| Recall | **0.31** (0.34, 0.28) | 0.95 (0.97, 0.93) | 0.855 (0.83, 0.88) |
+| First tag from the page's own topic | 95% (301, 296) | 97% (109, 107 of 111) | 95% (134, 134 of 141) |
+| Pages untagged | 10, 9 | 1, 4 | 3, 6 |
+| Topics lost | 0 | 0 | 0 |
+| Coverage, all pages | 78% (79%, 77%) | 76% | 97% |
+| Two imports, each reviewed, agree on | **0.70** | 0.92 | 0.91 |
+| Collisions on ambiguous words | 0 | 0 | 0–1 |
+
+On this set only:
+- **Other languages:** pages in other languages got a first tag from their own topic as often as English pages: 66 of 68 (34, 32 of 34), against 531 of 560.
+- **Thin pages:** in each review, 8 of the 11 on these topics got their topic's tag, and 2 were left untagged.
+- **Pages that didn't load:** 53, all of them expected to fail.
+- **The long tail:**
+  - 51 and 39 of its 134 loaded pages got a tag.
+  - A topic needs 3 pages for a tag of its own (`min_support`), so a pair shares a first tag only by chance: 4 of 21 pairs in each review.
+- **Without the review,** the imports score F1 0.14, since each page gets narrow tags of its own.
+
+### What holds
+
+- **Topics stay apart** as well as on the other two sets, and no topic is lost.
+- **Other languages:** pages in the 9 other languages are tagged as well as English ones.
+- **Ambiguous words:** none of the seven puts two meanings under one first tag.
+- **Failures:** every page that failed was expected to.
+
+### What goes wrong
+
+1. **Big topics are split into subtopics, with no tag over them.**
+   - Precision is as on the other sets, but recall drops to 0.31. Topics of 25–40 pages get 3–6 tags each. In the first review:
+     - `portugal` (39 loaded pages): lisbon-travel 12, algarve 8, portugal-travel 7, portugal-trains 5, portugal 4, lisbon 3;
+     - `kitchen-renovation` (35): kitchen-remodeling 11, countertops 7, kitchen-ventilation 5, kitchen-cabinets 4, induction-cooking 4, others 4;
+     - `spanish-language` (25): spanish-language-learning 9, spanish-subjunctive 5, spanish-grammar 5, spanish-language-certification 4, spanish-verbs 2.
+   - Topics of 5–10 pages mostly keep one tag.
+   - Nothing joins the parts:
+     - Pages have 1.4–1.5 tags on average.
+     - The one tag that finds most of a topic's pages finds 20–23 of the 39 Portugal pages, and 13–14 of the 35 kitchen pages.
+     - The tree doesn't join them either: the first review's tree files `lisbon` and `portugal` under culture and the other Portugal tags under travel.
+   - The cause: tags are named per cluster, and the clustering joins pages only while they are alike enough (`cluster_similarity`). A broad interest's pages aren't all that alike, so it becomes several clusters, each with its own name.
+2. **Near-duplicate tags share one vocabulary.**
+   - Examples:
+     - `mechanical-keyboard` and `mechanical-keyboards`, beside `keyboards`;
+     - `lisbon` and `lisbon-travel`;
+     - `portugal` and `portugal-travel`;
+     - `nitrogen-cycle` and `aquarium-cycling`;
+     - `firmware` and `keyboard-firmware`.
+   - The vocabulary review has no merge step:
+     - with `reconcile.vocabulary` on (the default), the older review's merge check doesn't run;
+     - a cluster's name reuses a tag only when it is spelled the same.
+   - Merging the clear duplicates by hand raises F1 to just 0.55 and 0.49. So most of the split is real subtopics: Lisbon, the Algarve, trains.
+3. **Two runs split differently.** Two imports of the set, each reviewed, agree on 0.70. Where a big topic splits changes from run to run.
+4. **Loose catch-all tags in the long tail.** Most long-tail pages stay untagged, as planned, but some tags gather unrelated pages:
+   - `minimalism` (first review): two posts on minimalism in software, plus Vim, the twelve-factor app, semantic versioning, color theory, furniture design software, a Nintendo Switch page and two essays on woodworking;
+   - `time` (second review): leap seconds and the Gregorian calendar, but also GPS, the Antikythera mechanism and Apple's sign-language service, SignTime;
+   - `puzzles` (first review): crosswords and the Monty Hall problem, and also 85 ways to tie a tie;
+   - `portugal-travel` (second review) on a Google Maps link and on the Tour du Mont Blanc.
+5. **The data tools share generic tags.**
+   - `apache-spark` is almost all `data-processing`.
+   - `dbt` splits over data-transformation, data-engineering and data-pipelines, and those tags reach Airflow and PostgreSQL pages too.
+   - Most pages with another topic's first tag are these.
+6. **One naming reply ran past the 1,500-token cap,** in the first review.
+   - It was for a cluster of three unrelated pages: two thin Reddit threads and a page on Kafka's insurance job.
+   - Its pages were left for the next review.
+   - The longest reply seen before was about 450 tokens.
+
 ## Limits
 
-It is still a guess at what a tab archive looks like, by the same author as the prompts, and it will be cleaner than real tabs. A later check against 50–100 real tabs would show how representative it is. Adding another 500 pages later would double as a real growth test (section 11.6 of `tagging-algorithm.md`).
+It is still a guess at what a tab archive looks like, by the same author as the prompts, and it will be cleaner than real tabs. A few pages fit their topic loosely: one meal-prep page is an article on food flown to a village in Alaska. A later check against 50–100 real tabs would show how representative it is. Adding another 500 pages later would double as a real growth test (section 11.6 of `tagging-algorithm.md`).

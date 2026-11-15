@@ -1,0 +1,919 @@
+# Realistic test set (docs/realistic-test-set.md): about 500 pages shaped
+# like one person's tabs, gathered on 2026-11-14 from web searches, Hacker
+# News, Stack Exchange, GitHub and Wikipedia. A test set only: no prompt is
+# tuned on it.
+#
+# "# cluster: name" starts a topic. "pair-" topics have 2 pages and "one-"
+# topics 1. "# group: name: topic ..." names related topics, for a coarser
+# second score. "# ambiguous: a b ..." names topics that use one word in
+# different meanings. "# fails: URL reason" marks a page expected not to
+# load with tabkeeper's fetcher, and "# thin: URL" one that loads with under
+# 500 characters of text. "# repeats:" starts URLs that repeat a page above
+# in another form; they belong to no topic.
+
+# group: data-engineering: apache-kafka apache-airflow apache-spark postgresql dbt
+# group: fitness: knee-rehab strength-training
+# group: smart-home: home-networking home-automation
+# group: painting-and-drawing: watercolor urban-sketching pair-color-theory
+# ambiguous: apache-kafka franz-kafka
+# ambiguous: mechanical-keyboards home-networking pair-nintendo-switch
+# ambiguous: woodworking pair-airplanes
+# ambiguous: portugal home-networking pair-shipping-ports
+# ambiguous: apache-spark pair-car-maintenance
+# ambiguous: apache-spark pair-river-deltas
+# ambiguous: apache-airflow kitchen-renovation
+
+# cluster: apache-kafka
+https://stackoverflow.com/questions/42151544/when-to-use-rabbitmq-over-kafka
+https://stackoverflow.com/questions/38024514/understanding-kafka-topics-and-partitions
+https://stackoverflow.com/questions/17708489/using-kafka-as-a-cqrs-eventstore-good-idea
+https://github.com/apache/kafka
+https://en.wikipedia.org/wiki/Apache_Kafka
+https://kafka.apache.org/intro
+https://kafka.apache.org/quickstart
+https://kafka.apache.org/uses
+https://gentlydownthe.stream/
+https://www.michael-noll.com/blog/2020/01/16/what-every-software-engineer-should-know-about-apache-kafka-fundamentals/
+https://topicpartition.io/blog/postgres-pubsub-queue-benchmarks
+https://thenewstack.io/this-week-in-numbers-apache-kafkas-metamorphosis/
+
+# cluster: apache-airflow
+https://stackoverflow.com/questions/41517798/proper-way-to-create-dynamic-workflows-in-airflow
+https://stackoverflow.com/questions/43410836/how-to-remove-default-example-dags-in-airflow
+https://stackoverflow.com/questions/40651783/airflow-how-to-delete-a-dag
+https://bhavaniravi.com/blog/apache-airflow-introduction
+https://shopify.engineering/lessons-learned-apache-airflow-scale
+https://github.com/apache/airflow
+https://en.wikipedia.org/wiki/Apache_Airflow
+https://airflow.apache.org/docs/apache-airflow/stable/start.html
+https://airflow.apache.org/docs/apache-airflow/stable/core-concepts/index.html
+https://www.youtube.com/watch?v=23_1WlxGGM4
+
+# cluster: apache-spark
+https://stackoverflow.com/questions/31610971/spark-repartition-vs-coalesce
+https://stackoverflow.com/questions/34077353/how-to-change-dataframe-column-names-in-pyspark
+https://code.facebook.com/posts/1671373793181703/apache-spark-scale-a-60-tb-production-use-case/
+http://minimaxir.com/2017/01/amazon-spark/
+https://techcrunch.com/2019/04/24/databricks-open-sources-delta-lake-to-make-data-lakes-more-reliable/
+https://github.com/apache/spark
+https://en.wikipedia.org/wiki/Apache_Spark
+https://spark.apache.org/docs/latest/quick-start.html
+https://spark.apache.org/docs/latest/sql-programming-guide.html
+https://spark.apache.org/docs/latest/tuning.html
+
+# cluster: postgresql
+https://stackoverflow.com/questions/769683/how-to-show-tables-in-postgresql
+https://stackoverflow.com/questions/109325/postgresql-describe-table
+https://stackoverflow.com/questions/3800551/select-first-row-in-each-group-by-group
+https://wiki.postgresql.org/wiki/Don%27t_Do_This
+https://github.com/supabase/postgres_lsp
+https://www.theguardian.com/info/2018/nov/30/bye-bye-mongo-hello-postgres
+https://spin.atomicobject.com/2021/02/04/redis-postgresql/
+https://en.wikipedia.org/wiki/PostgreSQL
+https://www.postgresql.org/docs/current/indexes.html
+https://www.postgresql.org/docs/current/using-explain.html
+https://www.postgresql.org/docs/current/tutorial-window.html
+https://www.postgresql.org/docs/current/routine-vacuuming.html
+
+# cluster: dbt
+https://stackoverflow.com/questions/72799237/only-run-a-set-of-models
+https://stackoverflow.com/questions/73784913/dbt-ref-vs-source
+https://georgheiler.com/2023/12/11/dagster-dbt-duckdb-as-new-local-mds/
+https://seattledataguy.substack.com/p/what-is-dbt-and-why-are-companies
+https://github.com/dbt-labs/dbt
+https://docs.getdbt.com/docs/introduction
+https://docs.getdbt.com/docs/build/sql-models
+https://docs.getdbt.com/docs/build/snapshots
+
+# cluster: portugal
+https://www.afar.com/travel-tips/the-best-things-to-do-in-lisbon
+https://devourtours.com/blog/what-to-do-in-lisbon
+https://www.kayak.com/news/things-to-do-in-lisbon/
+https://www.thecrazytourist.com/25-best-things-lisbon-portugal/
+https://www.freetour.com/blog/things-to-do-in-lisbon
+https://lisbonlisboaportugal.com/lisbon-tour/Lisbon-3-Day-Itinerary.html
+https://www.hellotickets.com/en-au/portugal/lisbon/alfama/sc-138-2537
+https://www.audleytravel.com/us/portugal/travel-guides/city-guide-to-lisbon
+https://www.22places.com/what-to-see-in-lisbon/
+https://www.earthtrekkers.com/wine-cellars-in-porto/
+https://yellowbustours.com/en/porto/taylors-port-wine-cellar
+https://www.wow.pt/en/en/news-and-blog/post/best-wine-experiences-in-porto
+https://theculturetrip.com/articles/10-wineries-and-vineyards-to-visit-in-porto
+https://authenticfoodquest.com/wine-port-tasting-porto/
+https://porto-north-portugal.com/porto-guide/port-cellars-houses-caves-tours-porto.html
+https://www.idealista.pt/en/news/lifestyle-in-portugal/2023/06/16/5520-a-guide-to-the-best-beaches-in-the-algarve
+https://www.earthtrekkers.com/best-things-to-do-in-algarve
+https://www.22places.com/things-to-do-in-algarve/
+https://algarvefun.com/algarve-tips/best-caves-algarve/
+https://www.algarveportugaltourism.com/guide
+https://gretastravels.com/benagil-cave
+https://lisbonlisboaportugal.com/lisbon-transport/lisbon-to-porto-train.html
+https://www.seat61.com/trains-and-routes/lisbon-to-porto-by-train
+https://thesavvybackpacker.com/travel-portugal-by-train/
+https://www.trvlogue.com/en/porto-lisbon-train-cp
+https://everyrail.com/trains/lisbon-to-porto/
+https://www.360meridianos.com/2017/03/o-que-fazer-em-lisboa-roteiro-de-3-dias.html
+https://www.viajenaviagem.com/destino/lisboa/o-que-fazer-lisboa
+https://www.vagamundos.pt/visitar-lisboa-roteiro-guia/
+https://www.buenasdicas.com/roteiro-lisboa-10374/
+https://en.wikipedia.org/wiki/Lisbon
+https://en.wikipedia.org/wiki/Porto
+https://pt.wikipedia.org/wiki/Lisboa
+https://pt.wikipedia.org/wiki/Vinho_do_Porto
+https://pt.wikipedia.org/wiki/Algarve
+https://pt.wikipedia.org/wiki/Porto
+https://blog.wego.com/lisbon-airport-to-city-centre/
+https://blog.yesim.tech/best-esim-for-portugal/
+https://www.360meridianos.com/o-que-fazer-no-porto-portugal/
+https://www.timeout.pt/lisboa/pt/viagens/as-melhores-praias-no-algarve-para-este-verao
+https://www.cp.pt/info/pt/precos-alfa-pendular
+https://rr.pt/noticia/pais/2023/10/31/lisboa-porto-a-55-euros-cp-tem-45-mil-bilhetes-em-promocao/353236/
+https://www.youtube.com/watch?v=9idsf4j368g
+https://www.tripadvisor.com/RestaurantsNear-g189158-d195649-Alfama-Lisbon_Lisbon_District_Central_Portugal.html
+
+# cluster: kitchen-renovation
+https://www.consumerreports.org/home-garden/kitchen-cabinets-a2814830958/
+https://www.homedepot.ca/en/home/ideas-how-to/kitchen/how-to-buy-kitchen-cabinets.html
+https://www.usacabinetstore.com/everything-about-kitchen-cabinets-your-ultimate-buying-guide/
+https://www.consumerreports.org/home-garden/kitchen-cabinets/buying-guide/
+https://zarsky.myeshowroom.com/guide/Cabinets-Kitchen
+https://www.fabuwood.com/blog/kitchen-cabinet-buying-guide
+https://homeadditionplus.com/dev/kitchen/six-things-to-know-when-buying-cabinets
+https://bobvila.com/articles/quartz-vs-granite-cost
+https://marblesystems.com/quartz-vs-granite-countertops-which-is-better
+https://www.hunker.com/2211053/granite-vs-quartz-countertops-which-costs-less/
+https://graniteselection.com/blog/quartz-vs-granite-pros-and-cons/
+https://angi.com/articles/quartz-vs-granite-countertops.htm
+https://www.kitchencabinetkings.com/quartz-vs-granite-countertops
+https://www.reico.com:443/about-us/blog/2012/granite-or-quartz---great-choices-in-kitchen-countertops/
+https://www.hgtv.com/design/rooms/kitchens/granite-vs-quartz-is-one-better-than-the-other
+https://broan-nutone.com/en-us/range-hood-cfm-guide-how-to-choose-the-right
+https://www.sindacopper.com/blogs/sinda-copper-blog/what-cfm-do-you-need-for-a-range-hood
+https://www.buildwithrise.com/stories/kitchen-ventilation-planning-guide-layout-airflow-and-range-hood-performance
+https://www.tomsguide.com/home/home-appliances/induction-vs-gas-cooktop-which-is-best-for-you
+https://www.abt.com/learn/induction-cooktop-vs-gas-how-to-choose-whats-right-for-you
+https://carbonswitch.com/induction-cooktop-and-stove-guide
+https://blog.yaleappliance.com/dual-fuel-vs-induction-ranges
+https://construction2style.com/how-much-does-a-kitchen-remodel-cost-budget-breakdown-where-your-money-goes/
+https://www.homeadvisor.com/cost/kitchens/remodel-a-kitchen/
+https://www.hunker.com/13722987/how-to-remodel-a-kitchen
+https://www.homeadvisor.com/r/who-to-hire-kitchen-remodel
+https://elocal.com/resources/home-improvement/renovation/cost-guide/kitchen-remodel/
+https://angi.com/articles/hire-best-kitchen-remodeling-contractor.htm
+https://www.angi.com/articles/kitchen-remodel-checklist.htm
+https://ecohome.co/articles/how-to-remodel-kitchen
+https://www.blockrenovation.com/guides/how-to-start-a-kitchen-remodel?hsLang=en
+https://www.homedepot.com/c/kitchen_cabinets_HT_BG_KI
+https://www.wayfair.com/sca/ideas-and-advice/rooms/range-hood-buying-guide-T1487/
+https://www.familyhandyman.com/article/pros-and-cons-of-quartz-countertops/}
+https://en.wikipedia.org/wiki/Kitchen_cabinet
+https://en.wikipedia.org/wiki/Countertop
+https://en.wikipedia.org/wiki/Kitchen_hood
+https://en.wikipedia.org/wiki/Induction_cooking
+https://www.reddit.com/r/HomeImprovement/comments/dyvj3u/so_i_messed_up_bad_real_bad_one_more_warning_to/
+https://www.ikea.com/au/en/files/pdf/aa/24/aa2441d4/metod-kitchen-cabinets-buying-guide.pdf
+
+# cluster: mechanical-keyboards
+https://www.reddit.com/r/MechanicalKeyboards/comments/k7t53s/new_model_f_ultracompact_f77_keyboard_impressions/
+https://www.allithypermarket.com.my/blogs/techtalk/linear-vs-tactile-vs-clicky-switches-the-beginners-guide-to-mechanical-keyboards
+https://apos.audio/blogs/news/linear-tactile-clicky-guide
+https://reviewed.com/laptops/features/mechanical-keyboard-switches-explained
+https://voltcave.com/linear-tactile-clicky/
+https://keebsforall.com/blogs/mechanical-keyboards-101/mechanical-keyboard-switch-types-explained
+https://www.kromekeycaps.com/blogs/keycaps/mechanical-keyboard-switch-types
+https://www.dospara.co.jp/5info/cts_str_peri_mecha-kb.html
+https://braindetox.kr/ja/posts/mechanical_keyboard_guide.html
+https://en.wikipedia.org/wiki/Cherry_AG
+https://en.wikipedia.org/wiki/Keyboard_technology
+https://electronicmaterialsoffice.com/
+https://fowlie.github.io/2022/02/25/keyboards-rabbit-hole/
+https://incoherency.co.uk/blog/stories/jesboard.html
+https://github.com/dschil138/Fulcrum
+https://github.com/qmk/qmk_firmware
+https://github.com/zmkfirmware/zmk
+https://docs.qmk.fm/newbs
+https://docs.qmk.fm/newbs_building_firmware
+https://docs.qmk.fm/newbs_flashing
+https://www.logitech.com/en-us/products/keyboards/mx-mechanical.html
+https://www.jeffgeerling.com/blog/2025/testing-raspberry-pi-500s-new-mechanical-keyboard
+https://arstechnica.com/gadgets/2022/03/the-ars-technica-guide-to-mechanical-keyboards/
+https://www.masteringemacs.org/article/thoughts-on-mechanical-keyboards-zsa-moonlander
+https://www.newyorker.com/tech/annals-of-technology/the-obsessive-pleasures-of-mechanical-keyboard-tinkerers
+https://sheets.works/data-viz/keyboard-sounds
+https://blog.opsdisk.com/restoring-a-37-year-old-ibm-model-f-mechanical-keyboard.html
+https://en.wikipedia.org/wiki/Model_M_keyboard
+
+# cluster: spanish-language
+https://mezzoguild.com/learn/spanish/grammar/subjunctive
+https://www.tellmeinspanish.com/grammar/spanish-subjunctive/
+https://lingvist.com/course/learn-spanish-online/resources/spanish-subjunctive/
+https://www.lingoda.com/blog/en/when-to-use-subjunctive-tense-in-spanish/
+https://www.italki.com/en/blog/spanish-subjunctive
+https://letsspeakspanish.com/blog/ser-vs-estar/
+https://www.spanishdict.com/quizzes/46/using-estar-with-conditions
+https://blog.busuu.com/ser-vs-estar/
+https://www.lingq.com/blog/ser-vs-estar/
+https://www.babbel.com/learn-spanish/beginner/how-to-use-ser-and-estar
+https://refold.la/resources/spanish
+https://podcasts.apple.com/us/podcast/cu%C3%A9ntame-learn-spanish-with-comprehensible-input/id1571791000
+https://promova.com/blog/best-spanish-podcasts-for-learning
+https://lingtuitive.com/blog/5-best-beginner-spanish-apps-and-courses
+https://storylearning.com/learn/spanish/spanish-tips/best-app-to-learn-spanish
+https://www.fluentu.com/blog/spanish/best-apps-for-learning-spanish/
+https://cihub.notion.site/spanish
+https://marcoele.com/descargas/6/mattebon.pdf
+https://theobjective.com/sociedad/2024-08-12/dificultad-estudiantes-espanol-verbos-ser-estar/
+https://institutodeidiomas.us.es/node/781
+https://www.upv.es/entidades/acdl/examenes-de-espanol-dele/
+https://cervantesobservatorio.fas.harvard.edu/es/contenido/examenes-del-instituto-cervantes-dele-y-mas
+https://global-exam.com/blog/es/que-es-el-dele-como-registrarse-para-tomar-el-examen/
+https://en.wikipedia.org/wiki/DELE
+https://en.wikipedia.org/wiki/Spanish_verbs
+https://es.wikipedia.org/wiki/Modo_subjuntivo
+
+# cluster: woodworking
+https://alinpanaitiu.com/blog/woodworking-escape-from-software-absurdity/
+https://woodgears.ca/
+https://www.zainrizvi.io/blog/why-software-engineers-like-woodworking/
+http://woodgears.ca/beginner/
+https://www.smithsonianmag.com/smithsonian-institution/see-the-mesmerizing-interlocking-geometric-patterns-produced-with-this-ancient-japanese-woodworking-technique-180986494/
+https://daizen.com/hand-plane-competition-kezuroukai-usa/
+https://woodandshop.com/identify-stanley-hand-plane-age-type-study/
+https://layout.computer
+https://craftedworkshop.squarespace.com/store/roubo-style-woodworking-workbench-plans
+https://en.wikipedia.org/wiki/Dovetail_joint
+https://en.wikipedia.org/wiki/Mortise_and_tenon
+https://en.wikipedia.org/wiki/Plane_%28tool%29
+https://en.wikipedia.org/wiki/Wood_finishing
+https://www.youtube.com/watch?v=OCYjoj6cfno
+https://de.wikipedia.org/wiki/Schwalbenschwanzverbindung
+https://de.wikipedia.org/wiki/Zapfenverbindung
+https://www.woodcraft.com/blogs/shop-knowledge-guides/10-essential-sharpening-tricks-hone-your-sharpening-skills-and-your-tools
+https://www.finewoodworking.com/1998/10/01/honing-guides-arent-just-for-wimps
+https://medium.com/@ronincarpenter90/best-way-to-sharpen-chisels-the-only-guide-you-will-need-8aead790ca73
+https://www.workshopcompanion.com/KnowHow/Tools/Sharpening/4_Sharpening_Chisels_Plane_Irons/4_Sharpening_Chisels_Plane_Irons.htm
+https://www.leevalley.com/en-us/discover/sharpen-net/how-to-sharpen
+https://www.woodcentral.com/-/varnish-vs-shellac-a-woodworkers-guide/
+https://finewoodworking.com/project-guides/finishing/choosing-a-finish-2
+https://www.woodcentral.com/-/other-popular-wood-finishes-beyond-shellac-varnish/
+https://realcraft.com/blogs/articles/wood-finish-types-explained
+https://rothkoandfrost.com/blogs/stuff-you-should-know/wood-finishes-compared-oil-vs-wax-vs-lacquer-vs-varnish-vs-shellac
+https://www.leevalley.com/en-us/shop/tools/plans/70730-benchcrafted-workbench-plans
+https://www.heimwerker.de/werkbank-selber-bauen/
+https://www.bosch-diy.com/de/de/all-about-diy/werkbank-selber-bauen
+https://www.feinewerkzeuge.de/media/94/d4/c0/1750332492/roubo-hobelbank-bauplan-de.pdf
+
+# cluster: knee-rehab
+https://www.nhslanarkshire.scot.nhs.uk/?p=27401
+https://www.drugs.com/cg/patellofemoral-pain-syndrome-exercises.html
+https://webmd.com/fitness-exercise/best-exercises-patellofemoral-syndrome
+https://cochranelibrary.com/cdsr/doi/10.1002/14651858.CD010387.pub2
+https://www.hingehealth.com/resources/articles/patellofemoral-pain-syndrome
+https://www.aafp.org/pubs/afp/issues/2020/1001/p442.html
+https://www.dartmouth-hitchcock.org/sites/default/files/2022-06/ACL-Recontruction-Physical-Therapy-Protocol.pdf
+https://en.wikipedia.org/wiki/Anterior_cruciate_ligament_injury
+https://en.wikipedia.org/wiki/Patellofemoral_pain_syndrome
+https://spectrum.ieee.org/ballerina-turned-vr-pioneer
+https://www.sciencedaily.com/releases/2025/03/250305164447.htm
+
+# cluster: strength-training
+https://www.dotmoovs.com/articles/strength-training-for-beginners-a-complete-guide
+https://fitnessvolt.com/powerlifting/guides/training-for-beginners-guide/
+https://boostcamp.app/coaches/kristen-dunsmore/kristen-dunsmore-beginner-program
+https://elitefts.com/education/strength-progressions-for-beginner-and-intermediate-lifters
+https://www.jefit.com/wp/general-fitness/8-week-beginner-strength-training-plan
+https://www.strengthlog.com/how-to-get-stronger-part-1-the-beginner/
+https://setgraph.app/articles/starting-strength-program-complete-beginner-guide
+https://en.wikipedia.org/wiki/Squat_%28exercise%29
+https://en.wikipedia.org/wiki/Deadlift
+https://en.wikipedia.org/wiki/Progressive_overload
+https://fhur.me/posts/2024/why-strength-training-a-programmers-perspective
+https://www.health.harvard.edu/staying-healthy/want-to-live-longer-and-better-strength-train
+
+# cluster: chess
+https://lichess.org/blog/YF-ZORQAACAA89PI/why-lichess-will-always-be-free.
+https://lichess.org/@/Lichess/blog/wcc-2024-round-14-gukesh-becomes-the-youngest-world-champion-in-history/cDggdNZw
+https://en.lichess.org/blog/WFvLpiQAACMA8e9D/learn-from-your-mistakes
+https://en.wikipedia.org/wiki/Sicilian_Defence
+https://en.wikipedia.org/wiki/Chess_opening
+https://chess.stackexchange.com/questions/75/very-aggressive-openings
+https://dwheeler.com/chess-openings/
+https://fr.wikipedia.org/wiki/D%C3%A9fense_sicilienne
+
+# cluster: 3d-printing
+https://blog.rahix.de/design-for-3d-printing/
+https://www.josefprusa.com/articles/open-hardware-in-3d-printing-is-dead/
+https://grid.space/stem/
+https://www.michaelfogleman.com/pack3d/
+https://github.com/Klipper3d/klipper
+https://github.com/prusa3d/PrusaSlicer
+https://en.wikipedia.org/wiki/Fused_filament_fabrication
+https://help.prusa3d.com/article/types-of-printers-and-their-differences_112464
+
+# cluster: aquariums
+https://www.tankarium.com/nitrogen-cycle/
+https://fresh.bulkreefsupply.com/content/post/how-to-cycle-a-freshwater-aquarium-complete-beginners-guide
+https://aquariadise.com/fishless-cycling/
+https://www.practicalfishkeeping.co.uk/features/how-to-cycle-a-fish-tank-the-complete-guide/
+https://aquariumscience.org/index.php/2-aquarium-cycling
+https://modestfish.com/betta-fish-care/
+https://www.ratemyfishtank.com/blog/betta-fish-in-a-planted-tank-setup-care-mistakes-to-avoid
+https://aquifarm.com/betta-fish-planted-aquarium
+
+# cluster: home-networking
+https://old.reddit.com/r/HomeNetworking/comments/tu6ifb/explanation_of_docsis_303140_why_upload_speeds/
+https://blog.networkprofile.org/my-home-network-complete-details-2023/
+https://brianchristner.io/how-a-single-raspberry-pi-made-my-home-network-faster/
+https://ben.balter.com/2021/09/01/how-i-re-over-engineered-my-home-network/
+https://www.ctrl.blog/entry/homenet-domain-name.html
+https://clintonboys.com/projects/homelab/03-network/
+https://en.wikipedia.org/wiki/Port_forwarding
+https://en.wikipedia.org/wiki/Power_over_Ethernet
+https://nordvpn.com/blog/open-ports-on-router/
+https://www.tp-link.com/us/home-networking/8-port-switch/tl-sg108pe/v2
+
+# cluster: home-automation
+https://antonfrolov.substack.com/p/i-hired-an-illustrator-to-draw-my
+https://www.home-assistant.io/
+https://tylercipriani.com/blog/2022/10/17/whole-house-circadian-lighting-with-home-assistant/
+https://tristam.ie/2023/758/
+https://en.wikipedia.org/wiki/Home_automation
+https://en.wikipedia.org/wiki/Zigbee
+https://www.simon42.com/home-assistant-anfanger-guide/
+https://blog.usro.net/de/2024/12/wie-home-assistant-funktioniert/
+
+# cluster: formula-1
+http://www.wired.com/autopia/2013/10/red-bull-f1-traction-control/
+https://www.bbc.com/sport/formula1/47527705
+https://arstechnica.com/cars/2017/04/formula-1-technology/
+http://www.wired.com/2014/04/mercedes-f1-turbo
+https://www.formula1.com/en/latest/article.formula-1-launches-virtual-grand-prix-series-to-replace-postponed-races.1znLAbPzBbCQPj1IDMeiOi.html
+https://en.wikipedia.org/wiki/Formula_One
+https://es.wikipedia.org/wiki/F%C3%B3rmula_1
+https://www.youtube.com/watch?v=lkb5kqDJYXk
+
+# cluster: fermentation
+https://fieldreport.caes.uga.edu/publications/C1362/homemade-kimchi-a-science-based-guide-to-safe-fermentation/
+https://www.sfa.gov.sg/food-information/risk-at-a-glance/safety-of-home-fermentation---is-my-homemade-kombucha-safe-to-drink
+https://www.bamco.com/blog/buzz-home-fermentation/
+https://zerowastechef.com/2017/06/24/fermentation-faqs/
+https://immigrantstable.com/how-to-ferment-foods/
+https://www.oekotest.de/essen-trinken/Sauerkraut-selber-machen-So-gelingt-es-Schritt-fuer-Schritt_15870_1.html
+https://www.lecker.de/sauerkraut-selber-machen-so-gehts-72570.html
+https://ko.wikipedia.org/wiki/%EA%B9%80%EC%B9%98
+
+# cluster: franz-kafka
+https://www.newyorker.com/magazine/2020/06/29/the-rescue-will-begin-in-its-own-time
+https://twitter.com/LitAnscombe/status/1442683658951802882
+https://www.bbc.com/news/in-pictures-57267874
+https://www.newyorker.com/magazine/2023/01/16/the-diaries-of-franz-kafka-party-animal
+https://vienna.earth/plate/russell/kafka-insurance-career
+http://www.openculture.com/2017/06/franz-kafka-agonized-too-over-writers-block.html
+https://de.wikipedia.org/wiki/Die_Verwandlung
+https://cs.wikipedia.org/wiki/Franz_Kafka
+
+# cluster: watercolor
+https://www.skillshare.com/en/blog/essential-watercolor-techniques-for-every-artist/
+https://charlenelutz.substack.com/p/watercolor-essentials-12-techniques
+https://craftamo.freshdesk.com/support/solutions/articles/17000148703-watercolor-techniques-for-beginners
+https://watercoloraffair.com/watercolor-techniques-for-beginners
+https://www.udemy.com/course/mastering-glazing-techniques-in-watercolor/
+https://fr.wikipedia.org/wiki/Aquarelle
+https://www.youtube.com/watch?v=aOSaQ50xeAM
+
+# cluster: urban-sketching
+https://www.lizsteel.com/how-to-start-urban-sketching/
+https://www.outdoorpainter.com/urban-sketching-101-insights-from-four-artists/
+https://parkablogs.com/content/urban-sketching-tips-drawing-people
+https://chriswilsonstudio.com/tips-for-urban-sketching/
+https://chriswilsonstudio.com/what-is-urban-sketching/
+
+# cluster: react
+https://stackoverflow.com/questions/31079081/how-can-i-programmatically-navigate-using-react-router
+https://stackoverflow.com/questions/22876978/loop-inside-react-jsx
+https://dillonshook.com/a-critique-of-react-hooks/
+https://usehooks.com/
+https://overreacted.io/why-do-hooks-rely-on-call-order/
+https://react.dev/learn/tutorial-tic-tac-toe
+https://react.dev/learn/thinking-in-react
+https://react.dev/learn/your-first-component
+
+# cluster: tabletop-rpg
+https://www.tribality.com/2019/09/13/five-tips-for-new-dungeon-masters/
+https://www.cgmagonline.com/articles/columns/editors-choice/ec5-new-dungeon-master-tips/
+https://nerdarchy.com/dd-ideas-tips-for-a-new-dungeon-master/
+https://slyflourish.com/five_tips_for_new_dungeon_masters.html
+https://www.dndbeyond.com/posts/159-starting-strong-at-your-first-dungeons-dragons?comment=42
+https://en.wikipedia.org/wiki/Tabletop_role-playing_game
+https://app.roll20.net/characters/
+
+# cluster: mushroom-foraging
+https://northspore.com/blogs/the-black-trumpet/death-cap-mushroom-poisonings-and-safe-foraging-with-greg-marley
+https://harvestsavvy.blogspot.com/2025/12/mushroom-hunting-for-beginners-complete.html
+https://www.wildfooduk.com/artilces/wild-mushrooms-for-beginners/
+https://www.fieldandstream.com/stories/survival/wilderness-survival/safest-mushrooms-to-forage-and-eat
+https://a-z-animals.com/blog/a-beginners-guide-to-mushroom-foraging/
+https://www.wildfooduk.com/articles/how-to-tell-the-difference-between-poisonous-and-edible-mushrooms/
+https://en.wikipedia.org/wiki/Amanita_phalloides
+
+# cluster: interview-prep
+https://github.com/donnemartin/system-design-primer
+https://github.com/jwasham/coding-interview-university
+https://github.com/yangshun/tech-interview-handbook
+https://www.educative.io/collection/page/6630002/190001/270001
+https://medium.com/educative/3-month-coding-interview-bootcamp-904422926ce8
+https://leetcode.com/problems/two-sum/
+https://medium.com/@yurylifshits/the-ultimate-guide-to-ycombinator-interview-preparation-8372628154c3
+
+# cluster: pair-airplanes
+https://fermatslibrary.com/s/how-airplanes-fly-a-physical-description-of-lift
+https://www.cnbc.com/2024/01/06/boeing-737-max-9-grounding-after-alaska-airlines-door-blows-midflight.html
+
+# cluster: pair-calendar-history
+https://www.nature.com/articles/d41586-022-03783-5
+https://en.wikipedia.org/wiki/Gregorian_calendar
+
+# cluster: pair-car-maintenance
+https://www.theautopian.com/this-is-how-electronic-ignition-works-and-also-how-to-make-a-spark-plug-play-music/
+https://www.carvertical.com/en/blog/how-often-should-you-change-your-oil
+
+# cluster: pair-cat-behavior
+https://www.missinganimalresponse.com/lost-cat-behavior/
+https://www.sciencedirect.com/science/article/abs/pii/S1558787823001466
+
+# cluster: pair-color-theory
+https://tallys.github.io/color-theory/
+https://programmingdesignsystems.com/color/a-short-history-of-color-theory/index.html
+
+# cluster: pair-crosswords
+https://www.crosswordunclued.com/2009/01/nyt-election-day-crossword.html
+https://jameswillia.ms/posts/chatgpt-cryptics.html
+
+# cluster: pair-lawn-care
+http://www.richsoil.com/lawn-care.jsp
+http://techcrunch.com/2016/02/10/backed-by-ycombinator-yardbook-is-an-online-marketplace-for-the-30-9-billion-lawncare-business/
+
+# cluster: pair-meal-prep
+https://www.eater.com/23199328/alaska-remote-delivery-food-plane-bettles
+https://www.booritney.com/p/booritneys-ultimate-guide-to-meal
+
+# cluster: pair-minimalism
+https://volument.com/blog/minimalism-the-most-undervalued-development-skill
+https://brandur.org/minimalism
+
+# cluster: pair-nintendo-switch
+http://www.nintendo.com/switch
+https://blog.jonlu.ca/posts/nintendo-switch
+
+# cluster: pair-password-managers
+https://lock.cmpxchg8b.com/passmgrs.html
+https://bitwarden.com/
+
+# cluster: pair-probability-puzzles
+https://en.wikipedia.org/wiki/Monty_Hall_problem
+https://en.wikipedia.org/wiki/Birthday_problem
+
+# cluster: pair-public-speaking
+http://speaking.io
+http://zachholman.com/posts/what-they-dont-tell-you-about-public-speaking/
+
+# cluster: pair-regex
+https://regexcrossword.com/
+https://stackoverflow.com/questions/406230/regular-expression-to-match-a-line-that-doesnt-contain-a-word
+
+# cluster: pair-river-deltas
+https://en.wikipedia.org/wiki/Nile_Delta
+https://en.wikipedia.org/wiki/Mississippi_River_Delta
+
+# cluster: pair-shipping-ports
+https://www.businessinsider.com/amazon-making-own-shipping-containers-bypassing-port-delays-2021-12
+https://www.wsj.com/articles/insider-explains-supply-chain-crisis-phil-levy-shipping-containers-ports-costs-inflation-logistics-11639757471
+
+# cluster: pair-sign-language
+https://www.signtime.apple/applecare/us-EN/asl
+https://metro.co.uk/2018/06/21/famous-gorilla-koko-sign-language-died-age-46-7648488/
+
+# cluster: pair-solar-panels
+https://caseyhandmer.wordpress.com/2022/07/22/were-going-to-need-a-lot-of-solar-panels/
+https://grist.org/buildings/how-germany-outfitted-half-a-million-balconies-with-solar-panels/
+
+# cluster: pair-sous-vide
+http://www.seriouseats.com/2010/04/cook-your-meat-in-a-beer-cooler-the-worlds-best-sous-vide-hack.html
+http://fab.cba.mit.edu/classes/863.14/people/matthew_arbesfeld/2014/12/14/final-project/
+
+# cluster: pair-standing-desks
+http://arshadchowdhury.com/1485-what-happens-when-you-stand-for-2-years/
+http://iamnotaprogrammer.com/Ikea-Standing-desk-for-22-dollars.html
+
+# cluster: pair-tinnitus
+https://scitechdaily.com/tinnitus-linked-to-hidden-undetected-auditory-nerve-damage-a-step-towards-a-cure/
+https://www.lenire.com/
+
+# cluster: pair-unicode
+http://www.joelonsoftware.com/articles/Unicode.html
+https://en.wikipedia.org/wiki/UTF-8
+
+# cluster: pair-vim
+https://en.wikipedia.org/wiki/Vim_%28text_editor%29
+https://stackoverflow.com/questions/11828270/how-do-i-exit-vim
+
+# cluster: pair-vinyl-records
+http://boginjr.com/it/sw/dev/vinyl-boot/
+https://mkaic.substack.com/p/someone-stole-my-car-and-now-i-own
+
+# cluster: pair-wills-and-estates
+https://www.wired.com/story/family-living-will-death-estate-planning-tips/
+https://www.ramseysolutions.com/retirement/how-to-write-a-will
+
+# cluster: one-air-purifier
+https://dynomight.net/ikea-purifier/
+
+# cluster: one-amazon-product
+http://www.amazon.com/dp/B00EOE0WKQ
+
+# cluster: one-antikythera
+https://en.wikipedia.org/wiki/Antikythera_mechanism
+
+# cluster: one-backpack
+https://www.baqpa.com
+
+# cluster: one-banff
+https://en.wikipedia.org/wiki/Banff_National_Park
+
+# cluster: one-bauhaus
+https://en.wikipedia.org/wiki/Bauhaus
+
+# cluster: one-big-o
+https://www.bigocheatsheet.com/
+
+# cluster: one-blue-light-glasses
+https://www.washingtonpost.com/wellness/2023/08/17/blue-light-filter-glasses-eye/
+
+# cluster: one-cap-theorem
+https://mwhittaker.github.io/blog/an_illustrated_proof_of_the_cap_theorem/
+
+# cluster: one-cast-iron
+http://sherylcanter.com/wordpress/2010/01/a-science-based-technique-for-seasoning-cast-iron/
+
+# cluster: one-central-park
+https://en.wikipedia.org/wiki/Central_Park
+
+# cluster: one-champions-league
+https://www.theguardian.com/football/2022/feb/24/russia-football-world-cup-champions-league-ukraine
+
+# cluster: one-choosing-vpn
+https://drewdevault.com/2019/04/19/Your-VPN-is-a-serious-choice.html
+
+# cluster: one-congestion-pricing
+https://www.cnbc.com/2024/06/09/with-congestion-pricing-stop-nyc-enters-new-economic-gridlock-era.html
+
+# cluster: one-cooking-rice
+https://cooking.nytimes.com/article/how-to-cook-grains-rice
+
+# cluster: one-coriolis
+https://en.wikipedia.org/wiki/Coriolis_force
+
+# cluster: one-cover-letter
+http://www.doublefine.com/site/comments/twenty_years_only_a_few_tears/
+
+# cluster: one-crispr
+https://en.wikipedia.org/wiki/CRISPR_gene_editing
+
+# cluster: one-dancing-plague
+https://en.wikipedia.org/wiki/Dancing_plague_of_1518
+
+# cluster: one-dns
+https://howdns.works/
+
+# cluster: one-dune-review
+https://www.esquire.com/entertainment/movies/a46885292/dune-part-two-review/
+
+# cluster: one-dunning-kruger
+https://en.wikipedia.org/wiki/Dunning%E2%80%93Kruger_effect
+
+# cluster: one-egg-substitutes
+https://www.thekitchn.com/best-egg-substitutes-baking-23003895
+
+# cluster: one-electric-toothbrush
+https://www.dyson.com/oral-care/electric-toothbrush/camerajet/ceramic-ultra-blue
+
+# cluster: one-emu-war
+https://en.wikipedia.org/wiki/Emu_War
+
+# cluster: one-eu-ai-act
+https://wolfhf.medium.com/the-eu-ai-act-is-coming-this-time-for-real-probably-df31ad8c451f
+
+# cluster: one-find-xargs
+http://www.r-bloggers.com/find-xargs-like-a-boss/
+
+# cluster: one-fitted-sheet
+https://www.youtube.com/watch?v=DEwConOQmWM
+
+# cluster: one-fresh-pasta
+http://www.nytimes.com/2015/05/13/dining/fresh-pasta-made-simply.html
+
+# cluster: one-fruit-flies
+https://www.flavournetwork.ca/article/how-to-get-rid-of-fruit-flies-in-the-kitchen/
+
+# cluster: one-fusion-breakthrough
+https://www.ft.com/content/4b6f0fab-66ef-4e33-adec-cfc345589dc7
+
+# cluster: one-gift-guide
+http://www.ycgiftideas.com/?2016
+
+# cluster: one-git-rebase
+http://www.mail-archive.com/dri-devel@lists.sourceforge.net/msg39091.html
+
+# cluster: one-gps
+https://en.wikipedia.org/wiki/Global_Positioning_System
+
+# cluster: one-great-wave
+https://en.wikipedia.org/wiki/The_Great_Wave_off_Kanagawa
+
+# cluster: one-hades
+https://en.wikipedia.org/wiki/Hades_%28video_game%29
+
+# cluster: one-hamilton
+https://en.wikipedia.org/wiki/Hamilton_%28musical%29
+
+# cluster: one-hanseatic-league
+https://en.wikipedia.org/wiki/Hanseatic_League
+
+# cluster: one-headphones
+https://www.popsci.com/bose-700-noise-cancelling-headphone-review/
+
+# cluster: one-housing-spain
+https://www.bolsamania.com/noticias/empresas/precio-vivienda-sube-107-noviembre-nuevo-record-espana-idealista--18244306.html
+
+# cluster: one-https
+https://howhttps.works/
+
+# cluster: one-json-yaml
+http://www.json2yaml.com
+
+# cluster: one-knife-sharpening
+https://www.instructables.com/How-to-Sharpen-a-Knife-With-a-Whetstone
+
+# cluster: one-library-of-alexandria
+https://en.wikipedia.org/wiki/Library_of_Alexandria
+
+# cluster: one-lightning
+https://en.wikipedia.org/wiki/Lightning
+
+# cluster: one-machu-picchu
+https://www.smithsonianmag.com/smart-news/machu-picchu-was-purposely-built-top-intersecting-fault-lines-180973216/
+
+# cluster: one-mandela-effect
+https://en.wikipedia.org/wiki/False_memory
+
+# cluster: one-map
+https://www.google.com/maps/place/39%C2%B001%2718.5%22N+93%C2%B035%2740.5%22W/@39.0219215,-93.5946774,253m/data=!3m1!1e3!4m5!3m4!1s0x0:0xd87af7588b9c362e!8m2!3d39.0218056!4d-93.5945833
+
+# cluster: one-mattress
+https://www.fastcompany.com/3065928/sleepopolis-casper-bloggers-lawsuits-underside-of-the-mattress-wars
+
+# cluster: one-migraine-triggers
+http://www.livescience.com/56528-bacteria-migraines-food.html
+
+# cluster: one-moving-checklist
+https://moveplaybook.app/
+
+# cluster: one-mpemba
+https://en.wikipedia.org/wiki/Mpemba_effect
+
+# cluster: one-mrna-vaccines
+https://en.wikipedia.org/wiki/MRNA_vaccine
+
+# cluster: one-netflix-title
+https://www.netflix.com/title/80184771?s=i&trkid=13747225
+
+# cluster: one-new-species
+https://www.nationalgeographic.com/animals/article/meet-the-first-new-cat-species-discovered-in-100-years
+
+# cluster: one-noise-cancelling
+https://en.wikipedia.org/wiki/Active_noise_control
+
+# cluster: one-oauth
+https://aaronparecki.com/oauth-2-simplified/
+
+# cluster: one-olympic-breaking
+https://www.fastcompany.com/90835635/breakdancing-olympics-scoring-trivium-breaking
+
+# cluster: one-onions-cry
+https://www.youtube.com/watch?v=IS9bo3cVmYI
+
+# cluster: one-passport-renewal
+https://travel.state.gov/content/travel/en/passports/have-passport/renew-online.html
+
+# cluster: one-pho
+https://vi.wikipedia.org/wiki/Ph%E1%BB%9F
+
+# cluster: one-placebo
+https://en.wikipedia.org/wiki/Placebo
+
+# cluster: one-podcast-episode
+https://radiolab.org/podcast/91721-oops
+
+# cluster: one-prague-old-town
+https://en.wikipedia.org/wiki/Old_Town_Square
+
+# cluster: one-printing-press
+https://en.wikipedia.org/wiki/Printing_press
+
+# cluster: one-project-hail-mary
+https://www.rifters.com/crawl/?p=11659
+
+# cluster: one-qwerty
+https://en.wikipedia.org/wiki/QWERTY
+
+# cluster: one-rijksmuseum
+https://www.rijksmuseum.nl/en/press/press-releases/rijksmuseum-to-stage-the-largest-vermeer-exhibition-ever
+
+# cluster: one-ring-road
+https://en.wikipedia.org/wiki/Route_1_%28Iceland%29
+
+# cluster: one-ripgrep
+http://blog.burntsushi.net/ripgrep/
+
+# cluster: one-robot-vacuum
+https://timleland.com/robot-vacuum/
+
+# cluster: one-rosetta-stone
+https://en.wikipedia.org/wiki/Rosetta_Stone
+
+# cluster: one-sagrada-familia
+https://en.wikipedia.org/wiki/Sagrada_Fam%C3%ADlia
+
+# cluster: one-salary-negotiation
+https://interviewing.io/blog/sabotage-salary-negotiation-before-even-start
+
+# cluster: one-semver
+https://surfingthe.cloud/semantic-versioning-anti-pattern/
+
+# cluster: one-severance
+https://en.wikipedia.org/wiki/Severance_%28TV_series%29
+
+# cluster: one-shakshuka
+https://foodsmartcolorado.colostate.edu/shakshuka
+
+# cluster: one-silk-road
+https://en.wikipedia.org/wiki/Silk_Road
+
+# cluster: one-sky-blue
+https://en.wikipedia.org/wiki/Rayleigh_scattering
+
+# cluster: one-spotify-playlist
+https://open.spotify.com/playlist/03XGVdYSFum8T6McmcU998
+
+# cluster: one-sqlite
+https://sqlite.org/whentouse.html
+
+# cluster: one-ssh-keys
+http://resin.io/email-github-public-ssh-key/
+
+# cluster: one-stack-overflow-sale
+https://www.wsj.com/articles/software-developer-community-stack-overflow-sold-to-tech-giant-prosus-for-1-8-billion-11622648400
+
+# cluster: one-stardew-valley
+https://en.wikipedia.org/wiki/Stardew_Valley
+
+# cluster: one-storing-herbs
+https://www.foodnetwork.com/recipes/articles/how-to-store-fresh-herbs
+
+# cluster: one-tax-deadline
+https://www.wsj.com/articles/u-s-treasury-likely-to-push-back-april-15-tax-filing-deadline-sources-11583897351
+
+# cluster: one-tcp-udp
+http://1024monkeys.wordpress.com/2014/04/01/game-servers-udp-vs-tcp/
+
+# cluster: one-the-wire
+https://en.wikipedia.org/wiki/The_Wire
+
+# cluster: one-tie-a-tie
+https://en.wikipedia.org/wiki/The_85_Ways_to_Tie_a_Tie
+
+# cluster: one-time-falsehoods
+http://infiniteundo.com/post/25326999628/falsehoods-programmers-believe-about-time
+
+# cluster: one-tiramisu
+https://it.wikipedia.org/wiki/Tiramis%C3%B9
+
+# cluster: one-tour-du-mont-blanc
+https://en.wikipedia.org/wiki/Tour_du_Mont_Blanc
+
+# cluster: one-twelve-factor
+https://12factor.net/
+
+# cluster: one-unclog-drain
+https://www.yahoo.com/lifestyle/unclog-drain-without-resorting-chemicals-145058508.html
+
+# cluster: one-video-essay
+https://www.youtube.com/watch?v=bUAbGV7RA0Q&list=PLGEE7pGLuppT9IthLu41d5vpgfF9HhQiL
+
+# cluster: one-voynich
+https://en.wikipedia.org/wiki/Voynich_manuscript
+
+# cluster: one-waste-sorting
+https://de.wikipedia.org/wiki/M%C3%BClltrennung
+
+# cluster: one-water-intake
+http://www.nytimes.com/2015/08/25/upshot/no-you-do-not-have-to-drink-8-glasses-of-water-a-day.html?_r=0&abt=0002&abg=1
+
+# cluster: one-webassembly
+https://www.smashingmagazine.com/2017/05/abridged-cartoon-introduction-webassembly/#
+
+# cluster: one-wine-stains
+https://www.tomsguide.com/uk/how-to/how-to-remove-red-wine-stains-from-carpet-clothes-and-more
+
+# cluster: one-wordle
+https://en.wikipedia.org/wiki/Wordle
+
+# fails: https://stackoverflow.com/questions/42151544/when-to-use-rabbitmq-over-kafka blocked (HTTP 403 Forbidden)
+# fails: https://stackoverflow.com/questions/38024514/understanding-kafka-topics-and-partitions blocked (HTTP 403 Forbidden)
+# fails: https://stackoverflow.com/questions/17708489/using-kafka-as-a-cqrs-eventstore-good-idea blocked (HTTP 403 Forbidden)
+# fails: https://stackoverflow.com/questions/41517798/proper-way-to-create-dynamic-workflows-in-airflow blocked (HTTP 403 Forbidden)
+# fails: https://stackoverflow.com/questions/43410836/how-to-remove-default-example-dags-in-airflow blocked (HTTP 403 Forbidden)
+# fails: https://stackoverflow.com/questions/40651783/airflow-how-to-delete-a-dag blocked (HTTP 403 Forbidden)
+# fails: https://stackoverflow.com/questions/31610971/spark-repartition-vs-coalesce blocked (HTTP 403 Forbidden)
+# fails: https://stackoverflow.com/questions/34077353/how-to-change-dataframe-column-names-in-pyspark blocked (HTTP 403 Forbidden)
+# fails: https://stackoverflow.com/questions/769683/how-to-show-tables-in-postgresql blocked (HTTP 403 Forbidden)
+# fails: https://stackoverflow.com/questions/109325/postgresql-describe-table blocked (HTTP 403 Forbidden)
+# fails: https://stackoverflow.com/questions/3800551/select-first-row-in-each-group-by-group blocked (HTTP 403 Forbidden)
+# fails: https://stackoverflow.com/questions/72799237/only-run-a-set-of-models blocked (HTTP 403 Forbidden)
+# fails: https://stackoverflow.com/questions/73784913/dbt-ref-vs-source blocked (HTTP 403 Forbidden)
+# fails: https://www.wow.pt/en/en/news-and-blog/post/best-wine-experiences-in-porto blocked (HTTP 403 Forbidden)
+# fails: https://theculturetrip.com/articles/10-wineries-and-vineyards-to-visit-in-porto connection (connection failed: stream error received)
+# fails: https://www.trvlogue.com/en/porto-lisbon-train-cp blocked (HTTP 429 Too Many Requests)
+# fails: https://rr.pt/noticia/pais/2023/10/31/lisboa-porto-a-55-euros-cp-tem-45-mil-bilhetes-em-promocao/353236/ blocked (HTTP 403 Forbidden)
+# fails: https://www.tripadvisor.com/RestaurantsNear-g189158-d195649-Alfama-Lisbon_Lisbon_District_Central_Portugal.html blocks robots
+# fails: https://www.homedepot.ca/en/home/ideas-how-to/kitchen/how-to-buy-kitchen-cabinets.html connection (connection failed: stream error received)
+# fails: https://www.fabuwood.com/blog/kitchen-cabinet-buying-guide blocked (HTTP 429 Too Many Requests)
+# fails: https://www.hgtv.com/design/rooms/kitchens/granite-vs-quartz-is-one-better-than-the-other blocked (HTTP 403 Forbidden)
+# fails: https://www.homedepot.com/c/kitchen_cabinets_HT_BG_KI blocks robots
+# fails: https://www.ikea.com/au/en/files/pdf/aa/24/aa2441d4/metod-kitchen-cabinets-buying-guide.pdf pdf
+# fails: https://marcoele.com/descargas/6/mattebon.pdf pdf
+# fails: https://www.leevalley.com/en-us/discover/sharpen-net/how-to-sharpen blocked (HTTP 429 Too Many Requests)
+# fails: https://www.leevalley.com/en-us/shop/tools/plans/70730-benchcrafted-workbench-plans blocked (HTTP 429 Too Many Requests)
+# fails: https://www.feinewerkzeuge.de/media/94/d4/c0/1750332492/roubo-hobelbank-bauplan-de.pdf pdf
+# fails: https://www.drugs.com/cg/patellofemoral-pain-syndrome-exercises.html blocked (HTTP 403 Forbidden)
+# fails: https://cochranelibrary.com/cdsr/doi/10.1002/14651858.CD010387.pub2 http_error (HTTP 412 Precondition Failed)
+# fails: https://www.dartmouth-hitchcock.org/sites/default/files/2022-06/ACL-Recontruction-Physical-Therapy-Protocol.pdf pdf
+# fails: https://chess.stackexchange.com/questions/75/very-aggressive-openings blocked (HTTP 403 Forbidden)
+# fails: https://aquifarm.com/betta-fish-planted-aquarium blocked (HTTP 403 Forbidden)
+# fails: http://www.wired.com/autopia/2013/10/red-bull-f1-traction-control/ dead link
+# fails: https://stackoverflow.com/questions/31079081/how-can-i-programmatically-navigate-using-react-router blocked (HTTP 403 Forbidden)
+# fails: https://stackoverflow.com/questions/22876978/loop-inside-react-jsx blocked (HTTP 403 Forbidden)
+# fails: https://app.roll20.net/characters/ needs javascript (virtual tabletop)
+# fails: https://www.sciencedirect.com/science/article/abs/pii/S1558787823001466 blocked (HTTP 403 Forbidden)
+# fails: https://stackoverflow.com/questions/406230/regular-expression-to-match-a-line-that-doesnt-contain-a-word blocked (HTTP 403 Forbidden)
+# fails: https://www.wsj.com/articles/insider-explains-supply-chain-crisis-phil-levy-shipping-containers-ports-costs-inflation-logistics-11639757471 paywall
+# fails: https://stackoverflow.com/questions/11828270/how-do-i-exit-vim blocked (HTTP 403 Forbidden)
+# fails: http://www.amazon.com/dp/B00EOE0WKQ blocks robots
+# fails: https://www.baqpa.com timeout (timed out)
+# fails: https://www.washingtonpost.com/wellness/2023/08/17/blue-light-filter-glasses-eye/ connection (connection failed: stream error received)
+# fails: http://www.ycgiftideas.com/?2016 dead link
+# fails: https://www.fastcompany.com/3065928/sleepopolis-casper-bloggers-lawsuits-underside-of-the-mattress-wars blocked (HTTP 403 Forbidden)
+# fails: https://www.fastcompany.com/90835635/breakdancing-olympics-scoring-trivium-breaking blocked (HTTP 403 Forbidden)
+# fails: https://travel.state.gov/content/travel/en/passports/have-passport/renew-online.html blocked (HTTP 403 Forbidden)
+# fails: https://www.rifters.com/crawl/?p=11659 blocked (HTTP 401 Unauthorized)
+# fails: http://resin.io/email-github-public-ssh-key/ dead link
+# fails: https://www.wsj.com/articles/software-developer-community-stack-overflow-sold-to-tech-giant-prosus-for-1-8-billion-11622648400 paywall
+# fails: https://www.foodnetwork.com/recipes/articles/how-to-store-fresh-herbs blocked (HTTP 403 Forbidden)
+# fails: https://www.wsj.com/articles/u-s-treasury-likely-to-push-back-april-15-tax-filing-deadline-sources-11583897351 paywall
+# fails: http://infiniteundo.com/post/25326999628/falsehoods-programmers-believe-about-time blocked (HTTP 403 Forbidden)
+
+# thin: https://www.youtube.com/watch?v=23_1WlxGGM4 254
+# thin: https://www.youtube.com/watch?v=9idsf4j368g 225
+# thin: https://www.reddit.com/r/HomeImprovement/comments/dyvj3u/so_i_messed_up_bad_real_bad_one_more_warning_to/ 6
+# thin: https://www.reddit.com/r/MechanicalKeyboards/comments/k7t53s/new_model_f_ultracompact_f77_keyboard_impressions/ 6
+# thin: https://cihub.notion.site/spanish 95
+# thin: https://cervantesobservatorio.fas.harvard.edu/es/contenido/examenes-del-instituto-cervantes-dele-y-mas 121
+# thin: https://www.youtube.com/watch?v=OCYjoj6cfno 239
+# thin: https://old.reddit.com/r/HomeNetworking/comments/tu6ifb/explanation_of_docsis_303140_why_upload_speeds/ 38
+# thin: https://www.youtube.com/watch?v=lkb5kqDJYXk 218
+# thin: https://vienna.earth/plate/russell/kafka-insurance-career 0
+# thin: https://www.youtube.com/watch?v=aOSaQ50xeAM 229
+# thin: https://regexcrossword.com/ 15
+# thin: https://www.signtime.apple/applecare/us-EN/asl 154
+# thin: https://drewdevault.com/2019/04/19/Your-VPN-is-a-serious-choice.html 154
+# thin: https://www.youtube.com/watch?v=DEwConOQmWM 219
+# thin: http://www.json2yaml.com 43
+# thin: https://www.instructables.com/How-to-Sharpen-a-Knife-With-a-Whetstone 66
+# thin: https://www.google.com/maps/place/39%C2%B001%2718.5%22N+93%C2%B035%2740.5%22W/@39.0219215,-93.5946774,253m/data=!3m1!1e3!4m5!3m4!1s0x0:0xd87af7588b9c362e!8m2!3d39.0218056!4d-93.5945833 131
+# thin: https://www.youtube.com/watch?v=IS9bo3cVmYI 230
+# thin: https://www.youtube.com/watch?v=bUAbGV7RA0Q&list=PLGEE7pGLuppT9IthLu41d5vpgfF9HhQiL 228
+
+# repeats:
+https://lisbonlisboaportugal.com/amp/lisbon-to-porto-train-amp.html
+https://seat61.com/trains-and-routes/lisbon-to-porto-by-train.htm
+https://www.lingoda.com/blog/en/when-to-use-subjunctive-tense-in-spanish/?utm_source=newsletter&utm_medium=email
+https://blog.wego.com/lisbon-airport-to-city-centre/?utm_source=twitter
+https://en.m.wikipedia.org/wiki/Apache_Kafka
+https://en.m.wikipedia.org/wiki/Sagrada_Fam%C3%ADlia
+https://en.wikipedia.org/wiki/Lisbon#History
+https://www.postgresql.org/docs/current/indexes.html#INDEXES-INTRO
+http://www.seat61.com/trains-and-routes/lisbon-to-porto-by-train
+https://12factor.net
+https://www.bolsamania.com/noticias_print/empresas/precio-vivienda-sube-107-noviembre-nuevo-record-espana-idealista--18244306.html
+https://www.carvertical.com/gb/blog/how-often-should-you-change-your-oil
+https://www.booritney.com/writing/meal-prep
