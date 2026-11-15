@@ -419,11 +419,16 @@ struct Split {
 }
 
 /// Asks whether `word`, on the pages `list` (indexes into `pages`), names
-/// unrelated things. `None` when it doesn't: one meaning (remembered, and
-/// asked again only once the word has twice the pages), all pages in one
+/// unrelated things. `None` when it doesn't: one meaning, all pages in one
 /// cluster, no other meaning that could be named, or a failed request
-/// (recorded in `out`). A one-meaning verdict is remembered only if
-/// `remember`.
+/// (recorded in `out`).
+///
+/// A one-meaning verdict holds for the rest of the review (in `same`) until
+/// the word has twice the pages. If `remember`, it is also saved with the
+/// pages the model was shown, and a later review reuses it only when it
+/// would show the same pages in the same groups: at temperature 0 asking
+/// again would get the same answer. So a review of an archive that grew
+/// checks the word as a review of all its pages from scratch would.
 #[allow(clippy::too_many_arguments)]
 async fn check_word<R: Reviewer>(
     db: &Db,
@@ -434,14 +439,10 @@ async fn check_word<R: Reviewer>(
     pages: &[AnalyzedPage],
     members: &BTreeMap<String, Vec<usize>>,
     remember: bool,
+    same: &mut BTreeMap<String, usize>,
     out: &mut Retag,
 ) -> Result<Option<Split>> {
-    let key = format!("meanings:{word}");
-    if let Some(n) = db
-        .tag_decision(&key)?
-        .and_then(|d| d.strip_prefix("same:").and_then(|n| n.parse::<usize>().ok()))
-        && list.len() < n * 2
-    {
+    if same.get(word).is_some_and(|&n| list.len() < n * 2) {
         return Ok(None);
     }
     let mut groups: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
@@ -467,6 +468,20 @@ async fn check_word<R: Reviewer>(
                 .collect()
         })
         .collect();
+    // What the model is asked: the pages shown, group by group.
+    let asked = shown
+        .iter()
+        .map(|g| g.iter().map(|p| p.id.to_string()).collect::<Vec<_>>().join(","))
+        .collect::<Vec<_>>()
+        .join("|");
+    let key = format!("meanings:{word}");
+    let verdict = format!("same:{asked}");
+    if db.tag_decision(&key)?.as_deref() == Some(verdict.as_str()) {
+        if remember {
+            same.insert(word.to_string(), list.len());
+        }
+        return Ok(None);
+    }
     out.meaning_checks += 1;
     // A word checked again after classification is listed once.
     if !out.checked.iter().any(|(w, _)| w == word) {
@@ -481,7 +496,8 @@ async fn check_word<R: Reviewer>(
     let things = match meanings::check(reviewer, word, &shown).await {
         Ok(meanings::Verdict::Same) => {
             if remember {
-                db.set_tag_decision(&key, &format!("same:{}", list.len()), "llm")?;
+                same.insert(word.to_string(), list.len());
+                db.set_tag_decision(&key, &verdict, "llm")?;
             }
             return Ok(None);
         }
@@ -801,6 +817,7 @@ pub async fn retag<R: Reviewer, E: Embedder>(
     // model says whether it is, and each meaning gets a qualified tag. This
     // includes a name the model gave two unrelated clusters (amazon for the
     // company and for the rainforest).
+    let mut same: BTreeMap<String, usize> = BTreeMap::new();
     let words: Vec<String> = vocabulary
         .values()
         .filter(|t| !t.name.contains('-'))
@@ -819,6 +836,7 @@ pub async fn retag<R: Reviewer, E: Embedder>(
             &pages,
             &members,
             true,
+            &mut same,
             &mut out,
         )
         .await?
@@ -923,6 +941,7 @@ pub async fn retag<R: Reviewer, E: Embedder>(
             &pages,
             &members,
             !split_before,
+            &mut same,
             &mut out,
         )
         .await?
@@ -1244,13 +1263,70 @@ mod tests {
         );
         assert_eq!(out.untagged, 1);
         assert_eq!(out.dropped, ["python-snake"]);
-        // The one-meaning verdict is remembered, but not python's second
-        // check, which only saw the language.
+        // The one-meaning verdict is remembered with the pages shown, one
+        // group each, but not python's second check, which only saw the
+        // language.
         assert_eq!(
             db.tag_decision("meanings:coffee").unwrap().as_deref(),
-            Some("same:3")
+            Some("same:1|2|3")
         );
         assert_eq!(db.tag_decision("meanings:python").unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_one_meaning_verdict_is_reused_only_for_the_same_pages() {
+        use crate::reconcile::tests::{FakeReviewer, archive, no_names};
+        let settings = Settings {
+            cluster_similarity: 0.8,
+            min_support: 2,
+            candidates: 8,
+            max_tags: 3,
+            concurrency: 1,
+        };
+        // Pages unlike each other: each is its own group in the check.
+        let pages = [
+            (&["coffee"][..], [1.0, 0.0, 0.0]),
+            (&["coffee"][..], [0.0, 1.0, 0.0]),
+            (&["coffee"][..], [0.0, 0.0, 1.0]),
+        ];
+        let same = || json!({"groups": [], "same_meaning": true});
+        let coffee = || json!({"tags": ["coffee"]});
+        let db = archive(&pages);
+        let mut replies = vec![same()];
+        replies.extend((0..6).map(|_| coffee()));
+        let reviewer = FakeReviewer::new(replies);
+        let first = retag(&db, &reviewer, &no_names(), &settings, |_| {})
+            .await
+            .unwrap();
+        // The same pages: the same question, so the verdict holds.
+        let second = retag(&db, &reviewer, &no_names(), &settings, |_| {})
+            .await
+            .unwrap();
+        assert_eq!((first.meaning_checks, second.meaning_checks), (1, 0));
+
+        // With a fourth page the question changes, so it is asked again, as
+        // a review of the four pages from scratch would.
+        let grown = archive(&[pages[0], pages[1], pages[2], (&["coffee"][..], [0.5, 0.5, 0.5])]);
+        let verdict = db.tag_decision("meanings:coffee").unwrap().unwrap();
+        grown
+            .set_tag_decision("meanings:coffee", &verdict, "llm")
+            .unwrap();
+        let mut replies = vec![same()];
+        replies.extend((0..4).map(|_| coffee()));
+        let out = retag(
+            &grown,
+            &FakeReviewer::new(replies),
+            &no_names(),
+            &settings,
+            |_| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.meaning_checks, 1);
+        assert_eq!(
+            grown.tag_decision("meanings:coffee").unwrap().as_deref(),
+            Some("same:1|2|3|4")
+        );
     }
 
     /// Embeds a page by its first topic, from a fixed table; other texts get

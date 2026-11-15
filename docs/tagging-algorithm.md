@@ -108,7 +108,7 @@ erDiagram
 
 - **Tags are tree nodes.** A category in the tree is a tag too; `parent_id` links a tag to the category above it.
 - **`tag_decisions` is the review's memory.** It records verdicts and refusals so they aren't asked again:
-  - `meanings:<word>` = `same:<pages>`: the word was found to have one meaning on that many pages. It is asked again once the word has twice as many pages.
+  - `meanings:<word>` = `same:<pages shown>`: the word was found to have one meaning when the model was shown these pages, by id, group by group (`same:12,15|31`). A later review reuses the verdict only when it would show the same pages in the same groups.
   - `retag:<pages>`: a retag was declined, undone or skipped at that archive size. It is proposed again at 1.5 times the pages.
   - `place:<tag>><path>`: a declined placement in the tree.
   - `merge:<a>|<b>` and `split:<tag>`: decisions of the other review mode (section 7).
@@ -362,7 +362,7 @@ flowchart TD
   two -->|"yes"| split["Several meanings"]
 ```
 
-- **Remembered verdicts.** A "one meaning" verdict is saved with the word's page count, and the word is asked about again once it has twice as many pages.
+- **Remembered verdicts.** A "one meaning" verdict is saved with the pages the model was shown. A later review reuses it only for the same question: at temperature 0, asking again would get the same answer. Within one review, the second meanings check (5.6) skips a word judged to have one meaning until the word has twice the pages.
 - **Groups.** The word's pages are grouped by cluster, largest first. Clusters beyond the fourth join the largest group, and each group shows 5 pages: a title and the first sentence of the summary.
 - **Who keeps the word.** If the word has several meanings, the meaning with the most pages keeps the plain word, with the comparison's description. A false split then only takes the word off the smaller groups' pages.
 - **Names for the other meanings.** Each other meaning gets `word-qualifier`. A vocabulary tag of that form already made for at least half of these pages is reused. Otherwise the qualifier is up to two words of the model's name, or of its description if the name has none. It leaves out the word itself and generic words such as genus, species, type and kind.
@@ -829,6 +829,24 @@ Every review classifies every page again, about one request per page, plus clust
 
 *Measure:* churn (pages whose first tag changes between two reviews with no new pages) and time per review.
 
+> [!NOTE]
+> **Measured; not worth building for quality.** With no new pages there is no churn since 11.9. To measure growth, each test import was reviewed with a quarter of its pages held back, then again with them added (`target/experiments/run_growth.sh`, `run_import_growth.sh`, `growth.py`). The held pages either kept their import tags or were imported again after the first review, as a later import would bring them. Both gave the same picture, since the import doesn't see the review's tags (`b990074`): the re-imported pages took a reviewed tag for 8 of their 92 tags.
+>
+> | Earlier pages, 4 imports | A third more pages on the same topics | Every fourth topic added later |
+> |---|---|---|
+> | Pages whose tags changed | 151–156 of 438 | 54–88 of 446 |
+> | Got a tag: their topic reached 3 pages | 43–47 | 4–14 |
+> | Same grouping, new name | 58–64 | 22–25 |
+> | Moved to another tag, or lost theirs | 33–39 | 18–33 |
+> | Right → wrong, wrong → right | 4–6, 47–48 | 6, 5 |
+>
+> - Rebuilding the vocabulary is what improves earlier pages as the archive grows: most changes give a page its first tag or the right one. Incremental reviews would keep those pages as they were.
+> - A grown archive ends where a fresh review of all its pages ends: the same tags on 579 of 582 pages, and on all 582 when the new pages are new topics. The 3 others are a fix below.
+> - Caching the model's replies wouldn't save time after growth: the second review repeated 2 of the first one's 848 requests, since each page's candidate tags carry the new vocabulary's descriptions.
+> - Renames are the avoidable part: `horses` → `horse`, `bicycle` → `cycling`, `seashells` → `conchology`. Offering the naming each cluster's previous name keeps it 21 times in 25. But it also keeps names the naming rules would correct (`bird-species`, `board-game-history`, `sleep-hygiene`), and it changes 4 of 81 naming replies on an unchanged archive. Not adopted.
+>
+> **Fixed** (not committed yet): a "one meaning" verdict was reused until the word had twice the pages, so a review after growth skipped checks a fresh review made, and lost `indonesia` on one import. A verdict is now kept with the pages the model was shown, and reused only for the same question (5.4). With that, a grown archive ends with the same tags as a fresh review on all 582 pages. First reviews are unchanged, and a second review still changes nothing, with the same requests as before (`run_memo.sh`).
+
 ### 11.7 Make the evaluation able to show the next gain
 
 On the held-out set's topics of 3+ pages the review already gets 96% of pages right, and the differences between versions sit within the noise between reviews. To see a real improvement:
@@ -854,7 +872,7 @@ The naming judged them to fit, but neither the classifier nor the yes/no check a
 *Found while measuring 11.5.* A review runs at the end of every import and on every `revise-tags`, and it read the archive's current tags, its own earlier output. So a second review of an unchanged archive differed from the first, and it was worse. It changed 7–20 pages and lost a topic on three of the four imports: `amazon-rainforest` came back as `amazon-river`, and `houseplants` fell apart. Untagged pages went from 14 to 23.
 
 > [!NOTE]
-> **Done** (not committed yet). The first time a review sees a page, it freezes the page's tags and their descriptions in `pages.review_topics`. Every later review reads those frozen topics: for the page vectors, the seeds and their descriptions, and the cluster-naming lines. A review is now a function of the pages' import data, and at temperature 0 the same pages give the same tags.
+> **Done** in `c410103`. The first time a review sees a page, it freezes the page's tags and their descriptions in `pages.review_topics`. Every later review reads those frozen topics: for the page vectors, the seeds and their descriptions, and the cluster-naming lines. A review is now a function of the pages' import data, and at temperature 0 the same pages give the same tags.
 > - First reviews of the four imports gave exactly the same tags as before.
 > - Second reviews of those archives: "no changes needed" on all four.
 > - Archives reviewed by older code get their current tags frozen at their next review, and are stable from then on.
@@ -888,6 +906,7 @@ These were measured on the test sets and didn't help, or made things worse:
 | Two reviews of one import | agree on 0.95–0.96 | **identical** | agree on 0.94–0.97 | **identical** |
 | Collisions on ambiguous words | 0–1 | 0 | 0–1 | 0–1 |
 | A second review of the same archive | changed 7–20 pages; lost a topic in 3 of 4 | **no changes** | same | **no changes** |
+| A third more pages, against a fresh review of all of them | not measured | **same tags on 300/300** | not measured | **same tags on 282/282** |
 
 The worst case improved most. Before, one of the old set's reviews lost three topics and left 18 pages untagged. Now no import loses a topic, and the most pages left untagged is 6. The remaining gaps are pages whose cluster got a name narrower than their topic (11.8), and the held-out set's long tail of topics with 1 or 2 pages (11.3).
 
