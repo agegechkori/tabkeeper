@@ -675,14 +675,36 @@ User message: `Tag: {tag}`, then `Pages with this tag:` and `- page {id}: {title
 |---|---|---|
 | `scripts/cluster_urls.txt` ("old set") | 141 in 27 topic clusters | Tag sharing; words with several meanings spread over clusters (rust, python, java, go, apple, jaguar, mercury). The prompts were tuned on it. |
 | `scripts/holdout_urls.txt` ("held-out set") | 150: 111 in 27 topics of 3+ pages, 39 on topics of 1–2 pages | Topics the prompts never saw, and a long tail like a real archive's. |
+| `scripts/realistic_urls.txt` ("realistic set") | 501 in 152 topics: 26 of 5–44 pages, 25 pairs and 101 single pages. 53 are expected not to load. | One person's tabs: a few big interests with subtopics, a long tail, pages in other languages, pages that fail to load, and 13 repeated URLs. No prompt is tuned on it. See `docs/realistic-test-set.md`. |
 
-- **First-tag pairwise F1** (the headline number) looks at every pair of pages on topics of 3+ pages. Precision is the share of pairs with the same first tag that are on the same topic. Recall is the share of same-topic pairs that got the same first tag.
-- **Cluster share** is, for each topic, the share of its pages that have its most common tag.
+Each set has two imports, and a change is measured by reviewing both. Where a result gives one number for a set, it is the mean of the two reviews, and the brackets give each review's own value.
+
+### 9.1 First-tag pairwise F1
+
+The headline number compares the review's first tags with the labeled topics, pair by pair:
+
+1. Take the pages on labeled topics of 3+ pages. Pages that didn't load are left out and reported separately.
+2. Keep only each page's first tag.
+3. Look at every pair of these pages. A pair should match if both pages are on the same topic. It does match if both have the same first tag.
+4. **Precision** is the share of matching pairs that are on the same topic. **Recall** is the share of same-topic pairs that match. **F1** is their harmonic mean.
+
+Tag names don't matter, only which pages share a first tag. Merging two topics under one tag lowers precision, and splitting one topic across several tags lowers recall. Second and third tags don't count, and neither do pages on topics of 1 or 2 pages. An untagged page forms no pairs, so it lowers recall but not precision.
+
+> [!NOTE]
+> **An example.** In the realistic set, the 39 Portugal pages make 741 same-topic pairs. The 9B model's review of the first import (11.10) gave them the first tags `lisbon` (15 pages), `portugal` (11), `algarve` (8), `portugal-trains` (4) and `portugal-travel` (1). Only 194 of the 741 pairs share a tag, so recall on this topic is 26%, although no tag is wrong. This is why the realistic set scores about 0.5 with a precision of 0.97.
+
+### 9.2 The other numbers
+
 - **First tag from another topic** counts pages whose first tag mostly sits on another topic's pages.
-- **Untagged** counts pages left without a topic tag.
-- **Collisions** count tags found on both topics of an ambiguous word.
+- **Untagged** counts pages left without a topic tag. **Lost topics** are topics where no page's first tag is one mostly used on that topic.
+- **Coverage** is the share of all pages, the long tail included, that have any tag.
+- **Collisions** count first tags on pages of two topics that use one word in different meanings, as the labels list them (`# ambiguous:` lines), such as `apache-kafka` on a Franz Kafka page.
+- **Agreement** compares two reviews with each other the way F1 compares a review with the labels. Of the page pairs that share a first tag in one review, it asks how many also share one in the other: it is the pairwise F1 of the two first-tag groupings. It covers every labeled page that loaded, the 1–2-page topics too. A review gives the same tags every time for the same import (11.5), so agreement compares the reviews of a set's two imports. It shows how much the result depends on how the pages happened to be imported.
+- **Cluster share**, an older measure from `compare_trees.py`, is for each topic the share of its pages that have its most common tag.
 
-Scripts: `scripts/score_holdout.py`, `scripts/compare_trees.py --clusters`, `scripts/meanings_bench.py`, and `scripts/score_tree.py` for the tree (not committed yet; it waits for `scripts/tree_domains.txt` to be agreed). `scripts/diagnose.py --labels holdout|old ARCHIVE…` reports all of these on topics of 3+ pages: F1, first tags from another topic, untagged pages by cause, lost topics and coverage. With the review's trace next to the archive, it also says whether the topic's tag was offered and whether the model answered `none` anyway. `--stability` compares reviews.
+The realistic set adds an F1 over groups of related topics (coarse F1), how pages in other languages and thin pages fare, and how many repeated URLs the import folded. See `docs/realistic-test-set.md`.
+
+Scripts: `scripts/score_holdout.py`, `scripts/compare_trees.py --clusters`, `scripts/meanings_bench.py`, and `scripts/score_tree.py` for the tree (not committed yet; it waits for `scripts/tree_domains.txt` to be agreed). `scripts/diagnose.py --labels holdout|old|realistic ARCHIVE…` reports all of these on topics of 3+ pages: F1, first tags from another topic, untagged pages by cause, lost topics and coverage. With the review's trace next to the archive, it also says whether the topic's tag was offered and whether the model answered `none` anyway. `--stability` adds the agreement between every pair of the archives given.
 
 > [!WARNING]
 > **Imports differ; reviews don't any more.** Reviews of two imports of the same pages differ by up to 0.04 F1, because each import tags the pages a little differently. At temperature 0.2, two reviews of one import also differed: by up to 0.02 F1, and 12 against 18 untagged pages. The review now runs at temperature 0 and gives the same tags every time. So one review per import measures a change, and all four imports (h1, h2, t1, t2) are needed to see past the imports' differences.
@@ -878,6 +900,49 @@ The naming judged them to fit, but neither the classifier nor the yes/no check a
 > - Archives reviewed by older code get their current tags frozen at their next review, and are stable from then on.
 > - Adding pages still rebuilds the vocabulary from all of them, so some earlier pages can change tags. 11.6 is about that.
 
+### 11.10 Other models
+
+Every prompt was tuned with `qwen3:4b`. Would a newer model of the same size, or a bigger one, tag better? Tried on 2026-11-15 with the Qwen3.5 family.
+
+Each model reviewed the same `qwen3:4b` imports, two per test set, with the same prompts and settings: temperature 0, thinking off, and a presence penalty of 0 (Qwen3.5 defaults to 1.5). Only the review's model changes; the summaries and import tags stay `qwen3:4b`'s.
+
+- On a Mac, Ollama's plain `qwen3.5:<size>` tags are MLX builds, which refuse structured output ("structured output is unavailable"). The GGUF builds, such as `qwen3.5:4b-q4_K_M`, enforce the schema.
+- Ollama's library has no `Q5_K_M` of the 2B, so the one tested is unsloth's (`hf.co/unsloth/Qwen3.5-2B-GGUF:Q5_K_M`). As pulled, it had no chat formatting, only a bare `{{ .Prompt }}` template. It was wrapped in a local model with Ollama's `qwen3.5` renderer, parser and defaults. It was made with a different tool chain, so part of any difference from the official builds may come from that.
+
+*Measure:* F1 per set, agreement, collisions and review time (section 9). The builds below are `q4_K_M`.
+
+| | `qwen3:4b` | `qwen3.5:2b` | `qwen3.5:4b` | `qwen3.5:9b` |
+|---|---|---|---|---|
+| F1, held-out | **0.967** (0.97, 0.96) | 0.890 (0.92, 0.86) | 0.945 (0.93, 0.96) | 0.964 (0.95, 0.98) |
+| F1, old set | **0.907** (0.88, 0.93) | 0.813 (0.77, 0.86) | 0.880 (0.91, 0.85) | 0.890 (0.84, 0.94) |
+| F1, realistic | 0.475 (0.51, 0.44) | 0.496 (0.50, 0.49) | 0.497 (0.53, 0.46) | **0.523** (0.54, 0.50) |
+| Agreement: held-out, old, realistic | 0.92, 0.91, 0.70 | 0.75, 0.82, 0.58 | 0.90, 0.84, 0.63 | 0.90, 0.85, **0.75** |
+| Collisions, realistic | 0, 0 | 3, 1 | 0, 0 | 2, 0 |
+| Review time | 1× | 0.55–0.8× | 1.15–1.35× | 2.2–2.7× |
+| Size of the weights | 2.5 GB | 1.9 GB | 3.3 GB | 6.6 GB |
+
+The 2B was also tried at higher precision. `qwen3:4b` reviews take 189–223 s on the held-out and old sets and 599–699 s on the realistic set.
+
+| `qwen3.5:2b` build | `q4_K_M` (Ollama) | `Q5_K_M` (unsloth) | `q8_0` (Ollama) |
+|---|---|---|---|
+| Size of the weights | 1.9 GB | 2.1 GB | 2.7 GB |
+| F1, held-out | **0.890** (0.92, 0.86) | 0.878 (0.93, 0.83) | 0.867 (0.91, 0.82) |
+| F1, old set | 0.813 (0.77, 0.86) | **0.890** (0.93, 0.85) | 0.875 (0.93, 0.82) |
+| F1, realistic | 0.496 (0.50, 0.49) | 0.487 (0.51, 0.47) | **0.503** (0.50, 0.50) |
+| Agreement: held-out, old, realistic | 0.75, 0.82, 0.58 | 0.58, 0.81, 0.61 | 0.53, 0.80, 0.68 |
+| Collisions, realistic | 3, 1 | 1, 1 | 0, 1 |
+| Review time: held-out and old; realistic | 136–148 s; 363–498 s | 168–249 s; 451–586 s | 136–303 s; 461–594 s |
+
+> [!NOTE]
+> **Tried; `qwen3:4b` stays.**
+> - **`qwen3.5:4b`** is no better, and slower. It files neighbouring topics under broad names: Go with Java under `programming-language`, construction machines with cars under `vehicles`. `qwen3:4b` produces the same names but puts them first on fewer pages.
+> - **`qwen3.5:9b`** matches `qwen3:4b` on the held-out set and is best on the realistic set, by about 0.05, but a review takes 2.2–2.7 times as long. The old set is uneven: 0.94 on one import, the best of any model, and 0.84 on the other, with the same broad merges as the 4B. Its realistic gain comes from naming more consistently (`lisbon` where `qwen3:4b` used both `lisbon` and `lisbon-travel`); big topics still split into 3–6 subtopic tags.
+> - **`qwen3.5:2b`** takes 0.55–0.8 times as long but is clearly worse on the held-out and old sets: more pages that share a first tag are on different topics (precision 0.76–0.90). On the realistic set its F1 matches the 4B models only because the splitting dominates F1 there; its low agreement and its collisions show the weakness.
+> - **More bits don't fix the 2B.** No build wins on more than one set. The old set's gain at `Q5_K_M` and `q8_0` comes from one import that `q4_K_M` reviewed badly (0.77 → 0.93), while the held-out set got slightly worse and its agreement fell from 0.75 to 0.58 and 0.53. At these sizes the reviews take about as long as `qwen3:4b`'s, so the 2B's one advantage, speed, is gone. The unsloth `Q5_K_M` landed among the official builds, so its different tool chain shows no effect here.
+> - **A two-sided naming rule** didn't help. The naming rule also said what's too broad: "not a whole field that also covers other topics (pottery, not crafts; sailing, not sports)". `qwen3:4b` got worse on all three sets (0.967 → 0.956, 0.907 → 0.896, 0.475 → 0.465). `qwen3.5:4b` got worse on two and stayed level on the held-out set (0.945 → 0.944, 0.880 → 0.857, 0.497 → 0.478). The rule changed single names in both directions instead of reining in broad ones.
+>
+> From 4B up, the model's own steps are already precise: precision is 0.95 or more on the held-out and realistic sets. What's left is how broad a topic is, and the clustering mostly decides that before any model is asked. Each naming call sees one group, so it can't tell that Lisbon belongs to a 39-page Portugal interest. A bigger model may pay off once it gets a decision that needs the whole collection, such as grouping cluster names into interests (umbrella tags), so that's where to test one again. Below 4B, the model's own steps start to fail.
+
 ### Already tried, and not worth repeating
 
 These were measured on the test sets and didn't help, or made things worse:
@@ -891,6 +956,7 @@ These were measured on the test sets and didn't help, or made things worse:
 - Replies that map ids to assignments in one JSON object: the 4B model garbles them. Use one entry per item.
 - A third import tag per page (section 4).
 - `nomic-embed-text`'s `clustering: ` prefix, and `qwen3-embedding:0.6b` (11.4).
+- `qwen3.5` at 2B (`q4_K_M`, `Q5_K_M`, `q8_0`), 4B and 9B in place of `qwen3:4b`, and a naming rule that also says what's too broad (11.10).
 
 ## 12. Results after the changes
 
