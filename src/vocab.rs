@@ -141,6 +141,10 @@ Reply with a JSON object: {\"description\": \"one line on what the interest cove
 
 /// Pages of a tag shown, by title, when asking about an umbrella.
 const UMBRELLA_TITLES: usize = 3;
+/// How much less alike than `Settings::umbrella_similarity` a new group's
+/// pages can be to an umbrella's pages and still be asked whether the group
+/// belongs to that umbrella's interest.
+const UMBRELLA_JOIN_STEP: f32 = 0.05;
 
 #[derive(Deserialize)]
 struct UmbrellaPairReply {
@@ -759,16 +763,7 @@ async fn add_umbrellas<R: Reviewer>(
     // Where each tag's pages point on average.
     let centroids: Vec<Vec<f32>> = names
         .iter()
-        .map(|name| {
-            let list = &firsts[name];
-            let mut sum = vec![0.0; page_vectors[list[0]].len()];
-            for &i in list {
-                for (s, x) in sum.iter_mut().zip(&page_vectors[i]) {
-                    *s += x;
-                }
-            }
-            unit(sum)
-        })
+        .map(|name| mean_vector(&firsts[name], page_vectors))
         .collect();
     // Each tag's interest comes first. Asked for a reason instead, the model
     // found a theme both tags share (conservation for birds and big cats)
@@ -796,6 +791,9 @@ async fn add_umbrellas<R: Reviewer>(
     });
     // A tag that has led, or joined an interest, isn't asked about again.
     let mut done = vec![false; names.len()];
+    // Each umbrella made so far, in the order of `out.umbrellas`: its name,
+    // its pages and their mean vector.
+    let mut made: Vec<(String, Vec<usize>, Vec<f32>)> = Vec::new();
     for &h in &order {
         if done[h] {
             continue;
@@ -843,42 +841,82 @@ async fn add_umbrellas<R: Reviewer>(
         if parts.len() < 2 {
             continue;
         }
-        // The leader first, then the others by their number of pages.
-        let mut user = String::from("Tags:\n");
-        for part in &parts {
-            user.push_str(&format!(
-                "- {}\n",
-                umbrella_line(part, &firsts[part], pages, vocabulary)
-            ));
-        }
-        let reply = match reviewer
-            .ask_json(UMBRELLA_NAME_SYSTEM, &user, "tag_umbrella", name_schema.clone())
-            .await
-        {
-            Ok(reply) => reply,
-            Err(err) => {
-                out.failed_requests.push(format!("{err:#}"));
+        let group_pages: Vec<usize> = parts.iter().flat_map(|p| firsts[p].iter().copied()).collect();
+        let group_vector = mean_vector(&group_pages, page_vectors);
+        // A second group of an interest that already has an umbrella
+        // (algarve and portugal-travel, after portugal over lisbon) is asked
+        // about with that umbrella, and joins it if they are one interest.
+        // Showing the umbrellas made so far when naming changed other names
+        // too (game-development instead of godot).
+        let mut joined = None;
+        for (k, (name, made_pages, made_vector)) in made.iter().enumerate() {
+            if similarity(made_vector, &group_vector) < settings.umbrella_similarity - UMBRELLA_JOIN_STEP {
                 continue;
             }
-        };
-        let Ok(reply) = serde_json::from_value::<UmbrellaNameReply>(reply) else {
-            continue;
-        };
-        let Some(umbrella) = normalize_name(&reply.tag) else {
-            continue;
-        };
-        if locked.contains(&umbrella) {
-            continue;
+            let user = format!(
+                "Tag 1: {}\nTag 2: {head_line}\n",
+                umbrella_line(name, made_pages, pages, vocabulary)
+            );
+            match reviewer
+                .ask_json(
+                    UMBRELLA_PAIR_SYSTEM,
+                    &user,
+                    "tag_umbrella_pair",
+                    pair_schema.clone(),
+                )
+                .await
+            {
+                Ok(reply) => {
+                    if serde_json::from_value::<UmbrellaPairReply>(reply).is_ok_and(|r| r.one_interest) {
+                        joined = Some(k);
+                        break;
+                    }
+                }
+                Err(err) => out.failed_requests.push(format!("{err:#}")),
+            }
         }
-        let description = match reply.description.trim() {
-            "" => format!("{}.", parts.join(", ")),
-            text => text.to_string(),
+        let umbrella = match joined {
+            Some(k) => made[k].0.clone(),
+            None => {
+                // The leader first, then the others by their number of pages.
+                let mut user = String::from("Tags:\n");
+                for part in &parts {
+                    user.push_str(&format!(
+                        "- {}\n",
+                        umbrella_line(part, &firsts[part], pages, vocabulary)
+                    ));
+                }
+                let reply = match reviewer
+                    .ask_json(UMBRELLA_NAME_SYSTEM, &user, "tag_umbrella", name_schema.clone())
+                    .await
+                {
+                    Ok(reply) => reply,
+                    Err(err) => {
+                        out.failed_requests.push(format!("{err:#}"));
+                        continue;
+                    }
+                };
+                let Ok(reply) = serde_json::from_value::<UmbrellaNameReply>(reply) else {
+                    continue;
+                };
+                let Some(umbrella) = normalize_name(&reply.tag) else {
+                    continue;
+                };
+                if locked.contains(&umbrella) {
+                    continue;
+                }
+                let description = match reply.description.trim() {
+                    "" => format!("{}.", parts.join(", ")),
+                    text => text.to_string(),
+                };
+                vocabulary.entry(umbrella.clone()).or_insert(VocabTag {
+                    name: umbrella.clone(),
+                    description,
+                    pages: 0,
+                });
+                umbrella
+            }
         };
-        vocabulary.entry(umbrella.clone()).or_insert(VocabTag {
-            name: umbrella.clone(),
-            description,
-            pages: 0,
-        });
         kept.insert(umbrella.clone());
         for part in &parts {
             for &i in &firsts[part] {
@@ -889,8 +927,29 @@ async fn add_umbrellas<R: Reviewer>(
                 }
             }
         }
-        out.umbrellas.push((umbrella, parts));
+        match joined {
+            Some(k) => {
+                made[k].1.extend(group_pages);
+                made[k].2 = mean_vector(&made[k].1, page_vectors);
+                out.umbrellas[k].1.extend(parts);
+            }
+            None => {
+                made.push((umbrella.clone(), group_pages, group_vector));
+                out.umbrellas.push((umbrella, parts));
+            }
+        }
     }
+}
+
+/// The unit mean of some pages' vectors.
+fn mean_vector(list: &[usize], page_vectors: &[Vec<f32>]) -> Vec<f32> {
+    let mut sum = vec![0.0; page_vectors[list[0]].len()];
+    for &i in list {
+        for (s, x) in sum.iter_mut().zip(&page_vectors[i]) {
+            *s += x;
+        }
+    }
+    unit(sum)
 }
 
 /// Builds the vocabulary from the whole archive and tags every done page
@@ -1978,6 +2037,180 @@ mod tests {
             (portugal.pages, portugal.description.as_str()),
             (6, "A trip to Portugal.")
         );
+    }
+
+    #[tokio::test]
+    async fn two_unlike_interests_get_an_umbrella_each() {
+        use crate::reconcile::tests::{FakeReviewer, archive};
+        // Two trips. Within each, the two places are 0.82 alike; the trips
+        // are unlike each other, so the second isn't asked about the first.
+        let db = archive(&[
+            (&["alfama"], [0.0; 3]),
+            (&["belem"], [0.0; 3]),
+            (&["sintra"], [0.0; 3]),
+            (&["lagos"], [0.0; 3]),
+            (&["faro"], [0.0; 3]),
+            (&["tavira"], [0.0; 3]),
+            (&["royal-mile"], [0.0; 3]),
+            (&["leith"], [0.0; 3]),
+            (&["holyrood"], [0.0; 3]),
+            (&["portree"], [0.0; 3]),
+            (&["quiraing"], [0.0; 3]),
+            (&["cuillin"], [0.0; 3]),
+        ]);
+        let embedder = TopicEmbedder(vec![
+            ("alfama", [1.0, 0.31]),
+            ("belem", [1.0, 0.31]),
+            ("sintra", [1.0, 0.31]),
+            ("lagos", [1.0, -0.31]),
+            ("faro", [1.0, -0.31]),
+            ("tavira", [1.0, -0.31]),
+            ("royal-mile", [-1.0, 0.31]),
+            ("leith", [-1.0, 0.31]),
+            ("holyrood", [-1.0, 0.31]),
+            ("portree", [-1.0, -0.31]),
+            ("quiraing", [-1.0, -0.31]),
+            ("cuillin", [-1.0, -0.31]),
+        ]);
+        let mut replies = vec![
+            json!({"description": "Lisbon.", "fits": [1, 2, 3], "tag": "lisbon"}),
+            json!({"description": "The Algarve.", "fits": [1, 2, 3], "tag": "algarve"}),
+            json!({"description": "Edinburgh.", "fits": [1, 2, 3], "tag": "edinburgh"}),
+            json!({"description": "The Isle of Skye.", "fits": [1, 2, 3], "tag": "isle-of-skye"}),
+        ];
+        for tag in ["lisbon", "algarve", "edinburgh", "isle-of-skye"] {
+            for _ in 0..3 {
+                replies.push(json!({"tags": [tag]}));
+            }
+        }
+        replies.extend([
+            json!({"interest_1": "portugal", "interest_2": "portugal", "one_interest": true}),
+            json!({"description": "A trip to Portugal.", "tag": "portugal"}),
+            json!({"interest_1": "scotland", "interest_2": "scotland", "one_interest": true}),
+            json!({"description": "A trip to Scotland.", "tag": "scotland"}),
+        ]);
+        let reviewer = FakeReviewer::new(replies);
+        let out = retag(&db, &reviewer, &embedder, &umbrella_settings(), |_| {})
+            .await
+            .unwrap();
+        let prompts = reviewer.prompts.borrow();
+        let first = &prompts[prompts.len() - 3];
+        assert!(first.starts_with("Tags:\n- algarve (3 pages)"), "{first}");
+        let second = &prompts[prompts.len() - 1];
+        assert!(second.starts_with("Tags:\n- edinburgh (3 pages)"), "{second}");
+        let names: Vec<&str> = out.umbrellas.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, ["portugal", "scotland"]);
+    }
+
+    /// Like `TopicEmbedder`, in four dimensions.
+    struct TopicEmbedder4(Vec<(&'static str, [f32; 4])>);
+
+    impl Embedder for TopicEmbedder4 {
+        fn model(&self) -> &str {
+            "m"
+        }
+
+        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            Ok(texts
+                .iter()
+                .enumerate()
+                .map(|(i, text)| {
+                    let mut out = vec![0.0; 4 + texts.len()];
+                    let first = text
+                        .lines()
+                        .find_map(|l| l.strip_prefix("Topics: "))
+                        .and_then(|t| t.split("; ").next());
+                    match self.0.iter().find(|(topic, _)| Some(*topic) == first) {
+                        Some((_, v)) => out[..4].copy_from_slice(v),
+                        None => out[4 + i] = 1.0,
+                    }
+                    out
+                })
+                .collect())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_second_group_of_an_interest_joins_its_umbrella() {
+        use crate::reconcile::tests::{FakeReviewer, archive};
+        // Four places on one trip, each pair 0.82 alike: a common direction
+        // plus one of its own.
+        let place = |own: usize| {
+            let mut v = [0.846; 4];
+            v[own] += 1.0;
+            v
+        };
+        let mut topics = Vec::new();
+        for (own, names) in [
+            (0, &["alfama", "belem", "sintra", "chiado"][..]),
+            (1, &["cascais", "estoril", "ericeira"][..]),
+            (2, &["lagos", "faro", "tavira"][..]),
+            (3, &["sagres", "aljezur", "monchique"][..]),
+        ] {
+            for name in names {
+                topics.push((*name, place(own)));
+            }
+        }
+        let pages: Vec<([&str; 1], [f32; 3])> = topics.iter().map(|(name, _)| ([*name], [0.0; 3])).collect();
+        let pages: Vec<(&[&str], [f32; 3])> = pages.iter().map(|(t, v)| (&t[..], *v)).collect();
+        let db = archive(&pages);
+        let mut replies = vec![
+            json!({"description": "Lisbon.", "fits": [1, 2, 3, 4], "tag": "lisbon"}),
+            json!({"description": "The coast near Lisbon.", "fits": [1, 2, 3], "tag": "lisbon-coast"}),
+            json!({"description": "The Algarve.", "fits": [1, 2, 3], "tag": "algarve"}),
+            json!({"description": "The western Algarve.", "fits": [1, 2, 3], "tag": "algarve-west"}),
+        ];
+        for (tag, n) in [
+            ("lisbon", 4),
+            ("lisbon-coast", 3),
+            ("algarve", 3),
+            ("algarve-west", 3),
+        ] {
+            for _ in 0..n {
+                replies.push(json!({"tags": [tag]}));
+            }
+        }
+        let no = json!({"interest_1": "lisbon", "interest_2": "algarve", "one_interest": false});
+        let yes = json!({"interest_1": "portugal", "interest_2": "portugal", "one_interest": true});
+        replies.extend([
+            // lisbon leads: algarve and algarve-west, then lisbon-coast.
+            no.clone(),
+            no,
+            yes.clone(),
+            json!({"description": "A trip to Portugal.", "tag": "portugal"}),
+            // algarve leads: algarve-west.
+            yes.clone(),
+            // Its group's pages are like portugal's: asked, it joins.
+            yes,
+        ]);
+        let reviewer = FakeReviewer::new(replies);
+        let out = retag(
+            &db,
+            &reviewer,
+            &TopicEmbedder4(topics),
+            &umbrella_settings(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+        let prompts = reviewer.prompts.borrow();
+        let last = prompts.last().unwrap();
+        assert!(
+            last.starts_with(
+                "Tag 1: portugal (7 pages): A trip to Portugal. Pages such as: Page 0; Page 1; Page 2\nTag 2: algarve (3 pages)"
+            ),
+            "{last}"
+        );
+        assert_eq!(
+            out.umbrellas,
+            [(
+                "portugal".to_string(),
+                ["lisbon", "lisbon-coast", "algarve", "algarve-west"]
+                    .map(String::from)
+                    .to_vec()
+            )]
+        );
+        assert!(tags_of(&out).iter().all(|tags| tags[0] == "portugal"));
     }
 
     #[tokio::test]

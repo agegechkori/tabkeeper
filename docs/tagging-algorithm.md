@@ -549,8 +549,9 @@ A big interest's pages often fall into several clusters, and each cluster gets a
 
 1. **Candidates.** Each tag that is the first tag of 3+ pages gets the mean of its pages' vectors. From the tag with the most pages down, each tag is compared with every smaller tag whose mean vector is at least 0.85 alike to its own (`umbrella_similarity`). A tag that has led, or joined an interest, isn't asked about again.
 2. **One pair at a time (Prompt 4c).** The model names the interest each tag's pages are about, then says whether the two are the same interest. Being alike isn't enough: neighbouring interests are as alike as two parts of one (on the development set, `sailing` and `surfing` 0.88; `sailing` and `sailing-knots` 0.92).
-3. **A name (Prompt 4d).** If at least one tag joined, the model names the interest from all its tags, the biggest first. It can keep one of their names.
-4. **First on the pages.** A page whose first tag is one of the parts gets the interest's tag first, then its own tags, at most 3 in all.
+3. **An earlier umbrella first.** If at least one tag joined, and an umbrella made before is almost as alike (its pages' mean vector at least 0.80, 0.05 below `umbrella_similarity`), the group's leader is first asked about with that umbrella (Prompt 4c, the umbrella as tag 1). A yes puts the group under that umbrella: a trip's second group of places joins `portugal` instead of becoming `portugal-travel`.
+4. **A name (Prompt 4d).** Otherwise the model names the interest from all its tags, the biggest first. It can keep one of their names.
+5. **First on the pages.** A page whose first tag is one of the parts gets the interest's tag first, then its own tags, at most 3 in all.
 
 A review asks 1–13 pairs on the sets of about 150 pages and about 40 on the realistic set of 500, and names up to 11 interests. It takes up to 10% longer. Section 11.11 has the results.
 
@@ -990,7 +991,7 @@ Section 5.7 describes the step. It was built on a development set of 162 pages m
 *Measure:* F1 on the development set, where perfect umbrellas would raise it from 0.59 and 0.66 to 0.97; no regression on the held-out and old sets; then the realistic set, once.
 
 > [!NOTE]
-> **Done** (not committed yet). How the step got there, on the development set:
+> **Done** in `0d14aa0`. How the step got there, on the development set:
 > - **One question per group of alike tags** (which tags are parts of one interest, and what it's called) put `sailing` and `kayak` under `water-sports` or `boating`: F1 0.83 and 0.88, precision 0.88. Asked about a whole group, the model names what all the tags share, often a field.
 > - **One pair at a time, with a reason first,** kept precision at 1.00, but called `sailing` and `sailing-knots` "different aspects, so two interests": F1 0.85 and 0.91. Saying that a part or an aspect of an interest belongs to it, and grouping by the biggest tag instead of average linkage, which had left out `wedding-dress`, raised F1 to 0.93 and 0.93.
 > - **The reason let the model find a theme two tags share.** On the old and held-out sets it put `birds` with `conservation`, the big-cats topic's tag ("two aspects of conservation"), and `linux` with `container-orchestration`: F1 0.884 → 0.848 and 0.971 → 0.926. Naming each tag's interest first, instead of a reason, removed both.
@@ -1007,7 +1008,17 @@ On the realistic set, recall rose from 0.34 and 0.28 to 0.50 and 0.46, precision
 - **Two umbrellas for one trip.** One run made `portugal` over `lisbon-travel`, `portugal-trains` and `portugal`, then `portugal-travel` over `algarve` and `portugal-travel`: naming the second group, the model didn't know the first one's name.
 - **Parts left out.** Spanish was joined only in part in one run (`spanish-grammar` over `spanish-subjunctive`).
 
-Next, on the development set: show the names of earlier umbrellas when naming a later one, and look at clusters of tools named for what the tools do (Prompt 2).
+**A second group of one interest.** Showing the names of earlier umbrellas when naming a later one changed other names too (`godot` became `game-development`). So a second group is now asked about with each earlier umbrella that is almost as alike (5.7, step 3). In the realistic set's first run, `algarve` and `portugal-travel` joined `portugal`, and F1 rose from 0.654 to 0.723; the second run, and the other three sets, didn't change. The same check let `apache-kafka` and Airflow's `workflow-orchestration` join `data-engineering`: precision 0.94 → 0.88.
+
+**Tools of one field.** To work on the data tools without touching the realistic set, two cases were added to the development set, which has 207 pages since:
+- Design tools (Figma, Blender, Inkscape): their clusters were named for the tools, and nothing joined them.
+- JavaScript bundlers (webpack, Vite, esbuild, Rollup, with pages that compare them): they reproduce the problem. One umbrella covered all four tools: F1 0.82 and 0.89, precision 0.82 and 0.85.
+
+Pages of tools that overlap form mixed clusters, which get the field's name or a comparison's (`javascript-bundling`, `webpack-vs-vite`), and then every tool looks like a part of the field. The model also names a tool's interest by its field ("javascript bundlers" for Rollup and for webpack alike), so "two different tools are two interests" never applies. Two fixes didn't hold:
+- **A naming rule** (when most pages are about one tool, the tag is its name, not what it does or a comparison) helped the bundlers by about 0.04, but changed names across the other sets: held-out 0.971 → 0.903 on one import (`containers` became `docker`), old set 0.929 → 0.911 on one.
+- **A pair rule** (a tool and the kind of tool it is are two interests) changed nothing.
+
+Next: ask once per tag whether its pages are about one program, a kind of software or a field, or neither, and let the code keep two programs, or a field and a program, apart.
 
 ### Already tried, and not worth repeating
 
@@ -1023,7 +1034,7 @@ These were measured on the test sets and didn't help, or made things worse:
 - A third import tag per page (section 4).
 - `nomic-embed-text`'s `clustering: ` prefix, and `qwen3-embedding:0.6b` (11.4).
 - `qwen3.5` at 2B (`q4_K_M`, `Q5_K_M`, `q8_0`), 4B and 9B in place of `qwen3:4b`, and a naming rule that also says what's too broad (11.10).
-- For umbrella tags: one question about a whole group of alike tags (it names a field), a reason before the yes or no (it finds a shared theme), and average-linkage groups (they leave parts out) (11.11).
+- For umbrella tags: one question about a whole group of alike tags (it names a field), a reason before the yes or no (it finds a shared theme), average-linkage groups (they leave parts out), the names of earlier umbrellas shown when naming (other names drift), a naming rule to call a tool by its name (names change everywhere), and a pair rule for a tool and its kind (no effect) (11.11).
 
 ## 12. Results after the changes
 

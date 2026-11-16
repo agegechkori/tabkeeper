@@ -5,11 +5,13 @@
 # in the other three sets.
 #
 # Four big interests whose pages split into subtopics (iceland, sailing,
-# godot, wedding-planning) should each get an umbrella tag. Two groups of
-# separate topics that only share a field (infrastructure-tools,
-# water-sports) should not. Three medium topics and 13 single pages complete
-# it; three single pages share a word with a tool (Prometheus, terraforming,
-# Waiting for Godot).
+# godot, wedding-planning) should each get an umbrella tag. Four groups of
+# separate topics that only share a field should not: infrastructure-tools,
+# water-sports, and, added the same day, design-tools and js-bundlers. The
+# bundlers' pages overlap (a page comparing two is labeled by the first it
+# names). Three medium topics and 13 single pages complete it; three single
+# pages share a word with a tool (Prometheus, terraforming, Waiting for
+# Godot).
 #
 # "# cluster: name" starts a topic. "one-" topics have 1 page.
 # "# group: name: topic ..." names related topics, for a coarser second
@@ -19,6 +21,8 @@
 
 # group: infrastructure-tools: terraform prometheus ansible
 # group: water-sports: kayaking surfing scuba-diving
+# group: design-tools: figma blender inkscape
+# group: js-bundlers: webpack vite esbuild rollup
 # ambiguous: prometheus one-prometheus-myth
 # ambiguous: terraform one-terraforming-mars
 # ambiguous: godot one-waiting-for-godot
@@ -173,6 +177,65 @@ https://www.atlasandboots.com/?p=7121
 https://blog.padi.com/ear-equalization-and-ear-care-for-scuba-divers/
 https://www.divessi.com/en/blog/equalize-ear-pressure-1218
 https://www.divepacific.co.nz/post/enriched-air---nitrox-diving
+
+# cluster: figma
+https://theadminbar.com/figma-tips-and-tricks-a-crash-course-for-beginners/
+https://uxdesign.cc/how-to-create-an-auto-layout-powered-component-in-figma-ca606a29a602
+https://help.figma.com/hc/en-us/articles/15343107263511
+https://help.figma.com/hc/en-us/articles/14506821864087-Overview-of-variables-collections-and-modes
+https://help.figma.com/hc/en-us/articles/17146044893591
+https://forum.figma.com/t/tutorial-prototype-variable/51256
+https://en.wikipedia.org/wiki/Figma
+
+# cluster: blender
+https://www.premiumbeat.com/blog/creating-the-donut-in-blender
+https://blender.tekriss.com/blender-5-0-beginner-guide-master-the-iconic-donut-tutorial-from-scratch/
+https://en.wikipedia.org/wiki/Blender_%28software%29
+https://www.blenderguru.com/posts/2025/9/10/blender-tutorial-geometry-nodes-for-beginners
+https://www.blenderguru.com/posts/blender-4-beginner-donut-tutorial
+https://80.lv/articles/tutorial-blender-s-geometry-nodes-for-beginners
+https://gamefromscratch.com/blender-3-geometry-node-beginner-tutorial/
+
+# cluster: inkscape
+https://en.wikibooks.org/wiki/A_Guide_to_Inkscape/Path_Drawing_Tools
+https://design.tutsplus.com/articles/inkscape-vs-illustrator-battle-of-the-vector-graphics-software--cms-93909
+https://logosbynick.com/inkscape-convert-png-to-svg/
+https://sendcutsend.com/converting-to-vector-in-inkscape
+https://en.wikipedia.org/wiki/Inkscape
+https://imagy.app/inkscape-trace-bitmap
+https://www.vecteezy.com/blog/design-tips/inkscape-vs-illustrator
+
+# cluster: webpack
+https://webpack.js.org/concepts
+https://www.hongkiat.com/blog/webpack-introduction
+https://flaviocopes.com/webpack/
+https://www.syncfusion.com/blogs/post/webpack-vs-vite-bundler-comparison
+https://en.wikipedia.org/wiki/Webpack
+https://dev.to/skaytech/a-basic-introduction-to-webpack-4eke
+
+# cluster: vite
+https://vite.dev/guide/why
+https://vite.dev/guide/comparisons
+https://leapcell.io/blog/vite-s-core-magic-how-esbuild-and-native-esm-reinvent-frontend-development
+https://www.educative.io/answers/what-is-vitejs
+https://betterstack.com/community/guides/scaling-nodejs/vite-vs-webpack/
+https://jsdevspace.substack.com/p/vite-vs-webpack-a-guide-to-choosing
+
+# cluster: esbuild
+https://blog.logrocket.com/getting-started-esbuild
+https://medium.com/sessionstack-blog/how-javascript-works-a-deep-dive-into-esbuild-5d997f93a8b4
+https://dev.to/marcinwosinek/how-to-start-building-a-project-with-esbuild-2d7i
+https://dev.to/koddr/battle-for-the-bundling-time-esbuild-a-javascript-bundler-and-minifier-written-on-golang-23bm
+https://mollify.noroff.dev/content/feu2/javascript-2/module-3/esbuild/comparing-esbuild-with-other-bundlers/
+https://medium.com/geekculture/build-a-library-with-esbuild-23235712f3c
+
+# cluster: rollup
+https://rollupjs.org/tutorial
+https://codetv.dev/blog/learn-rollup-js
+https://softwarehouse.au/blog/tree-shaking-unused-code-with-rollup
+https://blog.openreplay.com/the-ultimate-guide-to-getting-started-with-the-rollupjs-javascript-bundler/
+https://zetcode.com/javascript/rollupjs/
+https://risan.onrender.com/code/bundling-your-javascript-library-with-rollup
 
 # cluster: fpv-drones
 https://oscarliang.com/fpv-drone-guide
