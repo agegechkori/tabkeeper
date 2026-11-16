@@ -160,6 +160,139 @@ struct UmbrellaNameReply {
     tag: String,
 }
 
+const TAG_KIND_SYSTEM: &str = "You look at one tag of a personal archive of web pages, with the titles of some of its pages. Say what its pages are about.
+
+- software: one program, library, programming language or online service, by name: excel, photoshop. Pages on a part of one program, such as its features, its language or a plugin, are about that program: excel for pages on pivot tables.
+- field: a kind of software or a field of work, not one program: spreadsheets, image-editing.
+- other: anything else, such as a place, a trip, a hobby, a sport, gear, a project or a subject.
+
+Reply with a JSON object: {\"kind\": \"software\", \"name\": \"the program's name, or empty\"}.";
+
+#[derive(Deserialize)]
+struct TagKindReply {
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    name: String,
+}
+
+/// What a tag's pages are about, for umbrellas.
+#[derive(Debug, Clone, PartialEq)]
+enum TagKind {
+    /// One program, library, language or online service, by name.
+    Program(String),
+    /// A kind of software, or a field of work.
+    Field,
+    Other,
+}
+
+/// Two programs, or a field and a program, are two interests, whatever the
+/// pair question would answer: asked, the model files both under their field
+/// (javascript bundlers for rollup and for webpack). A program whose pages
+/// mostly name the other is a part of it (gdscript's pages name godot), and
+/// is left to the pair question. `a_titles` and `b_titles` are the titles
+/// of each tag's pages.
+fn two_programs(a: &TagKind, a_titles: &[&str], b: &TagKind, b_titles: &[&str]) -> bool {
+    match (a, b) {
+        (TagKind::Program(x), TagKind::Program(y)) => {
+            !same_program(x, y) && !mostly_name(b_titles, x) && !mostly_name(a_titles, y)
+        }
+        (TagKind::Field, TagKind::Program(_)) | (TagKind::Program(_), TagKind::Field) => true,
+        _ => false,
+    }
+}
+
+/// A `tag_kind` reply as a kind. A comparison (webpack-vs-vite) is about two
+/// programs, like a field.
+fn kind_from(kind: &str, name: &str) -> TagKind {
+    match kind {
+        "software" => match normalize_name(name) {
+            Some(name) if name.split('-').any(|w| w == "vs" || w == "versus") => TagKind::Field,
+            Some(name) => TagKind::Program(name),
+            None => TagKind::Other,
+        },
+        "field" => TagKind::Field,
+        _ => TagKind::Other,
+    }
+}
+
+/// The titles of some pages.
+fn titles_of<'a>(list: &[usize], pages: &'a [AnalyzedPage]) -> Vec<&'a str> {
+    list.iter().map(|&i| pages[i].title.as_str()).collect()
+}
+
+/// More than half of the titles name the program, every word of it as a
+/// whole word (godot in "GDScript basics for Godot"; not go in "Godot").
+fn mostly_name(titles: &[&str], program: &str) -> bool {
+    let words: Vec<&str> = program.split('-').filter(|w| !w.is_empty()).collect();
+    let naming = titles
+        .iter()
+        .filter(|title| {
+            let lower = title.to_lowercase();
+            let title_words: HashSet<&str> = lower
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|w| !w.is_empty())
+                .collect();
+            words.iter().all(|w| title_words.contains(w))
+        })
+        .count();
+    !words.is_empty() && naming * 2 > titles.len()
+}
+
+/// Two names of one program: all the words of one are in the other
+/// (airflow and apache-airflow, godot and godot-engine; not go and godot).
+fn same_program(a: &str, b: &str) -> bool {
+    let words = |s: &str| -> BTreeSet<String> {
+        s.split('-')
+            .filter(|w| !w.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    let (a, b) = (words(a), words(b));
+    a.is_subset(&b) || b.is_subset(&a)
+}
+
+/// What a tag's pages are about (Prompt 4e), asked once per tag. A failed or
+/// unusable reply counts as other, which leaves the decision to the pair
+/// question.
+#[allow(clippy::too_many_arguments)]
+async fn kind_of<R: Reviewer>(
+    reviewer: &R,
+    name: &str,
+    list: &[usize],
+    pages: &[AnalyzedPage],
+    vocabulary: &BTreeMap<String, VocabTag>,
+    kinds: &mut HashMap<String, TagKind>,
+    out: &mut Retag,
+) -> TagKind {
+    if let Some(kind) = kinds.get(name) {
+        return kind.clone();
+    }
+    let schema = json!({
+        "type": "object", "additionalProperties": false, "required": ["kind", "name"],
+        "properties": {
+            "kind": {"type": "string", "enum": ["software", "field", "other"]},
+            "name": {"type": "string"}
+        }
+    });
+    let user = format!("Tag: {}\n", umbrella_line(name, list, pages, vocabulary));
+    let kind = match reviewer
+        .ask_json(TAG_KIND_SYSTEM, &user, "tag_kind", schema)
+        .await
+    {
+        Ok(reply) => match serde_json::from_value::<TagKindReply>(reply) {
+            Ok(r) => kind_from(&r.kind, &r.name),
+            Err(_) => TagKind::Other,
+        },
+        Err(err) => {
+            out.failed_requests.push(format!("{err:#}"));
+            TagKind::Other
+        }
+    };
+    kinds.insert(name.to_string(), kind.clone());
+    kind
+}
+
 /// A tag as the umbrella questions show it: its name, pages, description and
 /// the titles of a few of its pages.
 fn umbrella_line(
@@ -794,6 +927,8 @@ async fn add_umbrellas<R: Reviewer>(
     // Each umbrella made so far, in the order of `out.umbrellas`: its name,
     // its pages and their mean vector.
     let mut made: Vec<(String, Vec<usize>, Vec<f32>)> = Vec::new();
+    // What each tag's pages are about, asked once per tag.
+    let mut kinds: HashMap<String, TagKind> = HashMap::new();
     for &h in &order {
         if done[h] {
             continue;
@@ -813,9 +948,29 @@ async fn add_umbrellas<R: Reviewer>(
         }
         let head = names[h].as_str();
         let head_line = umbrella_line(head, &firsts[head], pages, vocabulary);
+        let head_kind = kind_of(reviewer, head, &firsts[head], pages, vocabulary, &mut kinds, out).await;
+        let head_titles = titles_of(&firsts[head], pages);
         let mut parts = vec![head.to_string()];
         for j in near {
             let other = names[j].as_str();
+            let other_kind = kind_of(
+                reviewer,
+                other,
+                &firsts[other],
+                pages,
+                vocabulary,
+                &mut kinds,
+                out,
+            )
+            .await;
+            if two_programs(
+                &head_kind,
+                &head_titles,
+                &other_kind,
+                &titles_of(&firsts[other], pages),
+            ) {
+                continue;
+            }
             let user = format!(
                 "Tag 1: {head_line}\nTag 2: {}\n",
                 umbrella_line(other, &firsts[other], pages, vocabulary)
@@ -851,6 +1006,15 @@ async fn add_umbrellas<R: Reviewer>(
         let mut joined = None;
         for (k, (name, made_pages, made_vector)) in made.iter().enumerate() {
             if similarity(made_vector, &group_vector) < settings.umbrella_similarity - UMBRELLA_JOIN_STEP {
+                continue;
+            }
+            let made_kind = kind_of(reviewer, name, made_pages, pages, vocabulary, &mut kinds, out).await;
+            if two_programs(
+                &made_kind,
+                &titles_of(made_pages, pages),
+                &head_kind,
+                &head_titles,
+            ) {
                 continue;
             }
             let user = format!(
@@ -1899,7 +2063,10 @@ mod tests {
             json!({"tags": ["horses"]}),
             json!({"tags": ["horses"]}),
             // The pages are all alike, so horses is asked about as part of
-            // one interest with dogs. They are two interests.
+            // one interest with dogs, after what each tag is about. They are
+            // two interests.
+            json!({"kind": "other", "name": ""}),
+            json!({"kind": "other", "name": ""}),
             json!({"interest_1": "dogs", "interest_2": "horses", "one_interest": false}),
         ]);
         let settings = Settings {
@@ -1988,6 +2155,9 @@ mod tests {
     async fn tags_of_one_interest_get_an_umbrella_first() {
         use crate::reconcile::tests::FakeReviewer;
         let mut replies = lisbon_and_algarve_replies();
+        // What algarve and lisbon are about, then the pair, then the name.
+        replies.push(json!({"kind": "other", "name": ""}));
+        replies.push(json!({"kind": "other", "name": ""}));
         replies.push(json!({"interest_1": "portugal", "interest_2": "portugal", "one_interest": true}));
         replies.push(json!({"description": "A trip to Portugal.", "tag": "portugal"}));
         let reviewer = FakeReviewer::new(replies);
@@ -2083,9 +2253,14 @@ mod tests {
                 replies.push(json!({"tags": [tag]}));
             }
         }
+        let other = json!({"kind": "other", "name": ""});
         replies.extend([
+            other.clone(),
+            other.clone(),
             json!({"interest_1": "portugal", "interest_2": "portugal", "one_interest": true}),
             json!({"description": "A trip to Portugal.", "tag": "portugal"}),
+            other.clone(),
+            other,
             json!({"interest_1": "scotland", "interest_2": "scotland", "one_interest": true}),
             json!({"description": "A trip to Scotland.", "tag": "scotland"}),
         ]);
@@ -2094,10 +2269,18 @@ mod tests {
             .await
             .unwrap();
         let prompts = reviewer.prompts.borrow();
-        let first = &prompts[prompts.len() - 3];
-        assert!(first.starts_with("Tags:\n- algarve (3 pages)"), "{first}");
-        let second = &prompts[prompts.len() - 1];
-        assert!(second.starts_with("Tags:\n- edinburgh (3 pages)"), "{second}");
+        let namings: Vec<&String> = prompts.iter().filter(|p| p.starts_with("Tags:")).collect();
+        assert_eq!(namings.len(), 2);
+        assert!(
+            namings[0].starts_with("Tags:\n- algarve (3 pages)"),
+            "{}",
+            namings[0]
+        );
+        assert!(
+            namings[1].starts_with("Tags:\n- edinburgh (3 pages)"),
+            "{}",
+            namings[1]
+        );
         let names: Vec<&str> = out.umbrellas.iter().map(|(name, _)| name.as_str()).collect();
         assert_eq!(names, ["portugal", "scotland"]);
     }
@@ -2172,15 +2355,23 @@ mod tests {
         }
         let no = json!({"interest_1": "lisbon", "interest_2": "algarve", "one_interest": false});
         let yes = json!({"interest_1": "portugal", "interest_2": "portugal", "one_interest": true});
+        let other = json!({"kind": "other", "name": ""});
         replies.extend([
-            // lisbon leads: algarve and algarve-west, then lisbon-coast.
+            // lisbon leads: algarve and algarve-west, then lisbon-coast, each
+            // after what it is about.
+            other.clone(),
+            other.clone(),
             no.clone(),
+            other.clone(),
             no,
+            other.clone(),
             yes.clone(),
             json!({"description": "A trip to Portugal.", "tag": "portugal"}),
             // algarve leads: algarve-west.
             yes.clone(),
-            // Its group's pages are like portugal's: asked, it joins.
+            // Its group's pages are like portugal's: asked, after what
+            // portugal is about, it joins.
+            other,
             yes,
         ]);
         let reviewer = FakeReviewer::new(replies);
@@ -2218,6 +2409,8 @@ mod tests {
         use crate::reconcile::tests::FakeReviewer;
         let mut replies = lisbon_and_algarve_replies();
         // No naming request follows a "no".
+        replies.push(json!({"kind": "other", "name": ""}));
+        replies.push(json!({"kind": "other", "name": ""}));
         replies.push(json!({"interest_1": "algarve", "interest_2": "lisbon", "one_interest": false}));
         let reviewer = FakeReviewer::new(replies);
         let out = retag(
@@ -2241,6 +2434,73 @@ mod tests {
                 vec!["algarve"]
             ]
         );
+    }
+
+    #[test]
+    fn programs_and_fields_are_kept_apart() {
+        let program = |name: &str| TagKind::Program(name.to_string());
+        let none: [&str; 0] = [];
+        let apart = |a: &TagKind, b: &TagKind| two_programs(a, &none, b, &none);
+        assert!(apart(&program("rollup"), &program("webpack")));
+        assert!(!apart(&program("apache-airflow"), &program("airflow")));
+        assert!(!apart(&program("godot"), &program("godot-engine")));
+        assert!(apart(&TagKind::Field, &program("rollup")));
+        assert!(!apart(&TagKind::Field, &TagKind::Field));
+        assert!(!apart(&TagKind::Other, &program("excel")));
+        // gdscript's pages mostly name godot: a part of it, left to the pair
+        // question. Godot's pages don't name go.
+        let gdscript = [
+            "GDScript basics for Godot",
+            "Creating your first Godot script",
+            "Introduction to GDScript",
+        ];
+        assert!(!two_programs(
+            &program("godot"),
+            &none,
+            &program("gdscript"),
+            &gdscript
+        ));
+        assert!(two_programs(
+            &program("go"),
+            &["Go by example"],
+            &program("godot"),
+            &["Godot nodes", "Godot scenes"]
+        ));
+        // A comparison is about two programs.
+        assert_eq!(kind_from("software", "webpack-vs-vite"), TagKind::Field);
+        assert_eq!(kind_from("software", "Apache Airflow"), program("apache-airflow"));
+        assert_eq!(kind_from("software", ""), TagKind::Other);
+        assert_eq!(kind_from("other", "kayak"), TagKind::Other);
+    }
+
+    #[tokio::test]
+    async fn two_programs_are_not_asked_about_as_one_interest() {
+        use crate::reconcile::tests::FakeReviewer;
+        let mut replies = vec![
+            json!({"description": "Webpack.", "fits": [1, 2, 3], "tag": "webpack"}),
+            json!({"description": "Rollup.", "fits": [1, 2, 3], "tag": "rollup"}),
+        ];
+        for tag in ["webpack", "rollup"] {
+            for _ in 0..3 {
+                replies.push(json!({"tags": [tag]}));
+            }
+        }
+        replies.push(json!({"kind": "software", "name": "Rollup"}));
+        replies.push(json!({"kind": "software", "name": "webpack"}));
+        let reviewer = FakeReviewer::new(replies);
+        let out = retag(
+            &lisbon_and_algarve(),
+            &reviewer,
+            &lisbon_apart_from_algarve(),
+            &umbrella_settings(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+        assert!(out.umbrellas.is_empty());
+        let prompts = reviewer.prompts.borrow();
+        assert_eq!(prompts.len(), 10);
+        assert!(prompts[9].starts_with("Tag: webpack (3 pages)"), "{}", prompts[9]);
     }
 
     #[tokio::test]

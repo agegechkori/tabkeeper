@@ -548,12 +548,13 @@ The prompt was chosen on 100 hard cases from the baseline reviews: 48 pages the 
 A big interest's pages often fall into several clusters, and each cluster gets a name of its own: a trip becomes `lisbon`, `algarve` and `portugal-trains`. First-tag F1 counts each split as a miss, and on the realistic set this cost more than half of the recall (`docs/realistic-test-set.md`). Step 9 puts one tag for the whole interest first on those pages, and each page keeps its own tags after it (`[reconcile] umbrellas`, on by default).
 
 1. **Candidates.** Each tag that is the first tag of 3+ pages gets the mean of its pages' vectors. From the tag with the most pages down, each tag is compared with every smaller tag whose mean vector is at least 0.85 alike to its own (`umbrella_similarity`). A tag that has led, or joined an interest, isn't asked about again.
-2. **One pair at a time (Prompt 4c).** The model names the interest each tag's pages are about, then says whether the two are the same interest. Being alike isn't enough: neighbouring interests are as alike as two parts of one (on the development set, `sailing` and `surfing` 0.88; `sailing` and `sailing-knots` 0.92).
-3. **An earlier umbrella first.** If at least one tag joined, and an umbrella made before is almost as alike (its pages' mean vector at least 0.80, 0.05 below `umbrella_similarity`), the group's leader is first asked about with that umbrella (Prompt 4c, the umbrella as tag 1). A yes puts the group under that umbrella: a trip's second group of places joins `portugal` instead of becoming `portugal-travel`.
-4. **A name (Prompt 4d).** Otherwise the model names the interest from all its tags, the biggest first. It can keep one of their names.
-5. **First on the pages.** A page whose first tag is one of the parts gets the interest's tag first, then its own tags, at most 3 in all.
+2. **Programs stay apart (Prompt 4e).** Before its first pair, each tag is asked once what its pages are about: one program (a program, library, language or online service), a kind of software or a field, or anything else. Two different programs, or a field and a program, are never one interest, and their pair isn't asked: asked, the model files tools under their field ("javascript bundlers" for Rollup and for webpack alike). A comparison (`webpack-vs-vite`) counts as a field. A program whose pages' titles mostly name the other program counts as a part of it and goes to the pair question (`gdscript`, whose pages name Godot). Two names are one program when all the words of one are in the other (`airflow` and `apache-airflow`).
+3. **One pair at a time (Prompt 4c).** The model names the interest each tag's pages are about, then says whether the two are the same interest. Being alike isn't enough: neighbouring interests are as alike as two parts of one (on the development set, `sailing` and `surfing` 0.88; `sailing` and `sailing-knots` 0.92).
+4. **An earlier umbrella first.** If at least one tag joined, and an umbrella made before is almost as alike (its pages' mean vector at least 0.80, 0.05 below `umbrella_similarity`), the group's leader is first asked about with that umbrella (Prompt 4c, the umbrella as tag 1, with step 2 first). A yes puts the group under that umbrella: a trip's second group of places joins `portugal` instead of becoming `portugal-travel`.
+5. **A name (Prompt 4d).** Otherwise the model names the interest from all its tags, the biggest first. It can keep one of their names.
+6. **First on the pages.** A page whose first tag is one of the parts gets the interest's tag first, then its own tags, at most 3 in all.
 
-A review asks 1–13 pairs on the sets of about 150 pages and about 40 on the realistic set of 500, and names up to 11 interests. It takes up to 10% longer. Section 11.11 has the results.
+A review of the sets of 150–200 pages asks what 2–20 tags are about and 1–13 pairs, and names up to 5 interests; on the realistic set of 500 it asks about some 40 tags and 45 pairs, and names about 8. It takes up to 10% longer. Section 11.11 has the results.
 
 #### Prompt 4c: one interest or two? (`tag_umbrella_pair`)
 
@@ -581,6 +582,20 @@ Reply with a JSON object: {"description": "one line on what the interest covers"
 ```
 
 User message: `Tags:`, then one line per tag as in Prompt 4c, the biggest first. Schema: `{"description": string, "tag": string}`.
+
+#### Prompt 4e: what a tag is about (`tag_kind`)
+
+```text
+You look at one tag of a personal archive of web pages, with the titles of some of its pages. Say what its pages are about.
+
+- software: one program, library, programming language or online service, by name: excel, photoshop. Pages on a part of one program, such as its features, its language or a plugin, are about that program: excel for pages on pivot tables.
+- field: a kind of software or a field of work, not one program: spreadsheets, image-editing.
+- other: anything else, such as a place, a trip, a hobby, a sport, gear, a project or a subject.
+
+Reply with a JSON object: {"kind": "software", "name": "the program's name, or empty"}.
+```
+
+User message: `Tag: {name} ({n} pages): {description}. Pages such as: {up to 3 titles}`. Schema: `{"kind": "software" | "field" | "other", "name": string}`. A failed or unusable reply counts as other, which leaves the decision to the pair question. The model doesn't always follow the line about a program's parts (it called `gdscript` a program of its own), so the code also checks the page titles (step 2).
 
 ## 6. Stage 3: the tag tree
 
@@ -1018,7 +1033,18 @@ Pages of tools that overlap form mixed clusters, which get the field's name or a
 - **A naming rule** (when most pages are about one tool, the tag is its name, not what it does or a comparison) helped the bundlers by about 0.04, but changed names across the other sets: held-out 0.971 → 0.903 on one import (`containers` became `docker`), old set 0.929 → 0.911 on one.
 - **A pair rule** (a tool and the kind of tool it is are two interests) changed nothing.
 
-Next: ask once per tag whether its pages are about one program, a kind of software or a field, or neither, and let the code keep two programs, or a field and a program, apart.
+**Tools of one field, fixed.** The step now asks once per tag what its pages are about (5.7, step 2, Prompt 4e), and the code keeps two programs, or a field and a program, apart. Its first version missed two cases, both now handled in code:
+- `gdscript` came back as a program of its own, so it left the `godot` umbrella. Now a program whose pages' titles mostly name the other one goes to the pair question.
+- `webpack-vs-vite` came back as a program whose words matched both `webpack` and `vite`. Now a comparison counts as a field.
+
+| F1 | No umbrellas | Umbrellas, before step 2 | Now |
+|---|---|---|---|
+| Development set, 207 pages | 0.582, 0.656 | 0.820, 0.885 | **0.886, 0.946** |
+| Held-out set | 0.971, 0.962 | 0.971, 0.962 | 0.971, 0.962 |
+| Old set | 0.884, 0.929 | 0.907, 0.929 | 0.907, 0.929 |
+| Realistic set, the test | 0.511, 0.438 | 0.723, 0.606 | **0.755, 0.613** |
+
+Precision is back to where it was without umbrellas: 0.99 and 0.98 on the development set, and 0.99 and 0.97 on the realistic set (0.99 and 0.95 without umbrellas). Recall on the realistic set is 0.61 and 0.45, against 0.34 and 0.28 without. No umbrella joins the data tools any more, no topic is lost, and no tag is put on two meanings of a word. The two runs agree on 0.90 on the development set (0.73 without umbrellas) and on 0.69 on the realistic set (0.70). A review takes about 10% longer.
 
 ### Already tried, and not worth repeating
 
