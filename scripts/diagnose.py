@@ -1,6 +1,6 @@
 """Where a review's tagging goes wrong, and how much reviews agree.
 
-    python3 scripts/diagnose.py --labels holdout|old|realistic|FILE ARCHIVE... [--stability] [-v]
+    python3 scripts/diagnose.py --labels holdout|old|realistic|dev|FILE ARCHIVE... [--stability] [-v]
 
 For each archive, on the topics of 3+ pages: first-tag pairwise F1, first
 tags from another topic, untagged pages by cause, and topics lost
@@ -23,7 +23,7 @@ import sqlite3
 import statistics
 
 SCRIPTS = os.path.dirname(os.path.abspath(__file__))
-LABELS = {"holdout": "holdout_urls.txt", "old": "cluster_urls.txt", "realistic": "realistic_urls.txt"}
+LABELS = {"holdout": "holdout_urls.txt", "old": "cluster_urls.txt", "realistic": "realistic_urls.txt", "dev": "dev_urls.txt"}
 
 
 def read_labels(path):
@@ -234,7 +234,7 @@ def spread(values, fmt):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--labels", required=True, help="holdout, old, realistic, or a labels file")
+    parser.add_argument("--labels", required=True, help="holdout, old, realistic, dev, or a labels file")
     parser.add_argument("archives", nargs="+")
     parser.add_argument("--stability", action="store_true")
     parser.add_argument("-v", "--verbose", action="store_true")

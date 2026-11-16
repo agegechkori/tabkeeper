@@ -1,0 +1,239 @@
+# Development set for the umbrella-tag step (docs/tagging-algorithm.md),
+# gathered on 2026-11-15 from web searches, Stack Overflow, GitHub,
+# Wikipedia and documentation contents. Steps are tuned on this set; the
+# realistic set (realistic_urls.txt) stays a test set. None of its topics is
+# in the other three sets.
+#
+# Four big interests whose pages split into subtopics (iceland, sailing,
+# godot, wedding-planning) should each get an umbrella tag. Two groups of
+# separate topics that only share a field (infrastructure-tools,
+# water-sports) should not. Three medium topics and 13 single pages complete
+# it; three single pages share a word with a tool (Prometheus, terraforming,
+# Waiting for Godot).
+#
+# "# cluster: name" starts a topic. "one-" topics have 1 page.
+# "# group: name: topic ..." names related topics, for a coarser second
+# score. "# ambiguous: a b ..." names topics that use one word in different
+# meanings. "# thin: URL" marks a page that loads with under 500 characters
+# of text.
+
+# group: infrastructure-tools: terraform prometheus ansible
+# group: water-sports: kayaking surfing scuba-diving
+# ambiguous: prometheus one-prometheus-myth
+# ambiguous: terraform one-terraforming-mars
+# ambiguous: godot one-waiting-for-godot
+
+# cluster: iceland
+https://guidetoiceland.is/traveler-profiles/32888/ring-road-10-day-self-drive-itinerary-with-google-map
+https://fullsuitcase.com/iceland-ring-road-itinerary/
+https://holdurcarrental.is/services/protection
+https://www.bluecarrental.is/blog/gravel-protection-iceland-car-rental/
+https://fullsuitcase.com/reykjavik-best-things-to-do/
+https://visitreykjavik.is/things-to-do-in-reykjavik
+https://asocialnomad.com/iceland/reykjavik-travel-guide/
+https://www.frommers.com/destinations/icelands-golden-circle/introduction
+https://guidetoiceland.is/travel-iceland/drive/Golden-Circle
+https://www.twowanderingsoles.com/blog/golden-circle-iceland
+https://guidetoiceland.is/the-northern-lights/how-to-find-the-northern-lights-in-iceland
+https://www.perlan.is/articles/how-to-read-northern-lights-forecast
+https://iceland-photo-tours.com/articles/photography-tutorials/guide-to-the-aurora-forecast-in-iceland
+https://aurorareykjavik.is/aurora-forecast
+https://guidetoiceland.is/book-holiday-trips/crystal-ice-cave-tour-3
+https://www.icelandia.com/tours/blue-ice-cave-exploration-jokulsarlon
+https://www.onthegotours.com/ie/Iceland/Guides/Blue-Lagoon-vs-Sky-Lagoon-in-Iceland
+https://www.re.is/blog/sky-lagoon-vs-blue-lagoon-your-guide
+https://hvammsvik.com/hvammsvik-skylagoon-bluelagoon/
+https://en.wikipedia.org/wiki/Reykjav%C3%ADk
+https://en.wikipedia.org/wiki/Hallgr%C3%ADmskirkja
+https://en.wikipedia.org/wiki/Golden_Circle_%28Iceland%29
+https://en.wikipedia.org/wiki/J%C3%B6kuls%C3%A1rl%C3%B3n
+https://en.wikipedia.org/wiki/Vatnaj%C3%B6kull
+
+# cluster: sailing
+https://americansailing.com/asa-101-basic-keelboat-sailing-what-youll-learn/
+https://americansailing.com/articles/faq-learn-to-sail/
+https://americansailing.com/articles/8-things-i-learned-in-asa-101/
+https://www.modernsailing.com/course/asa-101-sportboat-basic-keelboat-sailing
+https://www.maritimemuseum.co.nz/collections/10-essential-knots-every-sailor-should-know
+https://www.savvy-navvy.com/blog/essential-sailing-knots-for-sailors
+https://en.wikipedia.org/wiki/Point_of_sail
+https://improvesailing.com/sailing/trim/points-of-sail
+https://www.practical-sailor.com/uncategorized/how-to-read-a-nautical-chart-tip-1/
+https://deckee.com/blog/how-to-read-a-nautical-chart
+https://www.practical-sailor.com/sailboat-reviews/used_sailboats/diy-survey-checklist-for-used-boat-buying/
+https://soundingsonline.com/features/the-smart-buyer-performing-a-sailboat-crawlthrough/
+https://www.yacht.de/en/yacht-market/buying-advice/buying-a-used-boat-own-inspection-or-surveyor-what-you-need-to-look-out-for/
+https://getmyboat.com/journal/lifestyle/more-sailing-terms-you-need-to-know
+https://improvesailing.com/terms
+https://www.airkayaks.com/parts-of-a-sailboat-a-complete-guide-for-beginners/
+https://www.cruisingworld.com/racing-101
+https://www.spinsheet.com/racing/expert-tips-winning-start-sailboat-race
+https://www.locallifesc.com/sailing-knots-every-boater-should-know/
+https://americansailing.com/articles/fit-tied-essential-sailing-knots/
+https://www.jdpower.com/boats/shopping-guides/how-to-buy-a-used-sailboat
+https://americansailing.com/?p=59448
+
+# cluster: godot
+https://docs.godotengine.org/en/stable/getting_started/step_by_step/nodes_and_scenes.html
+https://docs.godotengine.org/en/stable/getting_started/step_by_step/scripting_first_script.html
+https://docs.godotengine.org/en/stable/getting_started/step_by_step/signals.html
+https://docs.godotengine.org/en/stable/getting_started/first_2d_game/03.coding_the_player.html
+https://docs.godotengine.org/en/stable/tutorials/2d/2d_sprite_animation.html
+https://docs.godotengine.org/en/stable/tutorials/2d/using_tilemaps.html
+https://docs.godotengine.org/en/stable/tutorials/3d/introduction_to_3d.html
+https://docs.godotengine.org/en/stable/tutorials/export/exporting_projects.html
+https://docs.godotengine.org/en/stable/tutorials/physics/physics_introduction.html
+https://docs.godotengine.org/en/stable/tutorials/physics/using_character_body_2d.html
+https://docs.godotengine.org/en/stable/tutorials/scripting/gdscript/gdscript_basics.html
+https://docs.godotengine.org/en/stable/tutorials/shaders/introduction_to_shaders.html
+https://docs.godotengine.org/en/stable/tutorials/ui/size_and_anchors.html
+https://github.com/godotengine/godot
+https://en.wikipedia.org/wiki/Godot_%28game_engine%29
+https://www.gdquest.com/tutorial/godot/gdscript/intro/
+https://www.kodeco.com/38442713-introduction-to-gdscript-in-godot-4-part-1?page=1
+https://gamefromscratch.com/godot-vs-unity-which-to-choose-in-2025/
+https://forum.godotengine.org/t/how-to-make-a-characterbody2d-or-area2d-node-detect-what-physics-layer-you-are-colliding-with-on-a-tilemap/2738
+https://forum.godotengine.org/t/character-body-area2d-collision-detection-outside-overlapping/65005
+https://gamedevacademy.org/timer-in-godot-complete-guide/
+
+# cluster: wedding-planning
+https://bridalmusings.com/111791/65-questions-to-ask-your-wedding-venue/
+https://www.kennedyblue.com/blogs/weddings/all-the-top-questions-to-ask-a-wedding-venue
+https://www.tagvenue.com/blog/wedding-venue-questions-and-checklist
+https://www.tckpublishing.com/wedding-planning-checklist/
+https://www.zola.com/expert-advice/your-ultimate-wedding-planning-checklist
+https://theknot.com/content/12-month-wedding-planning-countdown
+https://withjoy.com/blog/wedding-planning-timeline/
+https://paperlust.co/blog/average-wedding-cost-2026/
+https://www.zola.com/expert-advice/whats-the-average-cost-of-a-wedding
+https://www.easyweddings.com.au/articles/ultimate-guide-wedding-dress-silhouettes
+https://justinalexander.com/blog/the-complete-guide-to-wedding-dress-silhouette-shapes-2025-07-23/
+https://davidsbridal.com/inspiration/brides/wedding-dress-styles
+https://www.theperfectwedding.nl/artikelen/5695/how-to-choose-wedding-catering-style
+https://paperlust.co/blog/plated-vs-buffet-wedding/
+https://bridebook.com/uk/article/how-to-the-secrets-to-wording-wedding-invitations
+https://www.greenvelope.com/blog/wedding-invitation-etiquette/
+https://minted.com/wedding-ideas/wedding-invitation-wording
+https://www.easyweddings.com.au/articles/15-questions-ask-wedding-photographer
+https://junebugweddings.com/wedding-blog/questions-to-ask-wedding-photographers/
+https://paperlust.co/blog/wedding-budget-breakdown/
+https://elephantsdeli.com/?p=2201
+https://bridebook.com/uk/article/16-questions-to-ask-your-wedding-photographer
+
+# cluster: terraform
+https://developer.hashicorp.com/terraform/intro
+https://developer.hashicorp.com/terraform/intro/core-workflow
+https://developer.hashicorp.com/terraform/language/state
+https://developer.hashicorp.com/terraform/language/modules
+https://github.com/hashicorp/terraform
+https://www.educative.io/answers/what-is-state-locking-in-terraform
+https://terrateam.io/blog/terraform-force-unlock
+
+# cluster: prometheus
+https://prometheus.io/docs/introduction/overview/
+https://prometheus.io/docs/concepts/data_model/
+https://prometheus.io/docs/prometheus/latest/querying/basics/
+https://prometheus.io/docs/alerting/latest/overview/
+https://prometheus.io/docs/guides/node-exporter/
+https://github.com/prometheus/prometheus
+https://last9.io/blog/prometheus-rate-function/
+
+# cluster: ansible
+https://docs.ansible.com/ansible/latest/getting_started/get_started_ansible.html
+https://docs.ansible.com/ansible/latest/getting_started/get_started_inventory.html
+https://docs.ansible.com/ansible/latest/getting_started/get_started_playbook.html
+https://docs.ansible.com/ansible/latest/getting_started/basic_concepts.html
+https://github.com/ansible/ansible
+https://lucaberton.com/blog/ansible-tutorial-beginners-guide-2026/
+https://phoenixnap.com/kb/ansible-variables
+
+# cluster: kayaking
+https://www.dickssportinggoods.com/protips/sports-and-activities/water-sports/how-to-buy-a-kayak
+https://paddling.com/learn/how-to-choose-the-right-kayak
+https://aquabound.com/blogs/resources/how-to-choose-sit-on-top-vs-sit-in-kayaks
+https://paddling.com/learn/kayak-forward-stroke-tips
+https://paddlingmag.com/skills/how-to-sweep-roll-a-kayak/
+https://www.nrs.com/learn/how-to-roll-a-sea-kayak
+https://en.wikipedia.org/wiki/Sea_kayak
+
+# cluster: surfing
+https://www.rapturecamps.com/learn-to-surf/surf-equipment/surfboards-for-beginners
+https://www.carvemag.com/2026/09/how-to-read-a-surf-forecast/
+https://www.surfertoday.com/surfing/14122-how-to-read-a-surf-report
+https://en.wikipedia.org/wiki/Surfing
+https://www.rapturecamps.com/blog/surf-etiquette-for-surfers
+https://www.watergatebay.co.uk/blog/how-to-pop-up/
+https://www.islesurfandsup.com/choosing-a-surfboard-for-beginners/
+
+# cluster: scuba-diving
+https://en.wikipedia.org/wiki/Scuba_diving
+https://www.sportdiver.com/node/27481
+https://blog.padi.com/padi-open-water-dives/
+https://www.atlasandboots.com/?p=7121
+https://blog.padi.com/ear-equalization-and-ear-care-for-scuba-divers/
+https://www.divessi.com/en/blog/equalize-ear-pressure-1218
+https://www.divepacific.co.nz/post/enriched-air---nitrox-diving
+
+# cluster: fpv-drones
+https://oscarliang.com/fpv-drone-guide
+https://blog.dronetrest.com/the-ultimate-beginners-guide-to-fpv-drones-tips-tricks-and-recommendations-2/
+https://all3dp.com/beginners-fpv-drones-goggles-fpv-racing/
+https://en.wikipedia.org/wiki/First-person_view_%28remote_control%29
+https://www.getfpv.com/learn/fpv-essentials/drone-battery-safety/
+https://shop.coptrz.com/blogs/news/getting-into-fpv-drones-heres-everything-you-need-to-know
+
+# cluster: tiny-houses
+https://www.hireahelper.com/advice/everything-you-need-to-know-before-moving-into-a-tiny-home/
+https://angi.com/articles/tiny-home-cost.htm
+https://www.thisoldhouse.com/foundations/build-tiny-house
+https://exprealty.com/guides/zoning-regulations-can-i-put-a-tiny-house-on-my-property/
+https://www.architecturecourses.org/blog/tiny-houses-wheels
+https://en.wikipedia.org/wiki/Tiny-house_movement
+
+# cluster: calligraphy
+https://anartfulmom.com/?p=82381
+https://calligrascape.com/modern-calligraphy/
+https://thepostmansknock.com/beginners-guide-modern-calligraphy
+https://madegooddesigns.com/modern-calligraphy-guide/
+https://mathilda-lundin-jb34.squarespace.com/blog/the-beginners-guide-to-modern-calligraphy-my-top-tools-and-supplies
+https://www.texasart.com/group/2461
+
+# cluster: one-brutalism
+https://en.wikipedia.org/wiki/Brutalist_architecture
+
+# cluster: one-daylight-saving
+https://www.sciencefocus.com/science/when-is-daylight-saving-2025
+
+# cluster: one-descale-kettle
+https://moralfibres.co.uk/how-to-descale-a-kettle-with-vinegar-or-citric-acid/
+
+# cluster: one-fermi-paradox
+https://worldatlas.com/space/the-fermi-paradox-explained.html
+
+# cluster: one-lindy-effect
+https://en.wikipedia.org/wiki/Lindy_effect
+
+# cluster: one-pomodoro
+https://hubstaff.com/time-tracking/pomodoro-technique
+
+# cluster: one-prometheus-myth
+https://en.wikipedia.org/wiki/Prometheus
+
+# cluster: one-rosetta-stone
+https://en.wikipedia.org/wiki/Rosetta_Stone
+
+# cluster: one-stripped-screw
+https://medium.com/@oliveroueen/how-to-remove-a-stripped-screw-fb079e5a09f4
+
+# cluster: one-tardigrades
+https://earth.com/news/tiny-survivors-tardigrades-extremes
+
+# cluster: one-terraforming-mars
+https://en.wikipedia.org/wiki/Terraforming_of_Mars
+
+# cluster: one-travel-pillow
+https://countryfile.com/reviews/best-travel-pillow
+
+# cluster: one-waiting-for-godot
+https://en.wikipedia.org/wiki/Waiting_for_Godot
+

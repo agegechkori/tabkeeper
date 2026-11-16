@@ -52,6 +52,13 @@ pub struct ReconcileConfig {
     pub min_support: usize,
     /// Vocabulary tags offered to the model for each page.
     pub candidates: usize,
+    /// Put an umbrella tag first on the pages of tags that are parts of one
+    /// interest (lisbon and algarve on a trip to portugal).
+    pub umbrellas: bool,
+    /// A tag is asked about with each smaller tag whose pages are at least
+    /// this alike to its own (cosine similarity of their mean page vectors),
+    /// as belonging to one interest.
+    pub umbrella_similarity: f32,
     /// Pages of one tag whose embeddings fall into two groups at most this
     /// similar to each other are checked for a split.
     pub split_similarity: f32,
@@ -73,6 +80,8 @@ impl Default for ReconcileConfig {
             cluster_similarity: 0.75,
             min_support: 3,
             candidates: 8,
+            umbrellas: true,
+            umbrella_similarity: 0.85,
             split_similarity: 0.75,
             batch_size: 20,
         }

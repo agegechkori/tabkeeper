@@ -41,6 +41,13 @@ pub struct Settings {
     pub max_tags: usize,
     /// Pages classified at the same time.
     pub concurrency: usize,
+    /// Put an umbrella tag first on the pages of tags that are parts of one
+    /// interest.
+    pub umbrellas: bool,
+    /// A tag is asked about with each smaller tag whose pages are at least
+    /// this alike to its own (cosine similarity of their mean page vectors),
+    /// as belonging to one interest.
+    pub umbrella_similarity: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -78,6 +85,9 @@ pub struct Retag {
     /// cluster, and how many of them got it.
     pub rescue_checked: usize,
     pub rescued: usize,
+    /// Umbrella tags, each put first on the pages of the tags that are its
+    /// parts, with those parts.
+    pub umbrellas: Vec<(String, Vec<String>)>,
 }
 
 const CLUSTER_SYSTEM: &str = "You name a group of pages from a personal archive. The numbered pages were grouped because they are about similar things. Give the one tag for the topic most of them share: the broad topic someone would file them under, like bread, investing, japan, astronomy or machine-learning.
@@ -112,6 +122,62 @@ Reply with a JSON object: {\"fits\": true}.";
 #[derive(Deserialize)]
 struct CheckReply {
     fits: bool,
+}
+
+const UMBRELLA_PAIR_SYSTEM: &str = "You compare two tags of a personal archive of web pages. Their pages are alike. First say, for each tag, which interest its pages are about: the specific topic someone would file them under, like scotland rather than travel, or pottery rather than crafts. Then say whether the two tags are about the same interest.
+
+- The same interest: one tag is the interest and the other a part or an aspect of it (pottery and glazes), both are parts of it (edinburgh and scottish-trains, on a trip to scotland; glazes and kilns, for pottery), or they are two names for the same thing.
+- Two interests: two different sports (tennis and golf), two different tools (excel and photoshop), two different trips or hobbies, even when their pages are alike and belong to one field.
+
+Reply with a JSON object: {\"interest_1\": \"...\", \"interest_2\": \"...\", \"one_interest\": true}.";
+
+const UMBRELLA_NAME_SYSTEM: &str = "You name an interest in a personal archive of web pages. The tags below belong to it, the tag with the most pages first: the places and travel of one trip, the parts of one project, the skills and gear of one hobby, the features of one tool, or names for the same thing. Give the one tag for the whole interest: the topic someone would file all these pages under, like scotland for edinburgh and isle-of-skye, or pottery for glazes and kilns.
+
+- If one of the tags already names the whole interest, use it exactly.
+- Name the interest itself, not a field it belongs to: pottery, not crafts; scotland, not travel.
+- Use lowercase kebab-case English.
+
+Reply with a JSON object: {\"description\": \"one line on what the interest covers\", \"tag\": \"...\"}.";
+
+/// Pages of a tag shown, by title, when asking about an umbrella.
+const UMBRELLA_TITLES: usize = 3;
+
+#[derive(Deserialize)]
+struct UmbrellaPairReply {
+    #[serde(default)]
+    one_interest: bool,
+}
+
+#[derive(Deserialize)]
+struct UmbrellaNameReply {
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    tag: String,
+}
+
+/// A tag as the umbrella questions show it: its name, pages, description and
+/// the titles of a few of its pages.
+fn umbrella_line(
+    name: &str,
+    list: &[usize],
+    pages: &[AnalyzedPage],
+    vocabulary: &BTreeMap<String, VocabTag>,
+) -> String {
+    let titles: Vec<String> = list
+        .iter()
+        .take(UMBRELLA_TITLES)
+        .map(|&i| truncate_chars(pages[i].title.trim(), 80))
+        .collect();
+    let description = vocabulary
+        .get(name)
+        .map(|t| t.description.trim().trim_end_matches('.'))
+        .unwrap_or_default();
+    format!(
+        "{name} ({} pages): {description}. Pages such as: {}",
+        list.len(),
+        titles.join("; ")
+    )
 }
 
 #[derive(Deserialize)]
@@ -656,6 +722,177 @@ async fn name_cluster<R: Reviewer>(
     }
 }
 
+/// Puts an umbrella tag first on the pages of tags that belong to one
+/// interest: lisbon and algarve under portugal. From the tag with the most
+/// pages down, each tag is compared with the smaller tags whose pages are
+/// alike to its own. Being alike isn't enough on its own, since neighbouring
+/// interests (sailing and surfing) are as alike as two parts of one interest,
+/// so the model says, pair by pair, whether the two belong to one interest,
+/// then names the interest.
+#[allow(clippy::too_many_arguments)]
+async fn add_umbrellas<R: Reviewer>(
+    reviewer: &R,
+    pages: &[AnalyzedPage],
+    page_vectors: &[Vec<f32>],
+    settings: &Settings,
+    vocabulary: &mut BTreeMap<String, VocabTag>,
+    kept: &mut HashSet<String>,
+    locked: &HashSet<String>,
+    chosen: &mut [Option<Vec<String>>],
+    out: &mut Retag,
+) {
+    // The pages each tag is the first tag of.
+    let mut firsts: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (i, tags) in chosen.iter().enumerate() {
+        let first = tags
+            .as_ref()
+            .and_then(|tags| tags.iter().find(|t| kept.contains(*t) && !locked.contains(*t)));
+        if let Some(first) = first {
+            firsts.entry(first.clone()).or_default().push(i);
+        }
+    }
+    firsts.retain(|_, list| list.len() >= settings.min_support);
+    let names: Vec<String> = firsts.keys().cloned().collect();
+    if names.len() < 2 {
+        return;
+    }
+    // Where each tag's pages point on average.
+    let centroids: Vec<Vec<f32>> = names
+        .iter()
+        .map(|name| {
+            let list = &firsts[name];
+            let mut sum = vec![0.0; page_vectors[list[0]].len()];
+            for &i in list {
+                for (s, x) in sum.iter_mut().zip(&page_vectors[i]) {
+                    *s += x;
+                }
+            }
+            unit(sum)
+        })
+        .collect();
+    // Each tag's interest comes first. Asked for a reason instead, the model
+    // found a theme both tags share (conservation for birds and big cats)
+    // and called the tags two aspects of it.
+    let pair_schema = json!({
+        "type": "object", "additionalProperties": false,
+        "required": ["interest_1", "interest_2", "one_interest"],
+        "properties": {
+            "interest_1": {"type": "string"},
+            "interest_2": {"type": "string"},
+            "one_interest": {"type": "boolean"}
+        }
+    });
+    let name_schema = json!({
+        "type": "object", "additionalProperties": false, "required": ["description", "tag"],
+        "properties": {"description": {"type": "string"}, "tag": {"type": "string"}}
+    });
+    // Tags by their number of pages, most first; ties by name.
+    let mut order: Vec<usize> = (0..names.len()).collect();
+    order.sort_by(|&a, &b| {
+        firsts[&names[b]]
+            .len()
+            .cmp(&firsts[&names[a]].len())
+            .then(names[a].cmp(&names[b]))
+    });
+    // A tag that has led, or joined an interest, isn't asked about again.
+    let mut done = vec![false; names.len()];
+    for &h in &order {
+        if done[h] {
+            continue;
+        }
+        done[h] = true;
+        // The bigger tag leads, and the others are compared with it one at a
+        // time. Asked about a whole group at once, the model named what all
+        // the tags share, often a field (water-sports for sailing and
+        // kayaking).
+        let near: Vec<usize> = order
+            .iter()
+            .copied()
+            .filter(|&j| !done[j] && similarity(&centroids[h], &centroids[j]) >= settings.umbrella_similarity)
+            .collect();
+        if near.is_empty() {
+            continue;
+        }
+        let head = names[h].as_str();
+        let head_line = umbrella_line(head, &firsts[head], pages, vocabulary);
+        let mut parts = vec![head.to_string()];
+        for j in near {
+            let other = names[j].as_str();
+            let user = format!(
+                "Tag 1: {head_line}\nTag 2: {}\n",
+                umbrella_line(other, &firsts[other], pages, vocabulary)
+            );
+            match reviewer
+                .ask_json(
+                    UMBRELLA_PAIR_SYSTEM,
+                    &user,
+                    "tag_umbrella_pair",
+                    pair_schema.clone(),
+                )
+                .await
+            {
+                Ok(reply) => {
+                    if serde_json::from_value::<UmbrellaPairReply>(reply).is_ok_and(|r| r.one_interest) {
+                        parts.push(other.to_string());
+                        done[j] = true;
+                    }
+                }
+                Err(err) => out.failed_requests.push(format!("{err:#}")),
+            }
+        }
+        if parts.len() < 2 {
+            continue;
+        }
+        // The leader first, then the others by their number of pages.
+        let mut user = String::from("Tags:\n");
+        for part in &parts {
+            user.push_str(&format!(
+                "- {}\n",
+                umbrella_line(part, &firsts[part], pages, vocabulary)
+            ));
+        }
+        let reply = match reviewer
+            .ask_json(UMBRELLA_NAME_SYSTEM, &user, "tag_umbrella", name_schema.clone())
+            .await
+        {
+            Ok(reply) => reply,
+            Err(err) => {
+                out.failed_requests.push(format!("{err:#}"));
+                continue;
+            }
+        };
+        let Ok(reply) = serde_json::from_value::<UmbrellaNameReply>(reply) else {
+            continue;
+        };
+        let Some(umbrella) = normalize_name(&reply.tag) else {
+            continue;
+        };
+        if locked.contains(&umbrella) {
+            continue;
+        }
+        let description = match reply.description.trim() {
+            "" => format!("{}.", parts.join(", ")),
+            text => text.to_string(),
+        };
+        vocabulary.entry(umbrella.clone()).or_insert(VocabTag {
+            name: umbrella.clone(),
+            description,
+            pages: 0,
+        });
+        kept.insert(umbrella.clone());
+        for part in &parts {
+            for &i in &firsts[part] {
+                if let Some(Some(tags)) = chosen.get_mut(i) {
+                    tags.retain(|t| kept.contains(t) && *t != umbrella);
+                    tags.insert(0, umbrella.clone());
+                    tags.truncate(settings.max_tags);
+                }
+            }
+        }
+        out.umbrellas.push((umbrella, parts));
+    }
+}
+
 /// Builds the vocabulary from the whole archive and tags every done page
 /// from it. Only the model's "one meaning" verdicts are saved, so they aren't
 /// asked again; `Retag::assignments` says which tags to save.
@@ -1147,6 +1384,28 @@ pub async fn retag<R: Reviewer, E: Embedder>(
         ));
     }
     out.dropped = names.iter().filter(|n| !kept.contains(*n)).cloned().collect();
+    // Tags that are parts of one interest get an umbrella, put first on
+    // their pages: the broad topic someone would file them under.
+    if settings.umbrellas {
+        add_umbrellas(
+            reviewer,
+            &pages,
+            &page_vectors,
+            settings,
+            &mut vocabulary,
+            &mut kept,
+            &locked,
+            &mut chosen,
+            &mut out,
+        )
+        .await;
+        for (umbrella, parts) in &out.umbrellas {
+            note(&format!(
+                "Umbrella tag {umbrella}, put first on the pages of {}.",
+                parts.join(", ")
+            ));
+        }
+    }
     // Pages per tag, as assigned.
     let mut counts: HashMap<String, usize> = HashMap::new();
     for tags in chosen.iter().flatten() {
@@ -1231,6 +1490,8 @@ mod tests {
             candidates: 8,
             max_tags: 3,
             concurrency: 1,
+            umbrellas: true,
+            umbrella_similarity: 0.85,
         };
         let out = retag(&db, &reviewer, &no_names(), &settings, |_| {})
             .await
@@ -1282,6 +1543,8 @@ mod tests {
             candidates: 8,
             max_tags: 3,
             concurrency: 1,
+            umbrellas: true,
+            umbrella_similarity: 0.85,
         };
         // Pages unlike each other: each is its own group in the check.
         let pages = [
@@ -1410,6 +1673,8 @@ mod tests {
             candidates: 8,
             max_tags: 3,
             concurrency: 1,
+            umbrellas: true,
+            umbrella_similarity: 0.85,
         };
         let out = retag(&dogs_and_horses(), &reviewer, &embedder, &settings, |_| {})
             .await
@@ -1475,6 +1740,8 @@ mod tests {
             candidates: 8,
             max_tags: 3,
             concurrency: 1,
+            umbrellas: true,
+            umbrella_similarity: 0.85,
         };
         let out = retag(
             &dogs_and_horses(),
@@ -1532,6 +1799,8 @@ mod tests {
             candidates: 8,
             max_tags: 3,
             concurrency: 1,
+            umbrellas: true,
+            umbrella_similarity: 0.85,
         };
         let out = retag(
             &dogs_and_horses(),
@@ -1570,6 +1839,9 @@ mod tests {
             json!({"tags": ["horses"]}),
             json!({"tags": ["horses"]}),
             json!({"tags": ["horses"]}),
+            // The pages are all alike, so horses is asked about as part of
+            // one interest with dogs. They are two interests.
+            json!({"interest_1": "dogs", "interest_2": "horses", "one_interest": false}),
         ]);
         let settings = Settings {
             cluster_similarity: 0.8,
@@ -1577,10 +1849,13 @@ mod tests {
             candidates: 8,
             max_tags: 3,
             concurrency: 1,
+            umbrellas: true,
+            umbrella_similarity: 0.85,
         };
         let out = retag(&dogs_and_horses(), &reviewer, &embedder, &settings, |_| {})
             .await
             .unwrap();
+        assert!(out.umbrellas.is_empty());
         // The second request shows only the pages left out, with dogs as an
         // existing tag.
         let second = &reviewer.prompts.borrow()[1];
@@ -1591,6 +1866,148 @@ mod tests {
         );
         let names: Vec<&str> = out.vocabulary.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(names, ["dogs", "horses"]);
+    }
+
+    /// Three Lisbon pages and three Algarve pages, each with a topic of its
+    /// own.
+    fn lisbon_and_algarve() -> Db {
+        use crate::reconcile::tests::archive;
+        archive(&[
+            (&["alfama"], [0.0; 3]),
+            (&["belem"], [0.0; 3]),
+            (&["sintra"], [0.0; 3]),
+            (&["lagos"], [0.0; 3]),
+            (&["faro"], [0.0; 3]),
+            (&["tavira"], [0.0; 3]),
+        ])
+    }
+
+    /// Lisbon pages and Algarve pages, 0.82 alike: a cluster each at 0.85,
+    /// one group of tags at 0.80.
+    fn lisbon_apart_from_algarve() -> TopicEmbedder {
+        TopicEmbedder(
+            [
+                ("alfama", 1),
+                ("belem", 1),
+                ("sintra", 1),
+                ("lagos", -1),
+                ("faro", -1),
+                ("tavira", -1),
+            ]
+            .map(|(topic, sign)| (topic, [1.0, sign as f32 * 0.31]))
+            .to_vec(),
+        )
+    }
+
+    /// Naming each cluster, then tagging each page with its cluster's name.
+    fn lisbon_and_algarve_replies() -> Vec<serde_json::Value> {
+        vec![
+            json!({"description": "Lisbon.", "fits": [1, 2, 3], "tag": "lisbon"}),
+            json!({"description": "The Algarve.", "fits": [1, 2, 3], "tag": "algarve"}),
+            json!({"tags": ["lisbon"]}),
+            json!({"tags": ["lisbon"]}),
+            json!({"tags": ["lisbon"]}),
+            json!({"tags": ["algarve"]}),
+            json!({"tags": ["algarve"]}),
+            json!({"tags": ["algarve"]}),
+        ]
+    }
+
+    fn umbrella_settings() -> Settings {
+        Settings {
+            cluster_similarity: 0.85,
+            min_support: 3,
+            candidates: 8,
+            max_tags: 3,
+            concurrency: 1,
+            umbrellas: true,
+            umbrella_similarity: 0.80,
+        }
+    }
+
+    #[tokio::test]
+    async fn tags_of_one_interest_get_an_umbrella_first() {
+        use crate::reconcile::tests::FakeReviewer;
+        let mut replies = lisbon_and_algarve_replies();
+        replies.push(json!({"interest_1": "portugal", "interest_2": "portugal", "one_interest": true}));
+        replies.push(json!({"description": "A trip to Portugal.", "tag": "portugal"}));
+        let reviewer = FakeReviewer::new(replies);
+        let out = retag(
+            &lisbon_and_algarve(),
+            &reviewer,
+            &lisbon_apart_from_algarve(),
+            &umbrella_settings(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+        let prompts = reviewer.prompts.borrow();
+        // As many pages each: the first by name leads the group.
+        let pair = &prompts[prompts.len() - 2];
+        assert!(
+            pair.starts_with(
+                "Tag 1: algarve (3 pages): The Algarve. Pages such as: Page 3; Page 4; Page 5\n"
+            ) && pair.contains("Tag 2: lisbon (3 pages): Lisbon."),
+            "{pair}"
+        );
+        let naming = &prompts[prompts.len() - 1];
+        assert!(
+            naming.starts_with("Tags:\n- algarve (3 pages)") && naming.contains("- lisbon (3 pages)"),
+            "{naming}"
+        );
+        assert_eq!(
+            out.umbrellas,
+            [(
+                "portugal".to_string(),
+                vec!["algarve".to_string(), "lisbon".to_string()]
+            )]
+        );
+        assert_eq!(
+            tags_of(&out),
+            [
+                vec!["portugal", "lisbon"],
+                vec!["portugal", "lisbon"],
+                vec!["portugal", "lisbon"],
+                vec!["portugal", "algarve"],
+                vec!["portugal", "algarve"],
+                vec!["portugal", "algarve"]
+            ]
+        );
+        let portugal = out.vocabulary.iter().find(|t| t.name == "portugal").unwrap();
+        assert_eq!(
+            (portugal.pages, portugal.description.as_str()),
+            (6, "A trip to Portugal.")
+        );
+    }
+
+    #[tokio::test]
+    async fn tags_of_two_interests_get_no_umbrella() {
+        use crate::reconcile::tests::FakeReviewer;
+        let mut replies = lisbon_and_algarve_replies();
+        // No naming request follows a "no".
+        replies.push(json!({"interest_1": "algarve", "interest_2": "lisbon", "one_interest": false}));
+        let reviewer = FakeReviewer::new(replies);
+        let out = retag(
+            &lisbon_and_algarve(),
+            &reviewer,
+            &lisbon_apart_from_algarve(),
+            &umbrella_settings(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+        assert!(out.umbrellas.is_empty());
+        assert_eq!(
+            tags_of(&out),
+            [
+                vec!["lisbon"],
+                vec!["lisbon"],
+                vec!["lisbon"],
+                vec!["algarve"],
+                vec!["algarve"],
+                vec!["algarve"]
+            ]
+        );
     }
 
     #[tokio::test]
@@ -1617,6 +2034,8 @@ mod tests {
             candidates: 8,
             max_tags: 3,
             concurrency: 1,
+            umbrellas: true,
+            umbrella_similarity: 0.85,
         };
         let out = retag(&dogs_and_horses(), &reviewer, &embedder, &settings, |_| {})
             .await
@@ -1679,6 +2098,8 @@ mod tests {
             candidates: 8,
             max_tags: 3,
             concurrency: 1,
+            umbrellas: true,
+            umbrella_similarity: 0.85,
         };
         let out = retag(&db, &reviewer, &embedder, &settings, |_| {}).await.unwrap();
         // The first name fits four pages, the second three.
@@ -1708,6 +2129,8 @@ mod tests {
             candidates: 8,
             max_tags: 3,
             concurrency: 1,
+            umbrellas: true,
+            umbrella_similarity: 0.85,
         };
         let out = retag(&db, &reviewer, &embedder, &settings, |_| {}).await.unwrap();
         assert_eq!(out.meaning_checks, 1);
@@ -1751,6 +2174,8 @@ mod tests {
             candidates: 8,
             max_tags: 3,
             concurrency: 1,
+            umbrellas: true,
+            umbrella_similarity: 0.85,
         };
         let out = retag(&db, &reviewer, &embedder, &settings, |_| {}).await.unwrap();
         // Two pages keep chemistry; the last, with nothing else, keeps rust.
@@ -1790,6 +2215,8 @@ mod tests {
             candidates: 8,
             max_tags: 3,
             concurrency: 1,
+            umbrellas: true,
+            umbrella_similarity: 0.85,
         };
         let out = retag(&db, &reviewer, &embedder, &settings, |_| {}).await.unwrap();
         let last = reviewer.prompts.borrow().last().cloned().unwrap();
@@ -1823,6 +2250,8 @@ mod tests {
             candidates: 8,
             max_tags: 3,
             concurrency: 1,
+            umbrellas: true,
+            umbrella_similarity: 0.85,
         };
         let out = retag(&db, &reviewer, &no_names(), &settings, |_| {})
             .await
@@ -1851,6 +2280,8 @@ mod tests {
             candidates: 8,
             max_tags: 3,
             concurrency: 1,
+            umbrellas: true,
+            umbrella_similarity: 0.85,
         };
         let out = retag(&db, &reviewer, &no_names(), &settings, |_| {})
             .await

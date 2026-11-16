@@ -128,6 +128,13 @@ vocabulary = true
 cluster_similarity = 0.75
 min_support = 3
 candidates = 8
+# Tags that belong to one interest (lisbon and algarve on a trip to
+# portugal) get an umbrella tag, put first on their pages. From the tag with
+# the most pages down, each tag is asked about with every smaller tag whose
+# pages are at least umbrella_similarity alike to its own, and the model says
+# whether the two belong to one interest.
+umbrellas = true
+umbrella_similarity = 0.85
 # Tag pairs per review request.
 batch_size = 20
 

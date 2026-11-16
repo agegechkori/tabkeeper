@@ -606,6 +606,8 @@ async fn vocabulary_review(
         candidates: r.candidates,
         max_tags: config.tags.max_per_page,
         concurrency: config.run.concurrency,
+        umbrellas: r.umbrellas,
+        umbrella_similarity: r.umbrella_similarity,
     };
     let retag = match vocab::retag(db, reviewer, embedder, &settings, say).await {
         Ok(retag) => retag,
@@ -643,6 +645,12 @@ async fn vocabulary_review(
     ));
     for t in &retag.vocabulary {
         say(&format!("  {:>4}  {:<28} {}", t.pages, t.name, t.description));
+    }
+    for (umbrella, parts) in &retag.umbrellas {
+        say(&format!(
+            "  ({umbrella}: put first on the pages of {})",
+            parts.join(", ")
+        ));
     }
     for (word, groups) in &retag.checked {
         let verdict = match retag.ambiguous.iter().find(|(w, _)| w == word) {

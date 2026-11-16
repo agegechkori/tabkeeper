@@ -47,7 +47,8 @@ flowchart LR
     direction TB
     v["Build a vocabulary<br/>from all pages"] --> m["Split words that name<br/>unrelated things"]
     m --> c["Tag every page<br/>from the vocabulary"]
-    c --> a{"Approve<br/>the retag?"}
+    c --> u["Put an interest's tag<br/>first over its parts"]
+    u --> a{"Approve<br/>the retag?"}
   end
   rev --> tree
   subgraph tree["3 · Tag tree"]
@@ -228,7 +229,7 @@ Reply:
 
 ## 5. Stage 2: the tag review
 
-The review (`vocab::retag` in `src/vocab.rs`) runs in nine steps. It asks at temperature 0 (`[reconcile] temperature`), so reviewing the same archive twice gives the same tags.
+The review (`vocab::retag` in `src/vocab.rs`) runs in ten steps. It asks at temperature 0 (`[reconcile] temperature`), so reviewing the same archive twice gives the same tags.
 
 ```mermaid
 flowchart LR
@@ -244,10 +245,11 @@ flowchart LR
     cl["5 · Classify: 1–3 of the<br/>8 nearest tags, or none<br/>(Prompt 4)"] --> mc2["6 · Meanings check<br/>on the tags chosen"]
     mc2 --> sup["7 · Drop tags on fewer<br/>than 3 pages; retry<br/>pages left without tags"]
     sup --> res["8 · Ask pages still<br/>without a tag about<br/>their cluster's tag<br/>(Prompt 4b)"]
+    res --> um["9 · Umbrella tags: tags<br/>of one interest get its<br/>tag first<br/>(Prompts 4c, 4d)"]
   end
   subgraph decide["Propose"]
     direction TB
-    g{"9 · Over half<br/>untagged?"} -->|"yes"| stop["Not proposed<br/>(a warning in<br/>revise-tags)"]
+    g{"10 · Over half<br/>untagged?"} -->|"yes"| stop["Not proposed<br/>(a warning in<br/>revise-tags)"]
     g -->|"no"| ap{"Approve?"}
     ap -->|"yes"| done["Applied as<br/>one revision"]
     ap -->|"no"| dec["Proposed again<br/>at 1.5 × the pages"]
@@ -540,6 +542,44 @@ Reply with a JSON object: {"fits": true}.
 User message: `Tag: {name}: {description}`, a blank line, then `Page: {title}` and the summary, cut to 500 characters. Schema: `{"fits": boolean}`.
 
 The prompt was chosen on 100 hard cases from the baseline reviews: 48 pages the classifier had left untagged although their topic's tag was in the vocabulary, and 52 plausible wrong tags for the same pages. It said yes to 23 of the 48 and wrongly said yes to only 3 of the 52. A variant that first writes what the page is about scored the same and took a third longer. Most of the no answers to right tags are names narrower than the topic: `index-funds` for a page on bonds, `houseplants` for compost, `knitting` for crochet. Rejecting those is right, and section 11.8 is about them.
+
+### 5.7 Umbrella tags
+
+A big interest's pages often fall into several clusters, and each cluster gets a name of its own: a trip becomes `lisbon`, `algarve` and `portugal-trains`. First-tag F1 counts each split as a miss, and on the realistic set this cost more than half of the recall (`docs/realistic-test-set.md`). Step 9 puts one tag for the whole interest first on those pages, and each page keeps its own tags after it (`[reconcile] umbrellas`, on by default).
+
+1. **Candidates.** Each tag that is the first tag of 3+ pages gets the mean of its pages' vectors. From the tag with the most pages down, each tag is compared with every smaller tag whose mean vector is at least 0.85 alike to its own (`umbrella_similarity`). A tag that has led, or joined an interest, isn't asked about again.
+2. **One pair at a time (Prompt 4c).** The model names the interest each tag's pages are about, then says whether the two are the same interest. Being alike isn't enough: neighbouring interests are as alike as two parts of one (on the development set, `sailing` and `surfing` 0.88; `sailing` and `sailing-knots` 0.92).
+3. **A name (Prompt 4d).** If at least one tag joined, the model names the interest from all its tags, the biggest first. It can keep one of their names.
+4. **First on the pages.** A page whose first tag is one of the parts gets the interest's tag first, then its own tags, at most 3 in all.
+
+A review asks 1–13 pairs on the sets of about 150 pages and about 40 on the realistic set of 500, and names up to 11 interests. It takes up to 10% longer. Section 11.11 has the results.
+
+#### Prompt 4c: one interest or two? (`tag_umbrella_pair`)
+
+```text
+You compare two tags of a personal archive of web pages. Their pages are alike. First say, for each tag, which interest its pages are about: the specific topic someone would file them under, like scotland rather than travel, or pottery rather than crafts. Then say whether the two tags are about the same interest.
+
+- The same interest: one tag is the interest and the other a part or an aspect of it (pottery and glazes), both are parts of it (edinburgh and scottish-trains, on a trip to scotland; glazes and kilns, for pottery), or they are two names for the same thing.
+- Two interests: two different sports (tennis and golf), two different tools (excel and photoshop), two different trips or hobbies, even when their pages are alike and belong to one field.
+
+Reply with a JSON object: {"interest_1": "...", "interest_2": "...", "one_interest": true}.
+```
+
+User message: `Tag 1: {name} ({n} pages): {description}. Pages such as: {up to 3 titles}`, then `Tag 2` the same way; tag 1 is the bigger tag. Schema: `{"interest_1": string, "interest_2": string, "one_interest": boolean}`. The examples come from outside all four test sets.
+
+#### Prompt 4d: naming the interest (`tag_umbrella`)
+
+```text
+You name an interest in a personal archive of web pages. The tags below belong to it, the tag with the most pages first: the places and travel of one trip, the parts of one project, the skills and gear of one hobby, the features of one tool, or names for the same thing. Give the one tag for the whole interest: the topic someone would file all these pages under, like scotland for edinburgh and isle-of-skye, or pottery for glazes and kilns.
+
+- If one of the tags already names the whole interest, use it exactly.
+- Name the interest itself, not a field it belongs to: pottery, not crafts; scotland, not travel.
+- Use lowercase kebab-case English.
+
+Reply with a JSON object: {"description": "one line on what the interest covers", "tag": "..."}.
+```
+
+User message: `Tags:`, then one line per tag as in Prompt 4c, the biggest first. Schema: `{"description": string, "tag": string}`.
 
 ## 6. Stage 3: the tag tree
 
@@ -943,12 +983,38 @@ The 2B was also tried at higher precision. `qwen3:4b` reviews take 189–223 s o
 >
 > From 4B up, the model's own steps are already precise: precision is 0.95 or more on the held-out and realistic sets. What's left is how broad a topic is, and the clustering mostly decides that before any model is asked. Each naming call sees one group, so it can't tell that Lisbon belongs to a 39-page Portugal interest. A bigger model may pay off once it gets a decision that needs the whole collection, such as grouping cluster names into interests (umbrella tags), so that's where to test one again. Below 4B, the model's own steps start to fail.
 
+### 11.11 Umbrella tags over an interest's subtopics
+
+Section 5.7 describes the step. It was built on a development set of 162 pages made for it (`scripts/dev_urls.txt`, 2026-11-15), so that the realistic set stayed a test. The set has four big interests whose pages split into subtopics (a trip to Iceland, sailing, the Godot engine, a wedding), two groups of separate topics that share only a field (Terraform, Prometheus and Ansible; kayaking, surfing and scuba diving), three medium topics and 13 single pages.
+
+*Measure:* F1 on the development set, where perfect umbrellas would raise it from 0.59 and 0.66 to 0.97; no regression on the held-out and old sets; then the realistic set, once.
+
+> [!NOTE]
+> **Done** (not committed yet). How the step got there, on the development set:
+> - **One question per group of alike tags** (which tags are parts of one interest, and what it's called) put `sailing` and `kayak` under `water-sports` or `boating`: F1 0.83 and 0.88, precision 0.88. Asked about a whole group, the model names what all the tags share, often a field.
+> - **One pair at a time, with a reason first,** kept precision at 1.00, but called `sailing` and `sailing-knots` "different aspects, so two interests": F1 0.85 and 0.91. Saying that a part or an aspect of an interest belongs to it, and grouping by the biggest tag instead of average linkage, which had left out `wedding-dress`, raised F1 to 0.93 and 0.93.
+> - **The reason let the model find a theme two tags share.** On the old and held-out sets it put `birds` with `conservation`, the big-cats topic's tag ("two aspects of conservation"), and `linux` with `container-orchestration`: F1 0.884 → 0.848 and 0.971 → 0.926. Naming each tag's interest first, instead of a reason, removed both.
+
+| F1 | Before | With umbrellas |
+|---|---|---|
+| Development set | 0.59, 0.66 | **0.94, 0.97** |
+| Held-out set | 0.971, 0.962 | 0.971, 0.962 (no umbrella made) |
+| Old set | 0.884, 0.929 | **0.907**, 0.929 (`astronomy` over `solar-system`) |
+| Realistic set, the test | 0.511, 0.438 | **0.654, 0.606** |
+
+On the realistic set, recall rose from 0.34 and 0.28 to 0.50 and 0.46, precision fell from 0.99 and 0.95 to 0.94 and 0.90, and coarse F1 rose from 0.43 and 0.37 to 0.59 and 0.56. No tag was put on two meanings of a word. A review took 652–715 s, against 599–670 s. The two runs agree on 0.66, against 0.70 before. What went wrong there:
+- **The data tools.** Kafka, Airflow, Spark, PostgreSQL and dbt are separate topics in the labels, in one group. Their clusters were named for what the tools do (`workflow-orchestration` for Airflow, `data-processing` for Spark, `data-transformation`), and the step took those for parts of one interest: `apache-kafka` with `workflow-orchestration` in one run, `data-engineering` over Spark, Airflow and pipelines in the other. Most of the lost precision is here; coarse F1, which scores the group, counts these as right.
+- **Two umbrellas for one trip.** One run made `portugal` over `lisbon-travel`, `portugal-trains` and `portugal`, then `portugal-travel` over `algarve` and `portugal-travel`: naming the second group, the model didn't know the first one's name.
+- **Parts left out.** Spanish was joined only in part in one run (`spanish-grammar` over `spanish-subjunctive`).
+
+Next, on the development set: show the names of earlier umbrellas when naming a later one, and look at clusters of tools named for what the tools do (Prompt 2).
+
 ### Already tried, and not worth repeating
 
 These were measured on the test sets and didn't help, or made things worse:
 
-- Embedding similarity as a judge of tags (the shared word dominates), and centering or whitening the vectors.
-- c-TF-IDF keyword overlap as a judge.
+- Embedding similarity as a judge of tags (the shared word dominates), and centering or whitening the vectors (13.2).
+- c-TF-IDF keyword overlap as a judge (13.2).
 - A refine step, numbered choices in classification, and merge/split/consolidate after a retag.
 - The model's thinking step: slow, and it hit the token caps.
 - `qwen3:14b`: worse than the 4B model here.
@@ -957,6 +1023,7 @@ These were measured on the test sets and didn't help, or made things worse:
 - A third import tag per page (section 4).
 - `nomic-embed-text`'s `clustering: ` prefix, and `qwen3-embedding:0.6b` (11.4).
 - `qwen3.5` at 2B (`q4_K_M`, `Q5_K_M`, `q8_0`), 4B and 9B in place of `qwen3:4b`, and a naming rule that also says what's too broad (11.10).
+- For umbrella tags: one question about a whole group of alike tags (it names a field), a reason before the yes or no (it finds a shared theme), and average-linkage groups (they leave parts out) (11.11).
 
 ## 12. Results after the changes
 
@@ -976,6 +1043,49 @@ These were measured on the test sets and didn't help, or made things worse:
 
 The worst case improved most. Before, one of the old set's reviews lost three topics and left 18 pages untagged. Now no import loses a topic, and the most pages left untagged is 6. The remaining gaps are pages whose cluster got a name narrower than their topic (11.8), and the held-out set's long tail of topics with 1 or 2 pages (11.3).
 
+## 13. Compared with BERTopic
+
+BERTopic is a widely used topic-modeling library. Like tabkeeper's review, it groups documents by their embeddings and can have an LLM name the groups. The two differ in what a group decides and in who makes the hard decisions.
+
+### 13.1 The differences
+
+| | BERTopic | tabkeeper's review |
+|---|---|---|
+| What is embedded | The document's text | The page's title, its LLM summary and its import tags: stage 1 has already read the page |
+| Before clustering | UMAP reduces the vectors to a few dimensions, which density-based clustering needs | Nothing: cosine similarity on the full vectors |
+| Clustering | HDBSCAN: density-based; it finds the number of clusters and leaves outliers out | Average-linkage agglomerative clustering at a fixed similarity, in two passes (5.3) |
+| What a topic is | A cluster number; two topics never merge because they share a word | A tag, which is its name: two clusters both named `python` become one tag unless the meanings check (5.4) gives each meaning its own name |
+| Describing a topic | c-TF-IDF keywords, the words most distinctive of the cluster's documents; optionally an LLM label from the keywords and the most representative documents | A tag name and a one-line description from the LLM, from the titles and summaries of the cluster's first 10 pages; no keywords |
+| What a cluster decides | The topic: a document's topic is its cluster | Only which topics exist and what they're called. Each page is then tagged by the LLM from the 8 vocabulary tags nearest to it (5.5), so it can get a tag from another cluster, and up to 3 tags |
+| Topics per document | One, with topic probabilities if asked | 1–3 tags, broadest first |
+| Documents without a topic | Outliers (topic −1); they can be attached to the nearest topic, by embedding or keyword similarity | Tags on fewer than 3 pages are dropped; a page left without a tag is asked, yes or no, about its cluster's tag (11.2) |
+| Merging topics | Topic reduction merges topics whose representations are alike | None in the vocabulary path, so near-duplicates such as `mechanical-keyboard` and `mechanical-keyboards` can both stay |
+| Hierarchy | Hierarchical topics: topics merged bottom-up by keyword similarity | The tag tree (section 6), set aside; umbrella tags over an interest's subtopics are next |
+| Repeatability | UMAP is random unless its seed is fixed | The same tags on every review: temperature 0 and frozen inputs (11.5, 11.9) |
+| Cost | Cheap once the documents are embedded; the LLM is optional | One LLM request per cluster and per page: with `qwen3:4b`, 3–4 minutes for 150 pages and 10–11 for 500 |
+
+In short, in BERTopic the statistics decide and the LLM only labels. In tabkeeper the statistics only propose (which pages are alike, which tags are near a page), and the LLM decides what the topics are, which tags fit each page, and whether a word means one thing or several.
+
+### 13.2 BERTopic's ideas, tried here
+
+On 2026-10-17, the ideas that could replace a model decision with a cheaper statistical one were tested offline on the old set, with no model requests. None held up:
+
+- **Spreading out the similarities, which is UMAP's job.** Most similarities fell between 0.6 and 0.8, and that looked like the reason similarity couldn't judge tags. Centering and whitening the vectors stood in for UMAP. They didn't help: the raw vectors already rank pages well, since two pages of one topic score as more alike than two pages of different topics with an AUC of 0.98–0.99. Centering only spread the numbers out, and it made known-wrong tags harder to find: of 182 page–tag pairs, the wrong tag that ranked as the least coherent fell to 13th.
+- **Telling a word with two meanings from a broad word, by similarity.** After centering, the groups of an ambiguous word's pages (`python`, `java`, `go`) were more alike, at 0.32–0.40, than the groups of a broad word's pages (`food`, `technology`), at −0.03 to 0.19: the opposite of what the check needs. The shared word itself pulls the groups together.
+- **The same question, by c-TF-IDF keyword overlap.** With the word itself left out, the keyword vectors of an ambiguous word's two least-alike groups had a cosine of 0.00–0.03, and a broad word's 0.00–0.02: no difference. A broad word's groups share no distinctive words either: under `food`, bread pages talk about gluten and baguettes, fruit pages about malus and cultivation.
+- **Better clusters.** UMAP and HDBSCAN weren't tried, because the clusters aren't where tags go wrong: the topic's tag is among the 8 offered to the classifier 99.5% of the time (section 10). An embedding prefix that made the clusters match the labeled topics better made full reviews worse (11.4).
+
+The common cause is that these signals measure shared words and surface similarity. Whether two groups of pages are one thing or two, whether a tag fits a page, and how broad a topic is all depend on world knowledge, which only the model has. BERTopic doesn't have to make those decisions: it gives each document the one topic of its cluster, and a person reads the keywords.
+
+Two ideas did carry over, in a form where the model decides:
+- **LLM labels** became cluster naming (prompt 2).
+- **Attaching outliers to a topic** became the yes/no rescue (11.2). Instead of the nearest topic by similarity, which can't tell a wrong tag from a weak right one, the model is asked about the tag of the page's cluster. Lost topics went to 0.
+
+Not tried yet:
+- **c-TF-IDF keywords as tag descriptions.** A tag the import model gave no description is still described as "first used for: <title>", and the classifier relies on descriptions. Keywords such as *library, asyncio, classes, programming* for `python` would describe it at no cost.
+- **Keywords and representative pages for naming.** The naming prompt shows a cluster's first 10 pages; BERTopic shows keywords and the documents that best represent the cluster.
+- **A bottom-up hierarchy.** The planned umbrella step is close to it: candidate groups come from tags whose pages are alike, and the model judges each group. The lesson above applies there too. On the old set, two tags of one topic (`houseplants` and `orchard`, 0.89) are no more alike than two tags of different topics (`fruits` and `houseplants`, 0.88), so the vectors can only propose the groups.
+
 ## Appendix: settings and constants
 
 | Setting | Default | Where |
@@ -987,6 +1097,8 @@ The worst case improved most. Before, one of the old set's reviews lost three to
 | `[reconcile] cluster_similarity` | 0.75 | Pass 2; pass 1 uses +0.05 |
 | `[reconcile] min_support` | 3 | Pages a tag needs to stay |
 | `[reconcile] candidates` | 8 | Tags offered per page |
+| `[reconcile] umbrellas` | true | Umbrella tags over an interest's parts (5.7) |
+| `[reconcile] umbrella_similarity` | 0.85 | Two tags' mean page vectors this alike are compared |
 | `[reconcile] similarity` | 0.80 | Merge candidates (merge/split mode) |
 | `[reconcile] split_similarity` | 0.75 | Split candidates (merge/split mode) |
 | `[reconcile] batch_size` | 20 | Pairs per merge request |
