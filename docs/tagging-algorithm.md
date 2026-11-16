@@ -553,6 +553,7 @@ A big interest's pages often fall into several clusters, and each cluster gets a
 4. **An earlier umbrella first.** If at least one tag joined, and an umbrella made before is almost as alike (its pages' mean vector at least 0.80, 0.05 below `umbrella_similarity`), the group's leader is first asked about with that umbrella (Prompt 4c, the umbrella as tag 1, with step 2 first). A yes puts the group under that umbrella: a trip's second group of places joins `portugal` instead of becoming `portugal-travel`.
 5. **A name (Prompt 4d).** Otherwise the model names the interest from all its tags, the biggest first. It can keep one of their names.
 6. **First on the pages.** A page whose first tag is one of the parts gets the interest's tag first, then its own tags, at most 3 in all.
+7. **A tag left alone.** When all groups are made, each tag that joined none, including one with no alike tag to ask about, is asked about with every umbrella whose pages are almost as alike (0.80), the most alike first, as in step 4. It joins the first that says yes, and its pages get that umbrella first. Asked about two parts of one interest, the model names each part's own topic and answers no (`lisbon` and `algarve`, `spanish-grammar` and `spanish-language-learning`); asked about an umbrella over several parts, it sees the whole interest.
 
 A review of the sets of 150–200 pages asks what 2–20 tags are about and 1–13 pairs, and names up to 5 interests; on the realistic set of 500 it asks about some 40 tags and 45 pairs, and names about 8. It takes up to 10% longer. Section 11.11 has the results.
 
@@ -1062,6 +1063,17 @@ Pages of tools that overlap form mixed clusters, which get the field's name or a
 | Realistic set, the test | 0.511, 0.438 | 0.723, 0.606 | **0.755, 0.613** |
 
 Precision is back to where it was without umbrellas: 0.99 and 0.98 on the development set, and 0.99 and 0.97 on the realistic set (0.99 and 0.95 without umbrellas). Recall on the realistic set is 0.61 and 0.45, against 0.34 and 0.28 without. No umbrella joins the data tools any more, no topic is lost, and no tag is put on two meanings of a word. The two runs agree on 0.90 on the development set (0.73 without umbrellas) and on 0.69 on the realistic set (0.70). A review takes about 10% longer.
+
+**A tag left out of every group, joined.** The realistic set's remaining splits came from pair questions about two parts of one interest. `lisbon` and `algarve`, `algarve` and `portugal`, and `spanish-grammar` and `spanish-language-learning` all came back as two interests, so those tags stayed out of every group, and the check against earlier umbrellas (5.7, step 4) only ran for groups. Now each tag left alone is asked about with the umbrellas whose pages are alike (step 7). The held-out and old sets are scored on `qwen3:4b`'s fresh imports (11.10).
+
+| F1 | Before | Now |
+|---|---|---|
+| Development set, 207 pages | 0.886, 0.946 | **0.905**, 0.946 |
+| Held-out set | 0.980, 0.927 | 0.980, 0.927 |
+| Old set | 0.887, 0.910 | 0.887, 0.910 |
+| Realistic set, the test | 0.755, 0.613 | **0.812, 0.835** |
+
+Portugal is now one tag in both runs (all 39 of its tagged pages), and Spanish in run 2 (25 of 25); in run 1, `countertops` joined `home-improvement`. Precision is unchanged (0.99 and 0.97), no topic is lost and no tag is put on two meanings of a word. The two runs agree on 0.80 (0.69 before). Still split: kitchen renovation, between `kitchen-remodel` and `home-improvement` in both runs, which the model calls two interests, and Spanish in run 1. With every tagged page right, the realistic set would score 0.98, so most of what's left is in the review.
 
 ### Already tried, and not worth repeating
 

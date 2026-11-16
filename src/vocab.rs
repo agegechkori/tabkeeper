@@ -929,6 +929,7 @@ async fn add_umbrellas<R: Reviewer>(
     let mut made: Vec<(String, Vec<usize>, Vec<f32>)> = Vec::new();
     // What each tag's pages are about, asked once per tag.
     let mut kinds: HashMap<String, TagKind> = HashMap::new();
+    let mut alone: Vec<String> = Vec::new();
     for &h in &order {
         if done[h] {
             continue;
@@ -944,6 +945,7 @@ async fn add_umbrellas<R: Reviewer>(
             .filter(|&j| !done[j] && similarity(&centroids[h], &centroids[j]) >= settings.umbrella_similarity)
             .collect();
         if near.is_empty() {
+            alone.push(names[h].clone());
             continue;
         }
         let head = names[h].as_str();
@@ -994,6 +996,7 @@ async fn add_umbrellas<R: Reviewer>(
             }
         }
         if parts.len() < 2 {
+            alone.push(head.to_string());
             continue;
         }
         let group_pages: Vec<usize> = parts.iter().flat_map(|p| firsts[p].iter().copied()).collect();
@@ -1100,6 +1103,66 @@ async fn add_umbrellas<R: Reviewer>(
             None => {
                 made.push((umbrella.clone(), group_pages, group_vector));
                 out.umbrellas.push((umbrella, parts));
+            }
+        }
+    }
+    // A tag left out of every group (algarve, after its pair with lisbon came
+    // back as two interests, or spanish-grammar before the spanish-language
+    // umbrella existed) is asked about with each umbrella whose pages are
+    // alike, the most alike first, and joins the first that is the same
+    // interest. An umbrella over several parts shows the whole interest,
+    // which a pair of two of its parts doesn't.
+    for tag in alone {
+        let tag_pages = &firsts[tag.as_str()];
+        let tag_vector = mean_vector(tag_pages, page_vectors);
+        let mut near: Vec<(usize, f32)> = made
+            .iter()
+            .enumerate()
+            .map(|(k, (_, _, vector))| (k, similarity(vector, &tag_vector)))
+            .filter(|&(_, s)| s >= settings.umbrella_similarity - UMBRELLA_JOIN_STEP)
+            .collect();
+        if near.is_empty() {
+            continue;
+        }
+        near.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let tag_kind = kind_of(reviewer, &tag, tag_pages, pages, vocabulary, &mut kinds, out).await;
+        let tag_titles = titles_of(tag_pages, pages);
+        let tag_line = umbrella_line(&tag, tag_pages, pages, vocabulary);
+        for (k, _) in near {
+            let (name, made_pages) = (made[k].0.clone(), made[k].1.clone());
+            let made_kind = kind_of(reviewer, &name, &made_pages, pages, vocabulary, &mut kinds, out).await;
+            if two_programs(&made_kind, &titles_of(&made_pages, pages), &tag_kind, &tag_titles) {
+                continue;
+            }
+            let user = format!(
+                "Tag 1: {}\nTag 2: {tag_line}\n",
+                umbrella_line(&name, &made_pages, pages, vocabulary)
+            );
+            match reviewer
+                .ask_json(
+                    UMBRELLA_PAIR_SYSTEM,
+                    &user,
+                    "tag_umbrella_pair",
+                    pair_schema.clone(),
+                )
+                .await
+            {
+                Ok(reply) => {
+                    if serde_json::from_value::<UmbrellaPairReply>(reply).is_ok_and(|r| r.one_interest) {
+                        for &i in tag_pages {
+                            if let Some(Some(tags)) = chosen.get_mut(i) {
+                                tags.retain(|t| kept.contains(t) && *t != name);
+                                tags.insert(0, name.clone());
+                                tags.truncate(settings.max_tags);
+                            }
+                        }
+                        made[k].1.extend(tag_pages.iter().copied());
+                        made[k].2 = mean_vector(&made[k].1, page_vectors);
+                        out.umbrellas[k].1.push(tag.clone());
+                        break;
+                    }
+                }
+                Err(err) => out.failed_requests.push(format!("{err:#}")),
             }
         }
     }
@@ -2311,6 +2374,74 @@ mod tests {
                 })
                 .collect())
         }
+    }
+
+    #[tokio::test]
+    async fn a_tag_left_out_of_every_group_joins_a_like_umbrella() {
+        use crate::reconcile::tests::{FakeReviewer, archive};
+        // Three places on one trip, each pair 0.82 alike.
+        let place = |own: usize| {
+            let mut v = [0.846; 4];
+            v[own] += 1.0;
+            v
+        };
+        let mut topics = Vec::new();
+        for (own, names) in [
+            (0, &["alfama", "belem", "sintra", "chiado"][..]),
+            (1, &["cascais", "estoril", "ericeira"][..]),
+            (2, &["lagos", "faro", "tavira"][..]),
+        ] {
+            for name in names {
+                topics.push((*name, place(own)));
+            }
+        }
+        let pages: Vec<([&str; 1], [f32; 3])> = topics.iter().map(|(name, _)| ([*name], [0.0; 3])).collect();
+        let pages: Vec<(&[&str], [f32; 3])> = pages.iter().map(|(t, v)| (&t[..], *v)).collect();
+        let db = archive(&pages);
+        let mut replies = vec![
+            json!({"description": "Lisbon.", "fits": [1, 2, 3, 4], "tag": "lisbon"}),
+            json!({"description": "The coast near Lisbon.", "fits": [1, 2, 3], "tag": "lisbon-coast"}),
+            json!({"description": "The Algarve.", "fits": [1, 2, 3], "tag": "algarve"}),
+        ];
+        for (tag, n) in [("lisbon", 4), ("lisbon-coast", 3), ("algarve", 3)] {
+            for _ in 0..n {
+                replies.push(json!({"tags": [tag]}));
+            }
+        }
+        let other = json!({"kind": "other", "name": ""});
+        let yes = json!({"interest_1": "portugal", "interest_2": "portugal", "one_interest": true});
+        replies.extend([
+            // lisbon leads: algarve, two interests; lisbon-coast, one.
+            other.clone(),
+            other.clone(),
+            json!({"interest_1": "lisbon", "interest_2": "algarve", "one_interest": false}),
+            other.clone(),
+            yes.clone(),
+            json!({"description": "A trip to Portugal.", "tag": "portugal"}),
+            // algarve, left alone, is asked about with portugal and joins it.
+            other,
+            yes,
+        ]);
+        let reviewer = FakeReviewer::new(replies);
+        let out = retag(
+            &db,
+            &reviewer,
+            &TopicEmbedder4(topics),
+            &umbrella_settings(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+        let prompts = reviewer.prompts.borrow();
+        let last = prompts.last().unwrap();
+        assert!(
+            last.starts_with(
+                "Tag 1: portugal (7 pages): A trip to Portugal. Pages such as: Page 0; Page 1; Page 2\nTag 2: algarve (3 pages)"
+            ),
+            "{last}"
+        );
+        let parts = ["lisbon", "lisbon-coast", "algarve"].map(String::from).to_vec();
+        assert_eq!(out.umbrellas, vec![("portugal".to_string(), parts)]);
     }
 
     #[tokio::test]
