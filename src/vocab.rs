@@ -1007,6 +1007,7 @@ async fn add_umbrellas<R: Reviewer>(
         // Showing the umbrellas made so far when naming changed other names
         // too (game-development instead of godot).
         let mut joined = None;
+        let mut broader = false;
         for (k, (name, made_pages, made_vector)) in made.iter().enumerate() {
             if similarity(made_vector, &group_vector) < settings.umbrella_similarity - UMBRELLA_JOIN_STEP {
                 continue;
@@ -1020,27 +1021,23 @@ async fn add_umbrellas<R: Reviewer>(
             ) {
                 continue;
             }
-            let user = format!(
-                "Tag 1: {}\nTag 2: {head_line}\n",
-                umbrella_line(name, made_pages, pages, vocabulary)
-            );
-            match reviewer
-                .ask_json(
-                    UMBRELLA_PAIR_SYSTEM,
-                    &user,
-                    "tag_umbrella_pair",
-                    pair_schema.clone(),
-                )
-                .await
-            {
-                Ok(reply) => {
-                    if serde_json::from_value::<UmbrellaPairReply>(reply).is_ok_and(|r| r.one_interest) {
-                        joined = Some(k);
-                        break;
-                    }
-                }
-                Err(err) => out.failed_requests.push(format!("{err:#}")),
+            let made_line = umbrella_line(name, made_pages, pages, vocabulary);
+            if one_interest(reviewer, &made_line, &head_line, &pair_schema, out).await {
+                joined = Some(k);
+                break;
             }
+            // Asked with the umbrella first, the model keeps a broader
+            // interest out of a narrower one (home-improvement out of
+            // kitchen-remodeling). Asked the other way round, a yes makes
+            // the group's leader the name of both.
+            if one_interest(reviewer, &head_line, &made_line, &pair_schema, out).await {
+                joined = Some(k);
+                broader = true;
+                break;
+            }
+        }
+        if let (Some(k), true) = (joined, broader) {
+            rename_umbrella(&mut made, &mut out.umbrellas, k, head, chosen, settings.max_tags);
         }
         let umbrella = match joined {
             Some(k) => made[k].0.clone(),
@@ -1134,38 +1131,74 @@ async fn add_umbrellas<R: Reviewer>(
             if two_programs(&made_kind, &titles_of(&made_pages, pages), &tag_kind, &tag_titles) {
                 continue;
             }
-            let user = format!(
-                "Tag 1: {}\nTag 2: {tag_line}\n",
-                umbrella_line(&name, &made_pages, pages, vocabulary)
-            );
-            match reviewer
-                .ask_json(
-                    UMBRELLA_PAIR_SYSTEM,
-                    &user,
-                    "tag_umbrella_pair",
-                    pair_schema.clone(),
-                )
-                .await
-            {
-                Ok(reply) => {
-                    if serde_json::from_value::<UmbrellaPairReply>(reply).is_ok_and(|r| r.one_interest) {
-                        for &i in tag_pages {
-                            if let Some(Some(tags)) = chosen.get_mut(i) {
-                                tags.retain(|t| kept.contains(t) && *t != name);
-                                tags.insert(0, name.clone());
-                                tags.truncate(settings.max_tags);
-                            }
-                        }
-                        made[k].1.extend(tag_pages.iter().copied());
-                        made[k].2 = mean_vector(&made[k].1, page_vectors);
-                        out.umbrellas[k].1.push(tag.clone());
-                        break;
-                    }
+            let made_line = umbrella_line(&name, &made_pages, pages, vocabulary);
+            let mut umbrella = name;
+            if !one_interest(reviewer, &made_line, &tag_line, &pair_schema, out).await {
+                // The other way round, as for a group (step 4): a yes makes
+                // the tag the name of both (spanish-language-learning over
+                // the spanish-grammar umbrella).
+                if !one_interest(reviewer, &tag_line, &made_line, &pair_schema, out).await {
+                    continue;
                 }
-                Err(err) => out.failed_requests.push(format!("{err:#}")),
+                rename_umbrella(&mut made, &mut out.umbrellas, k, &tag, chosen, settings.max_tags);
+                umbrella = tag.clone();
             }
+            for &i in tag_pages {
+                if let Some(Some(tags)) = chosen.get_mut(i) {
+                    tags.retain(|t| kept.contains(t) && *t != umbrella);
+                    tags.insert(0, umbrella.clone());
+                    tags.truncate(settings.max_tags);
+                }
+            }
+            made[k].1.extend(tag_pages.iter().copied());
+            made[k].2 = mean_vector(&made[k].1, page_vectors);
+            out.umbrellas[k].1.push(tag.clone());
+            break;
         }
     }
+}
+
+/// Asks whether two tags are about one interest (Prompt 4c), the first as
+/// tag 1; a failed request counts as no.
+async fn one_interest<R: Reviewer>(
+    reviewer: &R,
+    first: &str,
+    second: &str,
+    schema: &serde_json::Value,
+    out: &mut Retag,
+) -> bool {
+    let user = format!("Tag 1: {first}\nTag 2: {second}\n");
+    match reviewer
+        .ask_json(UMBRELLA_PAIR_SYSTEM, &user, "tag_umbrella_pair", schema.clone())
+        .await
+    {
+        Ok(reply) => serde_json::from_value::<UmbrellaPairReply>(reply).is_ok_and(|r| r.one_interest),
+        Err(err) => {
+            out.failed_requests.push(format!("{err:#}"));
+            false
+        }
+    }
+}
+
+/// Renames umbrella `k` to `name`, a broader tag that joined it, and puts
+/// that name first on the umbrella's pages; the old name stays after it.
+fn rename_umbrella(
+    made: &mut [(String, Vec<usize>, Vec<f32>)],
+    umbrellas: &mut [(String, Vec<String>)],
+    k: usize,
+    name: &str,
+    chosen: &mut [Option<Vec<String>>],
+    max_tags: usize,
+) {
+    for &i in &made[k].1 {
+        if let Some(Some(tags)) = chosen.get_mut(i) {
+            tags.retain(|t| t != name);
+            tags.insert(0, name.to_string());
+            tags.truncate(max_tags);
+        }
+    }
+    made[k].0 = name.to_string();
+    umbrellas[k].0 = name.to_string();
 }
 
 /// The unit mean of some pages' vectors.
@@ -2442,6 +2475,93 @@ mod tests {
         );
         let parts = ["lisbon", "lisbon-coast", "algarve"].map(String::from).to_vec();
         assert_eq!(out.umbrellas, vec![("portugal".to_string(), parts)]);
+    }
+
+    #[tokio::test]
+    async fn a_broader_tag_joins_an_umbrella_and_names_it() {
+        use crate::reconcile::tests::{FakeReviewer, archive};
+        let place = |own: usize| {
+            let mut v = [0.846; 4];
+            v[own] += 1.0;
+            v
+        };
+        let mut topics = Vec::new();
+        for (own, names) in [
+            (0, &["alfama", "belem", "sintra", "chiado"][..]),
+            (1, &["cascais", "estoril", "ericeira"][..]),
+            (2, &["lagos", "faro", "tavira"][..]),
+        ] {
+            for name in names {
+                topics.push((*name, place(own)));
+            }
+        }
+        let pages: Vec<([&str; 1], [f32; 3])> = topics.iter().map(|(name, _)| ([*name], [0.0; 3])).collect();
+        let pages: Vec<(&[&str], [f32; 3])> = pages.iter().map(|(t, v)| (&t[..], *v)).collect();
+        let db = archive(&pages);
+        let mut replies = vec![
+            json!({"description": "Spanish grammar.", "fits": [1, 2, 3, 4], "tag": "spanish-grammar"}),
+            json!({"description": "The subjunctive.", "fits": [1, 2, 3], "tag": "spanish-subjunctive"}),
+            json!({"description": "Learning Spanish.", "fits": [1, 2, 3], "tag": "spanish-language-learning"}),
+        ];
+        for (tag, n) in [
+            ("spanish-grammar", 4),
+            ("spanish-subjunctive", 3),
+            ("spanish-language-learning", 3),
+        ] {
+            for _ in 0..n {
+                replies.push(json!({"tags": [tag]}));
+            }
+        }
+        let other = json!({"kind": "other", "name": ""});
+        let no = json!({"interest_1": "spanish-grammar", "interest_2": "spanish-language-learning", "one_interest": false});
+        let yes = json!({"interest_1": "spanish", "interest_2": "spanish", "one_interest": true});
+        replies.extend([
+            // spanish-grammar leads: learning, two interests; the
+            // subjunctive, one; the umbrella keeps the leader's name.
+            other.clone(),
+            other.clone(),
+            no.clone(),
+            other,
+            yes.clone(),
+            json!({"description": "Spanish grammar.", "tag": "spanish-grammar"}),
+            // Learning, left alone: no with the umbrella first, yes the
+            // other way round.
+            no,
+            yes,
+        ]);
+        let reviewer = FakeReviewer::new(replies);
+        let out = retag(
+            &db,
+            &reviewer,
+            &TopicEmbedder4(topics),
+            &umbrella_settings(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+        let prompts = reviewer.prompts.borrow();
+        let last = prompts.last().unwrap();
+        assert!(
+            last.starts_with("Tag 1: spanish-language-learning (3 pages)"),
+            "{last}"
+        );
+        assert!(last.contains("\nTag 2: spanish-grammar (7 pages)"), "{last}");
+        let parts = [
+            "spanish-grammar",
+            "spanish-subjunctive",
+            "spanish-language-learning",
+        ]
+        .map(String::from)
+        .to_vec();
+        assert_eq!(
+            out.umbrellas,
+            vec![("spanish-language-learning".to_string(), parts)]
+        );
+        assert!(
+            out.assignments
+                .iter()
+                .all(|(_, tags)| tags[0].0 == "spanish-language-learning")
+        );
     }
 
     #[tokio::test]
