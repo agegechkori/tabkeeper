@@ -997,7 +997,24 @@ The 2B was also tried at higher precision. `qwen3:4b` reviews take 189–223 s o
 > - **More bits don't fix the 2B.** No build wins on more than one set. The old set's gain at `Q5_K_M` and `q8_0` comes from one import that `q4_K_M` reviewed badly (0.77 → 0.93), while the held-out set got slightly worse and its agreement fell from 0.75 to 0.58 and 0.53. At these sizes the reviews take about as long as `qwen3:4b`'s, so the 2B's one advantage, speed, is gone. The unsloth `Q5_K_M` landed among the official builds, so its different tool chain shows no effect here.
 > - **A two-sided naming rule** didn't help. The naming rule also said what's too broad: "not a whole field that also covers other topics (pottery, not crafts; sailing, not sports)". `qwen3:4b` got worse on all three sets (0.967 → 0.956, 0.907 → 0.896, 0.475 → 0.465). `qwen3.5:4b` got worse on two and stayed level on the held-out set (0.945 → 0.944, 0.880 → 0.857, 0.497 → 0.478). The rule changed single names in both directions instead of reining in broad ones.
 >
-> From 4B up, the model's own steps are already precise: precision is 0.95 or more on the held-out and realistic sets. What's left is how broad a topic is, and the clustering mostly decides that before any model is asked. Each naming call sees one group, so it can't tell that Lisbon belongs to a 39-page Portugal interest. A bigger model may pay off once it gets a decision that needs the whole collection, such as grouping cluster names into interests (umbrella tags), so that's where to test one again. Below 4B, the model's own steps start to fail.
+> From 4B up, the model's own steps are already precise: precision is 0.95 or more on the held-out and realistic sets. What's left is how broad a topic is, and the clustering mostly decides that before any model is asked. Each naming call sees one group, so it can't tell that Lisbon belongs to a 39-page Portugal interest. A bigger model may pay off once it gets a decision that needs the whole collection, such as grouping cluster names into interests (umbrella tags), so that's where to test one again; the end-to-end run below does that. Below 4B, the model's own steps start to fail.
+
+**End to end, with umbrella tags.** Each `qwen3.5` model later made both imports of each test set itself, from the same saved pages, and reviewed them with the umbrella step on (5.7). `qwen3:4b` reviewed the same imports too, for every pairing of import model and review model. `qwen3:4b` made fresh imports of the held-out and old sets for this run; its realistic imports were already real ones. F1 is the mean of the two imports, with each import's F1 in brackets; times are for one realistic import and its review.
+
+| Import, review | F1, realistic | F1, held-out | F1, old set | Agreement: realistic, held-out, old | Time: import, review |
+|---|---|---|---|---|---|
+| `qwen3:4b`, `qwen3:4b` | 0.684 (0.76, 0.61) | **0.954** (0.98, 0.93) | **0.898** (0.89, 0.91) | 0.69, 0.84, 0.86 | 32 min, 12 min |
+| `qwen3.5:4b`, `qwen3:4b` | 0.682 (0.73, 0.64) | 0.869 (0.93, 0.81) | 0.872 (0.86, 0.89) | 0.72, 0.58, 0.88 | 35 min, 13 min |
+| `qwen3.5:4b`, `qwen3.5:4b` | 0.588 (0.59, 0.59) | 0.747 (0.88, 0.61) | 0.811 (0.81, 0.81) | 0.50, 0.58, 0.79 | 35 min, 18 min |
+| `qwen3.5:9b`, `qwen3:4b` | **0.726** (0.73, 0.73) | 0.939 (0.95, 0.92) | 0.812 (0.83, 0.79) | 0.63, 0.95, 0.77 | 65 min, 11 min |
+| `qwen3.5:9b`, `qwen3.5:9b` | 0.654 (0.63, 0.68) | 0.942 (0.92, 0.97) | 0.812 (0.80, 0.83) | 0.71, 0.89, 0.82 | 65 min, 27–29 min |
+
+> [!NOTE]
+> **Tested end to end; `qwen3:4b` still stays.**
+> - **The umbrella step doesn't make a bigger model pay off.** `qwen3.5:9b` reviewing its own imports is below `qwen3:4b` on all three sets.
+> - **The 9B's imports give the best realistic score** when `qwen3:4b` reviews them: 0.04 above `qwen3:4b` alone, with the same precision (0.99, 0.95). But the two runs agree less (0.63 against 0.69), the held-out set is 0.015 lower and the old set 0.086 lower, and an import takes twice as long. Its old-set imports already mix topics before the review (F1 0.06, precision 0.61 and 0.53), and neither reviewer recovers from that.
+> - **`qwen3.5:4b` as a reviewer puts whole fields under one umbrella:** `software-development` over `apache-airflow`, `dbt`, `postgresql` and `react` (realistic, precision 0.83), and `animals-and-birds` over four animal tags (held-out, precision 0.48). The umbrella prompts and the code's checks were tuned on `qwen3:4b`'s answers. As an importer it puts broad tags such as `history` on pages about tea, cheese and horse riding.
+> - **Fresh `qwen3:4b` imports score a little lower** than the earlier ones, which were replays of recorded replies: 0.954 against 0.967 on the held-out set, and 0.898 against 0.918 on the old set. They are the fair baselines for later changes.
 
 ### 11.11 Umbrella tags over an interest's subtopics
 
@@ -1059,7 +1076,7 @@ These were measured on the test sets and didn't help, or made things worse:
 - Replies that map ids to assignments in one JSON object: the 4B model garbles them. Use one entry per item.
 - A third import tag per page (section 4).
 - `nomic-embed-text`'s `clustering: ` prefix, and `qwen3-embedding:0.6b` (11.4).
-- `qwen3.5` at 2B (`q4_K_M`, `Q5_K_M`, `q8_0`), 4B and 9B in place of `qwen3:4b`, and a naming rule that also says what's too broad (11.10).
+- `qwen3.5` at 2B (`q4_K_M`, `Q5_K_M`, `q8_0`), 4B and 9B in place of `qwen3:4b`, as the reviewer and end to end with the umbrella step, and a naming rule that also says what's too broad (11.10).
 - For umbrella tags: one question about a whole group of alike tags (it names a field), a reason before the yes or no (it finds a shared theme), average-linkage groups (they leave parts out), the names of earlier umbrellas shown when naming (other names drift), a naming rule to call a tool by its name (names change everywhere), and a pair rule for a tool and its kind (no effect) (11.11).
 
 ## 12. Results after the changes
